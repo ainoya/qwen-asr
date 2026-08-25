@@ -45,6 +45,9 @@ void qwen_q8_argmax_range_wasm(const int8_t *qx, const float *sx,
                                const int8_t *W, const float *ws,
                                int in_dim, int rows, int row_base,
                                int *best_out, float *best_val_out);
+void qwen_q8_matvec_m_wasm(float *y, int ldy, const int8_t *qx, const float *sx,
+                           int m, const int8_t *W, const float *ws,
+                           int in_dim, int rows);
 void qwen_q8_quantize_row_wasm(const float *x, int8_t *qx, float *sx, int n);
 float qwen_dot_f32_wasm(const float *a, const float *b, int n);
 void qwen_vec_scale_inplace_wasm(float *dst, float scale, int n);
@@ -54,7 +57,7 @@ void qwen_vec_scale_add_wasm(float *dst, const float *src, float correction, int
 #define qwen_bf16_matvec_fused_impl qwen_bf16_matvec_fused_wasm
 #define qwen_argmax_bf16_range_impl qwen_argmax_bf16_range_wasm
 #define qwen_q8_matvec_impl qwen_q8_matvec_wasm
-#define qwen_q8_matvec_m_impl qwen_q8_matvec_m_generic
+#define qwen_q8_matvec_m_impl qwen_q8_matvec_m_wasm
 #define qwen_q8_argmax_range_impl qwen_q8_argmax_range_wasm
 #define qwen_q8_quantize_row_impl qwen_q8_quantize_row_wasm
 #define qwen_dot_f32_impl qwen_dot_f32_wasm

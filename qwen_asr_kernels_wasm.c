@@ -65,6 +65,58 @@ void qwen_q8_matvec_wasm(float *y, const int8_t *qx, const float *sx,
         y[o] = q8_row_dot(W + (size_t)o * in_dim, ws + (size_t)o * nb, qx, sx, nb);
 }
 
+
+/* Batched matvec: one pass over the weight rows scores M activation rows.
+ * M has to be a compile-time constant - with a runtime count the accumulator
+ * array is indexed dynamically and lives on the stack rather than in
+ * registers, which costs about a quarter of the kernel's throughput. */
+#define Q8_MATVEC_M_KERNEL(NAME, M)                                            \
+static void NAME(float *y, int ldy, const int8_t *qx, const float *sx,         \
+                 const int8_t *W, const float *ws, int in_dim, int rows) {     \
+    int nb = in_dim / Q8B;                                                     \
+    for (int o = 0; o < rows; o++) {                                           \
+        const int8_t *w = W + (size_t)o * in_dim;                              \
+        const float *s = ws + (size_t)o * nb;                                  \
+        v128_t facc[M];                                                        \
+        for (int r = 0; r < M; r++) facc[r] = wasm_f32x4_splat(0.0f);          \
+        for (int b = 0; b < nb; b++) {                                         \
+            const int8_t *wp = w + (size_t)b * Q8B;                            \
+            float sc = s[b];                                                   \
+            for (int r = 0; r < M; r++) {                                      \
+                const int8_t *xp = qx + (size_t)r * in_dim + (size_t)b * Q8B;  \
+                v128_t acc = q8_block_dot(wp, xp);                             \
+                facc[r] = wasm_f32x4_add(facc[r],                              \
+                    wasm_f32x4_mul(wasm_f32x4_convert_i32x4(acc),              \
+                                   wasm_f32x4_splat(sc * sx[(size_t)r * nb + b]))); \
+            }                                                                  \
+        }                                                                      \
+        for (int r = 0; r < M; r++) y[(size_t)r * ldy + o] = hsum_f32x4(facc[r]); \
+    }                                                                          \
+}
+
+Q8_MATVEC_M_KERNEL(q8_mv_m1, 1)
+Q8_MATVEC_M_KERNEL(q8_mv_m2, 2)
+Q8_MATVEC_M_KERNEL(q8_mv_m4, 4)
+Q8_MATVEC_M_KERNEL(q8_mv_m8, 8)
+
+void qwen_q8_matvec_m_wasm(float *y, int ldy, const int8_t *qx, const float *sx,
+                           int m, const int8_t *W, const float *ws,
+                           int in_dim, int rows) {
+    int nb = in_dim / Q8B;
+    int off = 0;
+    while (off < m) {
+        int take = m - off;
+        const int8_t *x = qx + (size_t)off * in_dim;
+        const float *xs = sx + (size_t)off * nb;
+        float *dst = y + (size_t)off * ldy;
+        if (take >= 8)      { q8_mv_m8(dst, ldy, x, xs, W, ws, in_dim, rows); take = 8; }
+        else if (take >= 4) { q8_mv_m4(dst, ldy, x, xs, W, ws, in_dim, rows); take = 4; }
+        else if (take >= 2) { q8_mv_m2(dst, ldy, x, xs, W, ws, in_dim, rows); take = 2; }
+        else                { q8_mv_m1(dst, ldy, x, xs, W, ws, in_dim, rows); take = 1; }
+        off += take;
+    }
+}
+
 void qwen_q8_argmax_range_wasm(const int8_t *qx, const float *sx,
                                const int8_t *W, const float *ws,
                                int in_dim, int rows, int row_base,

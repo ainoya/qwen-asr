@@ -1,6 +1,9 @@
 /*
  * bench-node.js - time one file through the wasm build.
  *   node wasm/bench-node.js [model-dir] [audio.wav] [threads]
+ *
+ * QWEN_SEGMENT_SEC and QWEN_BATCH set segmented mode and how many segments
+ * share one sweep of the decoder weights.
  */
 const { load, transcribe, readWavMono16k } = require('./node-harness');
 
@@ -16,6 +19,14 @@ const { load, transcribe, readWavMono16k } = require('./node-harness');
   m._qwen_wasm_pool_selftest(100);
   console.log(`pool: ${m._qwen_wasm_pool_parts()} participants, ` +
               `${(m._qwen_wasm_pool_ms() * 1000 / 100).toFixed(0)} us/dispatch`);
+
+  const segSec = Number(process.env.QWEN_SEGMENT_SEC || 0);
+  const batch = Number(process.env.QWEN_BATCH || 0);
+  if (segSec > 0) {
+    m._qwen_wasm_set_segment_sec(segSec);
+    if (batch > 0) m._qwen_wasm_set_batch_size(batch);
+    console.log(`segment ${segSec}s, batch ${batch || 'default'}`);
+  }
 
   const r = await transcribe(m, readWavMono16k(wav));
   console.log('\n' + (r.text || '(empty)') + '\n');

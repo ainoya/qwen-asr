@@ -146,6 +146,15 @@ void qwen_wasm_set_segment_sec(float secs) {
     if (g_ctx) g_ctx->segment_sec = secs;
 }
 
+/* Segments decoded in one sweep of the decoder weights; see qwen_asr.h.
+ * Only takes effect with a segment size set and past-text conditioning off. */
+void qwen_wasm_set_batch_size(int n) {
+    if (!g_ctx) return;
+    if (n < 1) n = 1;
+    if (n > QWEN_MAX_BATCH) n = QWEN_MAX_BATCH;
+    g_ctx->batch_size = n;
+}
+
 EMSCRIPTEN_KEEPALIVE
 void qwen_wasm_set_stream_params(float chunk_sec, int max_new_tokens,
                                  float enc_window_sec) {

@@ -245,6 +245,7 @@ typedef struct {
 
     /* Segmentation settings */
     float segment_sec;             /* 0 = no splitting, default full-audio decode */
+    int batch_size;                /* segments decoded in one weight sweep (1 = off) */
     float search_sec;              /* segment-cutting silence search window ± seconds (default 3) */
 
     /* Streaming settings */
@@ -369,6 +370,52 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
 
 /* Decoder prefill (multiple tokens) */
 void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_len);
+
+/* ---------------------------------------------------------------------------
+ * Batched decoding
+ *
+ * Generating one token streams every decoder weight exactly once, so a single
+ * stream runs at the memory wall with the arithmetic units mostly idle.
+ * Independent utterances - the segments of a long recording, which under
+ * --past-text no do not condition on each other - can share that sweep: N
+ * streams cost roughly one stream's bandwidth.
+ *
+ * Each stream owns its KV cache; qwen_kv_bind() lends one to the context so
+ * the ordinary prefill path can fill it.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    float *k;                  /* [layers, max, kv_heads * head_dim] */
+    float *v;
+    int len;
+    int max;
+} qwen_kv_t;
+
+/* Streams the batched decoder can advance in one sweep. */
+#define QWEN_MAX_BATCH 16
+
+/* Rows a combined prefill will stack before splitting into another call. */
+#define QWEN_PREFILL_ROW_CAP 2048
+
+qwen_kv_t *qwen_kv_create(qwen_ctx_t *ctx, int max_seq);
+void qwen_kv_free(qwen_kv_t *kv);
+
+/* Lend a stream's cache to the context, run qwen_decoder_prefill(), then take
+ * it back - prefill may have grown it. */
+void qwen_kv_bind(qwen_ctx_t *ctx, qwen_kv_t *kv);
+void qwen_kv_unbind(qwen_ctx_t *ctx, qwen_kv_t *kv);
+
+/* Prefill n empty streams in one pass; embeds[i] is [lens[i]][dec_hidden].
+ * Cheaper than n separate prefills: the Q8 weight dequantize sweep is paid
+ * once. Returns 0 on success. */
+int qwen_decoder_prefill_multi(qwen_ctx_t *ctx, qwen_kv_t **kvs,
+                               const float *const *embeds, const int *lens, int n);
+
+/* Advance n streams by one token. embeds is [n][dec_hidden] in the same order
+ * as kvs; out_tokens receives n ids. Returns 0, or -1 if n exceeds
+ * QWEN_MAX_BATCH. */
+int qwen_decoder_forward_batch(qwen_ctx_t *ctx, qwen_kv_t **kvs, int n,
+                               const float *embeds, int *out_tokens);
 
 /* Decoder forward (single token, uses KV cache, returns greedy token) */
 int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed);

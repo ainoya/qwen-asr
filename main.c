@@ -61,6 +61,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "                       bf16  = no quantization\n");
     fprintf(stderr, "  -S <secs>     Segment target seconds (default: 0 = full-audio decode)\n");
     fprintf(stderr, "  -W <secs>     Segment-cutting silence search window ± seconds (default: 3.0)\n");
+    fprintf(stderr, "  --batch <n>   Segments decoded in one weight sweep (default: 4, 1 = off).\n");
+    fprintf(stderr, "                Needs -S and --past-text no; emits a segment at a time.\n");
     fprintf(stderr, "  --stream      Streaming mode: process in chunks with prefix rollback\n");
     fprintf(stderr, "  --stream-max-new-tokens <n>  Max generated tokens per stream step (default: 32)\n");
     fprintf(stderr, "  --enc-window-sec <secs>    Encoder attention window in seconds (1..8, default 8)\n");
@@ -86,6 +88,7 @@ int main(int argc, char **argv) {
     int use_stdin = 0;
     int n_threads = 0; /* 0 = auto-detect */
     float segment_sec = -1; /* -1 = use default (0) */
+    int batch_size = -1;    /* -1 = use default */
     float search_sec = -1;  /* -1 = use default (3) */
     int stream_mode = 0;
     int stream_max_new_tokens = -1; /* -1 = use default (32) */
@@ -104,6 +107,9 @@ int main(int argc, char **argv) {
             input_wav = argv[++i];
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             n_threads = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
+            batch_size = atoi(argv[++i]);
+            if (batch_size < 1) batch_size = 1;
         } else if (strcmp(argv[i], "-S") == 0 && i + 1 < argc) {
             segment_sec = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "-W") == 0 && i + 1 < argc) {
@@ -202,6 +208,7 @@ int main(int argc, char **argv) {
 
     /* Apply segmentation settings */
     if (segment_sec >= 0) ctx->segment_sec = segment_sec;
+    if (batch_size >= 1) ctx->batch_size = batch_size;
     if (search_sec >= 0) ctx->search_sec = search_sec;
     if (enc_window_sec >= 0) {
         int window_frames = (int)(enc_window_sec * 100.0f + 0.5f);

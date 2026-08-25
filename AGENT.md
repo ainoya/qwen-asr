@@ -112,6 +112,8 @@ From `qwen_load()` and CLI:
   because every parallel dispatch is barrier-synchronised.
 - Decoder weights: `--weights q8`
 - Segment mode default: `-S 0` (full-audio decode)
+- Segment batch size: `--batch 4` (only used when `-S > 0`, past-text off, weights quantized)
+- Segment batch size: `--batch 4` (only used when `-S > 0`, past-text off, weights quantized)
 - Segment cut search window: `-W 3.0`
 - Stream chunk: `2.0s`
 - Stream rollback: `5` tokens
@@ -253,6 +255,20 @@ Important caveat:
 When `-S > 0`:
 - split points are chosen near low-energy regions inside `-W`
 - default emission is token-by-token ASAP
+
+When `--past-text no` (the default) and weights are quantized, segments are
+decoded `--batch` at a time through `decode_segment_group()` in `qwen_asr.c`:
+one `qwen_decoder_prefill_multi()` for the whole group, then lockstep
+`qwen_decoder_forward_batch()` steps. Each stream owns a `qwen_kv_t`. Output is
+emitted a segment at a time rather than a token at a time; `--batch 1` restores
+the old per-segment path.
+
+When `--past-text no` (the default) and weights are quantized, segments are
+decoded `--batch` at a time through `decode_segment_group()` in `qwen_asr.c`:
+one `qwen_decoder_prefill_multi()` for the whole group, then lockstep
+`qwen_decoder_forward_batch()` steps. Each stream owns a `qwen_kv_t`. Output is
+emitted a segment at a time rather than a token at a time; `--batch 1` restores
+the old per-segment path.
 
 When `--past-text yes` in segmented mode:
 - boundary cleanup/post-processing path is enabled

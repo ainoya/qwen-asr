@@ -82,6 +82,7 @@ function sendSettings() {
   Module._qwen_wasm_set_language(lp);
   Module._qwen_wasm_release(lp);
   Module._qwen_wasm_set_segment_sec(Number($("seg").value) || 0);
+  Module._qwen_wasm_set_batch_size(Number($("batch").value) || 1);
   Module._qwen_wasm_set_stream_params(Number($("chunk").value) || 0, 32,
                                       Number($("encwin").value) || 0);
 }

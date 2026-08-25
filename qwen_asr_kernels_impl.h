@@ -7,6 +7,10 @@
 
 #include <stdint.h>
 
+/* Activation rows the batched Q8 kernels accept in one call; they keep one
+ * accumulator per row in registers. */
+#define QWEN_Q8_MAX_M 16
+
 void qwen_bf16_matvec_fused_generic(float *y, const float *x, const uint16_t *W_bf16,
                                     const float *bias, int in_dim, int out_dim);
 void qwen_argmax_bf16_range_generic(const float *x, const uint16_t *W_bf16,

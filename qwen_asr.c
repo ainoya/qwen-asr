@@ -231,6 +231,7 @@ static qwen_ctx_t *qwen_load_with(multi_safetensors_t *ms, const char *aux_dir) 
 
     /* Default transcription mode: full-audio offline decode (no splitting). */
     ctx->segment_sec = 0.0f;
+    ctx->batch_size = 4;
     ctx->search_sec = 3.0f;
 
     /* Default streaming parameters */
@@ -906,6 +907,297 @@ static void segment_emit_cb(const char *piece, void *userdata) {
     st->downstream_cb(piece, st->downstream_userdata);
 }
 
+
+/* ---------------------------------------------------------------------------
+ * Batched segment decoding
+ *
+ * With --past-text no (the default outside streaming) segments are decoded
+ * independently, so several of them can share one sweep of the decoder
+ * weights. Since a single stream already saturates memory bandwidth and
+ * leaves the arithmetic units idle, the extra streams are close to free.
+ *
+ * The trade-off is emission granularity: tokens are streamed a whole segment
+ * at a time instead of one by one, because a segment's text is only released
+ * once every earlier segment in the group has finished. --batch 1 restores
+ * token-by-token emission.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    char *buf;
+    size_t len, cap;
+} textbuf_t;
+
+static int tb_append(textbuf_t *t, const char *s, size_t n) {
+    if (t->len + n + 1 > t->cap) {
+        size_t cap = t->cap ? t->cap : 256;
+        while (t->len + n + 1 > cap) cap *= 2;
+        char *nb = (char *)realloc(t->buf, cap);
+        if (!nb) return -1;
+        t->buf = nb;
+        t->cap = cap;
+    }
+    memcpy(t->buf + t->len, s, n);
+    t->len += n;
+    t->buf[t->len] = '\0';
+    return 0;
+}
+
+typedef struct {
+    qwen_kv_t *kv;
+    textbuf_t text;
+    float *embeds;        /* prompt+audio embeddings, freed after prefill */
+    int token;            /* token to feed on the next step */
+    int past_asr_text;
+    int n_generated;
+    int n_text_tokens;
+    int done;
+} slot_t;
+
+/* Decode n segments together. Each slot's transcript is returned in texts[];
+ * the caller owns the strings. Returns 0 on success. */
+static int decode_segment_group(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer,
+                                const float **seg_ptr, const int *seg_n, int n,
+                                char **texts) {
+    const qwen_config_t *cfg = &ctx->config;
+    int dim = cfg->dec_hidden;
+    double group_t0 = get_time_ms();
+    slot_t *slots = (slot_t *)calloc(n, sizeof(slot_t));
+    float *slot_embeds = (float *)malloc((size_t)n * dim * sizeof(float));
+    float *step_embeds = (float *)malloc((size_t)n * dim * sizeof(float));
+    qwen_kv_t **kvs = (qwen_kv_t **)malloc((size_t)n * sizeof(*kvs));
+    int *tokens = (int *)malloc((size_t)n * sizeof(int));
+    int *active = (int *)malloc((size_t)n * sizeof(int));
+    int *prefill_lens = (int *)malloc((size_t)n * sizeof(int));
+    const float **prefill_embeds = (const float **)malloc((size_t)n * sizeof(*prefill_embeds));
+    int rc = -1;
+    if (!slots || !slot_embeds || !step_embeds || !kvs || !tokens || !active ||
+        !prefill_lens || !prefill_embeds) goto done;
+
+    double mel_total = 0, enc_total = 0;
+    double t0 = get_time_ms();
+
+    for (int i = 0; i < n; i++) {
+        double mel_ms = 0, enc_ms = 0;
+        int enc_seq_len = 0, total_seq = 0;
+        slots[i].embeds = build_input_embeds(ctx, seg_ptr[i], seg_n[i], tokenizer,
+                                             NULL, 0, &total_seq,
+                                             &mel_ms, &enc_ms, &enc_seq_len);
+        if (!slots[i].embeds || total_seq < 2) goto done;
+        mel_total += mel_ms;
+        enc_total += enc_ms;
+
+        slots[i].kv = qwen_kv_create(ctx, total_seq + 128);
+        if (!slots[i].kv) goto done;
+        /* Prefill covers all but the last embedding; that one is the first
+         * input of the generation loop. */
+        prefill_lens[i] = total_seq - 1;
+        prefill_embeds[i] = slots[i].embeds;
+        kvs[i] = slots[i].kv;
+        memcpy(slot_embeds + (size_t)i * dim,
+               slots[i].embeds + (size_t)(total_seq - 1) * dim,
+               dim * sizeof(float));
+        slots[i].past_asr_text = (ctx->n_force_prompt_tokens > 0) ? 1 : 0;
+    }
+    /* Combine prefills, but bound the row count: the shared prefill buffers
+     * are sized for the tallest call ever made and stay allocated, and the
+     * MLP intermediate alone is 48 KB per row. */
+    for (int i = 0; i < n; ) {
+        int j = i, taken = 0;
+        while (j < n && (j == i || taken + prefill_lens[j] <= QWEN_PREFILL_ROW_CAP)) {
+            taken += prefill_lens[j];
+            j++;
+        }
+        if (qwen_decoder_prefill_multi(ctx, kvs + i, prefill_embeds + i,
+                                       prefill_lens + i, j - i) != 0)
+            goto done;
+        i = j;
+    }
+    for (int i = 0; i < n; i++) {
+        free(slots[i].embeds);
+        slots[i].embeds = NULL;
+    }
+    ctx->perf_encode_ms += mel_total + enc_total;
+    double prefill_ms = (get_time_ms() - t0) - (mel_total + enc_total);
+    if (qwen_verbose >= 2)
+        fprintf(stderr, "  Batch of %d: prefill %.0f ms\n", n, prefill_ms);
+
+    /* ---- Lockstep autoregressive decode ---- */
+    t0 = get_time_ms();
+    const int max_tokens = 2048;
+    int n_steps = 0;
+    for (;;) {
+        int n_active = 0;
+        for (int i = 0; i < n; i++) {
+            if (slots[i].done) continue;
+            active[n_active] = i;
+            memcpy(step_embeds + (size_t)n_active * dim,
+                   slot_embeds + (size_t)i * dim, dim * sizeof(float));
+            kvs[n_active] = slots[i].kv;
+            n_active++;
+        }
+        if (n_active == 0) break;
+
+        if (qwen_decoder_forward_batch(ctx, kvs, n_active, step_embeds, tokens) != 0)
+            goto done;
+        n_steps++;
+
+        for (int a = 0; a < n_active; a++) {
+            slot_t *sl = &slots[active[a]];
+            int token = tokens[a];
+            sl->n_generated++;
+            if (token == QWEN_TOKEN_ENDOFTEXT || token == QWEN_TOKEN_IM_END ||
+                sl->n_generated >= max_tokens) {
+                sl->done = 1;
+                continue;
+            }
+            if (token == QWEN_TOKEN_ASR_TEXT) {
+                sl->past_asr_text = 1;
+            } else if (sl->past_asr_text) {
+                const char *piece = qwen_tokenizer_decode(tokenizer, token);
+                if (tb_append(&sl->text, piece, strlen(piece)) != 0) goto done;
+                sl->n_text_tokens++;
+            }
+            sl->token = token;
+        }
+
+        /* Next input embedding, written back in slot order. */
+        for (int a = 0; a < n_active; a++) {
+            slot_t *sl = &slots[active[a]];
+            if (sl->done) continue;
+            tok_embed_lookup(&ctx->decoder, slot_embeds + (size_t)active[a] * dim,
+                             sl->token, dim);
+        }
+    }
+
+    double decode_ms = get_time_ms() - t0;
+    int gen_total = 0, text_total = 0;
+    for (int i = 0; i < n; i++) {
+        gen_total += slots[i].n_generated;
+        text_total += slots[i].n_text_tokens;
+    }
+    if (qwen_verbose >= 2)
+        fprintf(stderr, "  Batch of %d: %d steps, %d tokens (%.0f ms, %.1f ms/token)\n",
+                n, n_steps, gen_total, decode_ms,
+                gen_total > 0 ? decode_ms / gen_total : 0);
+
+    for (int i = 0; i < n; i++) {
+        char *txt = slots[i].text.buf;
+        if (!txt) {
+            txt = (char *)malloc(1);
+            if (txt) txt[0] = '\0';
+        } else {
+            size_t rlen = strlen(txt);
+            while (rlen > 0 && isspace((unsigned char)txt[rlen - 1])) txt[--rlen] = '\0';
+            char *start = txt;
+            while (*start && isspace((unsigned char)*start)) start++;
+            if (start != txt) memmove(txt, start, strlen(start) + 1);
+        }
+        texts[i] = txt;
+        slots[i].text.buf = NULL;
+    }
+    ctx->perf_text_tokens += text_total;
+    ctx->perf_decode_ms += prefill_ms + decode_ms;
+    ctx->perf_total_ms += get_time_ms() - group_t0;
+    rc = 0;
+
+done:
+    if (slots) {
+        for (int i = 0; i < n; i++) {
+            free(slots[i].embeds);
+            free(slots[i].text.buf);
+            qwen_kv_free(slots[i].kv);
+        }
+        free(slots);
+    }
+    free(slot_embeds);
+    free(step_embeds);
+    free(kvs);
+    free(tokens);
+    free(active);
+    free(prefill_lens);
+    free(prefill_embeds);
+    return rc;
+}
+
+
+/* Drive decode_segment_group() over all segments and stitch the transcripts.
+ * Text is released a segment at a time rather than a token at a time; see the
+ * note above decode_segment_group(). */
+static char *batched_segments(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer,
+                              const float *audio, const int *splits,
+                              int n_splits, int batch) {
+    const int min_samples = QWEN_SAMPLE_RATE / 2; /* 0.5s, like the official pipeline */
+    textbuf_t out = {0};
+    if (tb_append(&out, "", 0) != 0) return NULL;
+
+    const float **ptrs = (const float **)malloc((size_t)batch * sizeof(*ptrs));
+    int *lens = (int *)malloc((size_t)batch * sizeof(int));
+    float **pads = (float **)calloc(batch, sizeof(*pads));
+    char **texts = (char **)calloc(batch, sizeof(*texts));
+    if (!ptrs || !lens || !pads || !texts) goto fail;
+
+    for (int base = 0; base < n_splits; base += batch) {
+        int n = n_splits - base;
+        if (n > batch) n = batch;
+
+        for (int i = 0; i < n; i++) {
+            int start = splits[base + i];
+            int count = splits[base + i + 1] - start;
+            pads[i] = NULL;
+            if (count < min_samples) {
+                pads[i] = (float *)calloc(min_samples, sizeof(float));
+                if (!pads[i]) goto fail;
+                memcpy(pads[i], audio + start, (size_t)count * sizeof(float));
+                ptrs[i] = pads[i];
+                lens[i] = min_samples;
+            } else {
+                ptrs[i] = audio + start;
+                lens[i] = count;
+            }
+        }
+
+        if (qwen_verbose >= 2)
+            fprintf(stderr, "Segments %d-%d/%d in one batch\n",
+                    base + 1, base + n, n_splits);
+
+        int rc = decode_segment_group(ctx, tokenizer, ptrs, lens, n, texts);
+        for (int i = 0; i < n; i++) { free(pads[i]); pads[i] = NULL; }
+        if (rc != 0) goto fail;
+
+        for (int i = 0; i < n; i++) {
+            const char *t = texts[i];
+            if (t && t[0]) {
+                if (should_insert_boundary_space(
+                        out.len > 0 ? (int)(unsigned char)out.buf[out.len - 1] : 0,
+                        (int)(unsigned char)t[0])) {
+                    if (tb_append(&out, " ", 1) != 0) goto fail;
+                    if (ctx->token_cb) ctx->token_cb(" ", ctx->token_cb_userdata);
+                }
+                if (tb_append(&out, t, strlen(t)) != 0) goto fail;
+                if (ctx->token_cb) ctx->token_cb(t, ctx->token_cb_userdata);
+            }
+            free(texts[i]);
+            texts[i] = NULL;
+        }
+    }
+
+    free(ptrs);
+    free(lens);
+    free(pads);
+    free(texts);
+    return out.buf;
+
+fail:
+    if (pads) for (int i = 0; i < batch; i++) free(pads[i]);
+    if (texts) for (int i = 0; i < batch; i++) free(texts[i]);
+    free(ptrs);
+    free(lens);
+    free(pads);
+    free(texts);
+    free(out.buf);
+    return NULL;
+}
+
 float *qwen_build_embeds(qwen_ctx_t *ctx, const float *samples, int n_samples,
                          int *out_seq_len, double *out_mel_ms, double *out_enc_ms) {
     char vocab_path[1024];
@@ -996,6 +1288,19 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
 
     if (qwen_verbose >= 2)
         fprintf(stderr, "Splitting into %d segments\n", n_splits);
+
+    /* Batched path: independent segments share one sweep of the decoder
+     * weights. Only valid without past-text conditioning, which makes each
+     * segment depend on the previous one's transcript. */
+    int batch = ctx->batch_size;
+    if (batch > QWEN_MAX_BATCH) batch = QWEN_MAX_BATCH;
+    if (batch > 1 && ctx->past_text_conditioning == 0 && ctx->decoder.embed_quantized) {
+        char *result = batched_segments(ctx, tokenizer, audio_samples,
+                                        splits, n_splits, batch);
+        qwen_tokenizer_free(tokenizer);
+        free(compacted_samples);
+        return result;
+    }
 
     /* Transcribe each segment and concatenate */
     size_t result_cap = 4096;

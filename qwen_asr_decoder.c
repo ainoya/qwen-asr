@@ -622,3 +622,295 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
         return qwen_argmax_matvec_q8(x, &dec->tok_embeddings_q8);
     return qwen_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, dim, cfg->vocab_size);
 }
+
+/* ========================================================================
+ * Batched Decoding
+ *
+ * One sweep of the decoder weights advances several independent streams.
+ * The per-token cost is dominated by reading 1.83 GB of weights, so the
+ * second and later streams in a batch are close to free; see qwen_asr.h.
+ * ======================================================================== */
+
+qwen_kv_t *qwen_kv_create(qwen_ctx_t *ctx, int max_seq) {
+    qwen_kv_t *kv = (qwen_kv_t *)calloc(1, sizeof(*kv));
+    if (!kv) return NULL;
+    int kv_dim = ctx->config.dec_kv_heads * ctx->config.dec_head_dim;
+    size_t bytes = (size_t)ctx->config.dec_layers * max_seq * kv_dim * sizeof(float);
+    kv->k = (float *)calloc(1, bytes);
+    kv->v = (float *)calloc(1, bytes);
+    kv->max = max_seq;
+    kv->len = 0;
+    if (!kv->k || !kv->v) { qwen_kv_free(kv); return NULL; }
+    return kv;
+}
+
+void qwen_kv_free(qwen_kv_t *kv) {
+    if (!kv) return;
+    free(kv->k);
+    free(kv->v);
+    free(kv);
+}
+
+/* The context keeps exactly one cache at a time. Bind/unbind swap a stream's
+ * cache in so the single-stream prefill can be reused verbatim; prefill may
+ * grow it, hence the write-back in unbind(). */
+void qwen_kv_bind(qwen_ctx_t *ctx, qwen_kv_t *kv) {
+    ctx->kv_cache_k = kv->k;
+    ctx->kv_cache_v = kv->v;
+    ctx->kv_cache_len = kv->len;
+    ctx->kv_cache_max = kv->max;
+}
+
+void qwen_kv_unbind(qwen_ctx_t *ctx, qwen_kv_t *kv) {
+    kv->k = ctx->kv_cache_k;
+    kv->v = ctx->kv_cache_v;
+    kv->len = ctx->kv_cache_len;
+    kv->max = ctx->kv_cache_max;
+    ctx->kv_cache_k = NULL;
+    ctx->kv_cache_v = NULL;
+    ctx->kv_cache_len = 0;
+    ctx->kv_cache_max = 0;
+}
+
+static int kv_grow(qwen_ctx_t *ctx, qwen_kv_t *kv, int required) {
+    if (required <= kv->max) return 0;
+    qwen_kv_bind(ctx, kv);
+    int rc = kv_cache_grow(ctx, required);
+    qwen_kv_unbind(ctx, kv);
+    return rc;
+}
+
+int qwen_decoder_forward_batch(qwen_ctx_t *ctx, qwen_kv_t **kvs, int n,
+                               const float *embeds, int *out_tokens) {
+    if (n <= 0) return 0;
+    if (n > QWEN_MAX_BATCH) return -1;
+
+    qwen_decoder_t *dec = &ctx->decoder;
+    const qwen_config_t *cfg = &ctx->config;
+    int dim = cfg->dec_hidden;
+    int n_heads = cfg->dec_heads;
+    int n_kv_heads = cfg->dec_kv_heads;
+    int head_dim = cfg->dec_head_dim;
+    int intermediate = cfg->dec_intermediate;
+    float eps = cfg->dec_rms_norm_eps;
+    float theta = cfg->dec_rope_theta;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    int max_pos = 0;
+    for (int s = 0; s < n; s++) {
+        if (kv_grow(ctx, kvs[s], kvs[s]->len + 1) != 0) return -1;
+        if (kvs[s]->len > max_pos) max_pos = kvs[s]->len;
+    }
+    if (ensure_prefill_buffers(ctx, n) != 0) return -1;
+    if (ensure_rope_cache(ctx, max_pos + 1, head_dim, theta) != 0) return -1;
+
+    float *x = ctx->pref_x;
+    float *x_norm = ctx->pref_x_norm;
+    float *q = ctx->pref_q;
+    float *k = ctx->pref_k;
+    float *v = ctx->pref_v;
+    float *attn_out = ctx->pref_attn_out;
+    float *proj_out = ctx->pref_proj_out;
+    float *ffn_out = ctx->pref_ffn_out;
+    float *gate = ctx->pref_gate;
+    float *gate_up = ctx->pref_gate_up;
+
+    memcpy(x, embeds, (size_t)n * dim * sizeof(float));
+
+    for (int layer = 0; layer < cfg->dec_layers; layer++) {
+        qwen_dec_layer_t *l = &dec->layers[layer];
+
+        qwen_rms_norm(x_norm, x, l->input_norm, n, dim, eps);
+        if (dec->quantized) {
+            qwen_linear_nobias_q8(q, x_norm, &l->wq_q8, n);
+            qwen_linear_nobias_q8(k, x_norm, &l->wk_q8, n);
+            qwen_linear_nobias_q8(v, x_norm, &l->wv_q8, n);
+        } else {
+            qwen_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, n, dim, q_dim);
+            qwen_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, n, dim, kv_dim);
+            qwen_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, n, dim, kv_dim);
+        }
+
+        qwen_rms_norm_per_head(q, l->q_norm_weight, n, n_heads, head_dim, eps);
+        qwen_rms_norm_per_head(k, l->k_norm_weight, n, n_kv_heads, head_dim, eps);
+
+        /* Each stream sits at its own position, so RoPE and attention are
+         * applied per row rather than over the batch. */
+        for (int s = 0; s < n; s++) {
+            int pos = kvs[s]->len;
+            const float *rc = ctx->rope_cache_cos + (size_t)pos * head_dim;
+            const float *rs = ctx->rope_cache_sin + (size_t)pos * head_dim;
+            qwen_apply_rope_neox(q + (size_t)s * q_dim, rc, rs, 1, n_heads, head_dim);
+            qwen_apply_rope_neox(k + (size_t)s * kv_dim, rc, rs, 1, n_kv_heads, head_dim);
+
+            float *dst_k = kvs[s]->k + ((size_t)layer * kvs[s]->max + pos) * kv_dim;
+            float *dst_v = kvs[s]->v + ((size_t)layer * kvs[s]->max + pos) * kv_dim;
+            memcpy(dst_k, k + (size_t)s * kv_dim, kv_dim * sizeof(float));
+            memcpy(dst_v, v + (size_t)s * kv_dim, kv_dim * sizeof(float));
+
+            float *full_k = kvs[s]->k + (size_t)layer * kvs[s]->max * kv_dim;
+            float *full_v = kvs[s]->v + (size_t)layer * kvs[s]->max * kv_dim;
+            qwen_causal_attention(attn_out + (size_t)s * q_dim, q + (size_t)s * q_dim,
+                                  full_k, full_v, 1, pos + 1, n_heads, n_kv_heads,
+                                  head_dim, scale, pos);
+        }
+
+        if (dec->quantized)
+            qwen_linear_nobias_q8(proj_out, attn_out, &l->wo_q8, n);
+        else
+            qwen_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, n, q_dim, dim);
+        qwen_add_inplace(x, proj_out, n * dim);
+
+        qwen_rms_norm(x_norm, x, l->post_attn_norm, n, dim, eps);
+
+        if (dec->quantized) {
+            qwen_linear_nobias_q8(gate_up, x_norm, &l->gate_up_q8, n);
+            qwen_swiglu_multiply(gate, gate_up, n, intermediate);
+            qwen_linear_nobias_q8(ffn_out, gate, &l->down_q8, n);
+        } else {
+            qwen_linear_nobias_bf16(gate_up, x_norm, l->gate_up_fused_bf16,
+                                    n, dim, 2 * intermediate);
+            qwen_swiglu_multiply(gate, gate_up, n, intermediate);
+            qwen_linear_nobias_bf16(ffn_out, gate, l->down_weight_bf16,
+                                    n, intermediate, dim);
+        }
+        qwen_add_inplace(x, ffn_out, n * dim);
+    }
+
+    for (int s = 0; s < n; s++) kvs[s]->len++;
+
+    qwen_rms_norm(x, x, dec->norm, n, dim, eps);
+    if (dec->embed_quantized)
+        return qwen_argmax_matvec_q8_batch(x, n, &dec->tok_embeddings_q8, out_tokens);
+
+    for (int s = 0; s < n; s++)
+        out_tokens[s] = qwen_argmax_matvec_bf16(x + (size_t)s * dim,
+                                                dec->tok_embeddings_bf16,
+                                                dim, cfg->vocab_size);
+    return 0;
+}
+
+/* Prefill several fresh streams in one pass.
+ *
+ * Prefill measures as ~590 ms of fixed cost plus ~3.6 ms per row on M1 Pro:
+ * the fixed part is the sweep that dequantizes every Q8 weight into f32
+ * panels for sgemm, and it is paid once per call no matter how few rows
+ * follow. Concatenating a batch's segments into one call pays it once
+ * instead of n times. Rows keep their own sequence's attention, so this is
+ * not a longer context - just a taller matrix.
+ *
+ * Every stream must be empty (len == 0); embeds[i] is [lens[i]][dec_hidden]. */
+int qwen_decoder_prefill_multi(qwen_ctx_t *ctx, qwen_kv_t **kvs,
+                               const float *const *embeds, const int *lens, int n) {
+    if (n <= 0) return 0;
+    if (n == 1) {
+        qwen_kv_bind(ctx, kvs[0]);
+        qwen_decoder_prefill(ctx, embeds[0], lens[0]);
+        qwen_kv_unbind(ctx, kvs[0]);
+        return kvs[0]->len == lens[0] ? 0 : -1;
+    }
+
+    qwen_decoder_t *dec = &ctx->decoder;
+    const qwen_config_t *cfg = &ctx->config;
+    int dim = cfg->dec_hidden;
+    int n_heads = cfg->dec_heads;
+    int n_kv_heads = cfg->dec_kv_heads;
+    int head_dim = cfg->dec_head_dim;
+    int intermediate = cfg->dec_intermediate;
+    float eps = cfg->dec_rms_norm_eps;
+    float theta = cfg->dec_rope_theta;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    int rows = 0, longest = 0;
+    for (int i = 0; i < n; i++) {
+        if (kvs[i]->len != 0) return -1;
+        if (lens[i] <= 0) return -1;
+        if (kv_grow(ctx, kvs[i], lens[i]) != 0) return -1;
+        rows += lens[i];
+        if (lens[i] > longest) longest = lens[i];
+    }
+    if (ensure_prefill_buffers(ctx, rows) != 0) return -1;
+    if (ensure_rope_cache(ctx, longest, head_dim, theta) != 0) return -1;
+
+    float *x = ctx->pref_x;
+    float *x_norm = ctx->pref_x_norm;
+    float *q = ctx->pref_q;
+    float *k = ctx->pref_k;
+    float *v = ctx->pref_v;
+    float *attn_out = ctx->pref_attn_out;
+    float *proj_out = ctx->pref_proj_out;
+    float *ffn_out = ctx->pref_ffn_out;
+    float *gate = ctx->pref_gate;
+    float *gate_up = ctx->pref_gate_up;
+
+    for (int i = 0, off = 0; i < n; off += lens[i], i++)
+        memcpy(x + (size_t)off * dim, embeds[i], (size_t)lens[i] * dim * sizeof(float));
+
+    const float *rope_cos = ctx->rope_cache_cos;
+    const float *rope_sin = ctx->rope_cache_sin;
+
+    for (int layer = 0; layer < cfg->dec_layers; layer++) {
+        qwen_dec_layer_t *l = &dec->layers[layer];
+
+        qwen_rms_norm(x_norm, x, l->input_norm, rows, dim, eps);
+        if (dec->quantized) {
+            qwen_linear_nobias_q8(q, x_norm, &l->wq_q8, rows);
+            qwen_linear_nobias_q8(k, x_norm, &l->wk_q8, rows);
+            qwen_linear_nobias_q8(v, x_norm, &l->wv_q8, rows);
+        } else {
+            qwen_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, rows, dim, q_dim);
+            qwen_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, rows, dim, kv_dim);
+            qwen_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, rows, dim, kv_dim);
+        }
+
+        qwen_rms_norm_per_head(q, l->q_norm_weight, rows, n_heads, head_dim, eps);
+        qwen_rms_norm_per_head(k, l->k_norm_weight, rows, n_kv_heads, head_dim, eps);
+
+        /* Each stream restarts at position 0 and attends only to itself. */
+        for (int i = 0, off = 0; i < n; off += lens[i], i++) {
+            int len = lens[i];
+            float *qi = q + (size_t)off * q_dim;
+            float *ki = k + (size_t)off * kv_dim;
+            float *vi = v + (size_t)off * kv_dim;
+
+            qwen_apply_rope_neox(qi, rope_cos, rope_sin, len, n_heads, head_dim);
+            qwen_apply_rope_neox(ki, rope_cos, rope_sin, len, n_kv_heads, head_dim);
+
+            float *ck = kvs[i]->k + (size_t)layer * kvs[i]->max * kv_dim;
+            float *cv = kvs[i]->v + (size_t)layer * kvs[i]->max * kv_dim;
+            memcpy(ck, ki, (size_t)len * kv_dim * sizeof(float));
+            memcpy(cv, vi, (size_t)len * kv_dim * sizeof(float));
+
+            qwen_causal_attention(attn_out + (size_t)off * q_dim, qi, ck, cv,
+                                  len, len, n_heads, n_kv_heads, head_dim, scale, 0);
+        }
+
+        if (dec->quantized)
+            qwen_linear_nobias_q8(proj_out, attn_out, &l->wo_q8, rows);
+        else
+            qwen_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, rows, q_dim, dim);
+        qwen_add_inplace(x, proj_out, rows * dim);
+
+        qwen_rms_norm(x_norm, x, l->post_attn_norm, rows, dim, eps);
+
+        if (dec->quantized) {
+            qwen_linear_nobias_q8(gate_up, x_norm, &l->gate_up_q8, rows);
+            qwen_swiglu_multiply(gate, gate_up, rows, intermediate);
+            qwen_linear_nobias_q8(ffn_out, gate, &l->down_q8, rows);
+        } else {
+            qwen_linear_nobias_bf16(gate_up, x_norm, l->gate_up_fused_bf16,
+                                    rows, dim, 2 * intermediate);
+            qwen_swiglu_multiply(gate, gate_up, rows, intermediate);
+            qwen_linear_nobias_bf16(ffn_out, gate, l->down_weight_bf16,
+                                    rows, intermediate, dim);
+        }
+        qwen_add_inplace(x, ffn_out, rows * dim);
+    }
+
+    for (int i = 0; i < n; i++) kvs[i]->len = lens[i];
+    return 0;
+}

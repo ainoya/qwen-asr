@@ -33,7 +33,7 @@ qwen_asr_safetensors.c qwen_asr_pack.c wasm/qwen_wasm.c"
 
 EXPORTS='["_qwen_wasm_alloc","_qwen_wasm_release","_qwen_wasm_init","_qwen_wasm_ready","_qwen_wasm_threads","_qwen_wasm_pool_selftest","_qwen_wasm_pool_parts","_qwen_wasm_pool_ms","_qwen_wasm_shutdown","_qwen_wasm_selftest_start","_qwen_wasm_selftest_value",
 "_qwen_wasm_batch_start","_qwen_wasm_job_done","_qwen_wasm_job_take","_qwen_wasm_take_text","_qwen_wasm_set_language",
-"_qwen_wasm_set_segment_sec","_qwen_wasm_set_stream_params",
+"_qwen_wasm_set_segment_sec","_qwen_wasm_set_batch_size","_qwen_wasm_set_stream_params",
 "_qwen_wasm_stream_start","_qwen_wasm_stream_push","_qwen_wasm_stream_finish",
 "_qwen_wasm_total_ms","_qwen_wasm_encode_ms","_qwen_wasm_decode_ms",
 "_qwen_wasm_text_tokens",

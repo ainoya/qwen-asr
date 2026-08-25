@@ -1387,6 +1387,93 @@ int qwen_argmax_matvec_q8(const float *x, const qwen_q8_mat_t *W) {
     return best;
 }
 
+
+/* ---- Batched argmax: B hidden states scored against one LM head sweep ----
+ *
+ * Decoding a token is memory bound: the 151936x2048 head alone is 330 MB of
+ * the 1.83 GB read per token. Scoring several independent sequences in one
+ * sweep costs the same reads, so the head becomes nearly free per extra
+ * sequence. */
+
+typedef struct {
+    const int8_t *qx;
+    const float *sx;
+    int m;
+    const qwen_q8_mat_t *W;
+    int best_idx[QWEN_MAX_THREADS][QWEN_Q8_MAX_M];
+    float best_val[QWEN_MAX_THREADS][QWEN_Q8_MAX_M];
+} q8_argmax_m_task_t;
+
+#define ARGMAX_BLOCK 256
+
+static void q8_argmax_m_worker(int tid, int n_threads, void *arg) {
+    q8_argmax_m_task_t *t = (q8_argmax_m_task_t *)arg;
+    const qwen_q8_mat_t *W = t->W;
+    int nb = W->cols / QWEN_Q8_BLOCK;
+    int m = t->m;
+    int chunk = qwen_chunk_size(W->rows, n_threads, ARGMAX_BLOCK);
+    float buf[QWEN_Q8_MAX_M * ARGMAX_BLOCK];
+
+    float best_val[QWEN_Q8_MAX_M];
+    int best_idx[QWEN_Q8_MAX_M];
+    for (int r = 0; r < m; r++) { best_val[r] = -1e30f; best_idx[r] = 0; }
+
+    for (int c = qwen_claim_chunk(); ; c = qwen_claim_chunk()) {
+        int start = c * chunk;
+        if (start >= W->rows) break;
+        int end = start + chunk;
+        if (end > W->rows) end = W->rows;
+
+        for (int o = start; o < end; o += ARGMAX_BLOCK) {
+            int rows = end - o;
+            if (rows > ARGMAX_BLOCK) rows = ARGMAX_BLOCK;
+            qwen_q8_matvec_m_impl(buf, ARGMAX_BLOCK, t->qx, t->sx, m,
+                                  W->q + (size_t)o * W->cols,
+                                  W->scales + (size_t)o * nb,
+                                  W->cols, rows);
+            for (int r = 0; r < m; r++) {
+                const float *row = buf + (size_t)r * ARGMAX_BLOCK;
+                float bv = best_val[r];
+                int bi = best_idx[r];
+                for (int i = 0; i < rows; i++)
+                    if (row[i] > bv) { bv = row[i]; bi = o + i; }
+                best_val[r] = bv;
+                best_idx[r] = bi;
+            }
+        }
+    }
+
+    for (int r = 0; r < m; r++) {
+        t->best_val[tid][r] = best_val[r];
+        t->best_idx[tid][r] = best_idx[r];
+    }
+}
+
+int qwen_argmax_matvec_q8_batch(const float *x, int m,
+                                const qwen_q8_mat_t *W, int *out) {
+    if (m <= 0) return 0;
+    if (m > QWEN_Q8_MAX_M) return -1;
+    if (m == 1) { out[0] = qwen_argmax_matvec_q8(x, W); return 0; }
+    if (q8_act_prepare_m(x, W->cols, m) != 0) return -1;
+
+    q8_argmax_m_task_t task;
+    task.qx = q8_act_q;
+    task.sx = q8_act_s;
+    task.m = m;
+    task.W = W;
+    parallel_for(q8_argmax_m_worker, &task);
+
+    int n = tp.n_threads > 0 ? tp.n_threads : 1;
+    for (int r = 0; r < m; r++) {
+        int best = task.best_idx[0][r];
+        float bv = task.best_val[0][r];
+        for (int i = 1; i < n; i++)
+            if (task.best_val[i][r] > bv) { bv = task.best_val[i][r]; best = task.best_idx[i][r]; }
+        out[r] = best;
+    }
+    return 0;
+}
+
 /* ========================================================================
  * 2D Convolution (im2col + BLAS sgemm)
  * ======================================================================== */

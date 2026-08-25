@@ -72,6 +72,7 @@ void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
 /* Activation rows handled per pass by the batched kernel (register budget). */
 #define QWEN_Q8_GROUP 16
 
+
 typedef struct {
     int8_t *q;        /* [rows * cols], row-major                */
     float  *scales;   /* [rows * cols / QWEN_Q8_BLOCK]           */
@@ -129,6 +130,11 @@ void qwen_linear_nobias_q8_qkv(float *q, float *k, float *v, const float *x,
 
 /* argmax(W @ x) without materializing logits. */
 int qwen_argmax_matvec_q8(const float *x, const qwen_q8_mat_t *W);
+
+/* Same, for m independent hidden states laid out as [m][W->cols]. Writes m
+ * token ids to out. Returns -1 if m exceeds QWEN_Q8_MAX_M. */
+int qwen_argmax_matvec_q8_batch(const float *x, int m,
+                                const qwen_q8_mat_t *W, int *out);
 
 /* ========================================================================
  * 2D Convolution (for audio encoder conv stem)

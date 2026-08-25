@@ -197,7 +197,39 @@ Monitor output goes to stderr and does not affect the transcription text on stdo
 
 Splits audio into segments of ~N seconds, finding segment-cutting silence boundaries within a search window (`-W`, default 3 seconds). Segments are transcribed and concatenated.
 
-Default segmented behavior (`-S > 0`) emits tokens ASAP, like full offline mode.
+Default segmented behavior (`-S > 0`) decodes segments in batches of 4 (see
+`--batch` below) and emits a segment at a time. `--batch 1` restores
+token-by-token emission.
+
+#### Batched segment decoding (`--batch`)
+
+Without past-text conditioning, segments do not depend on each other, so
+several of them can be decoded in lockstep. Generating one token reads every
+decoder weight exactly once — 1.83 GB for the 1.7B model in Q8 — which
+saturates memory bandwidth while leaving the arithmetic units idle, so the
+second and later streams in a batch are close to free.
+
+```bash
+./qwen_asr -d qwen3-asr-1.7b -i long_recording.wav -S 30 --batch 8
+```
+
+Applies when all of these hold: `-S > 0`, past-text conditioning off (the
+default), and quantized weights (`--weights q8-lm`, the default). Otherwise the
+flag is ignored and segments are decoded one at a time.
+
+Measured on M1 Pro, 1.7B Q8, a 246s Japanese recording at `-S 30`:
+
+| `--batch` | wall | realtime | peak RSS |
+|-----------|------|----------|----------|
+| 1 | 33.8 s | 7.3x | 2.6 GB |
+| 4 (default) | 20.3 s | 12.1x | 3.3 GB |
+| 8 | 18.3 s | 13.5x | 4.1 GB |
+| 12 | 17.3 s | 14.2x | — |
+
+Each stream keeps its own KV cache, which is where the extra memory goes;
+raise `--batch` if you have the headroom. The trade-off is emission
+granularity, not accuracy: a segment's text is released once every earlier
+segment in its group has finished.
 
 When `--past-text yes` is used, segmented mode switches to buffered per-segment emission and enables boundary post-processing:
 - Split points are chosen near low-energy (silence-like) regions within the `-W` window to avoid cutting in the middle of words.
@@ -474,6 +506,34 @@ Where the time went, and what changed:
 
 Decoder prefill is already close to the hardware ceiling: its `sgemm` calls run
 at ~1.4 TFLOPS, about what the M1 AMX blocks sustain.
+
+#### Reading the weights once for several rows
+
+Being at the memory wall means the only remaining levers are reading fewer
+bytes, or getting more work out of the bytes already read. Two changes take the
+second route.
+
+- **A batched Q8 matvec for short sequences.** The Q8 linear path had only two
+  modes: a single-row matvec, and a prefill path that dequantizes weight row
+  panels into f32 and hands them to `sgemm`. The panel path moves ~9 bytes per
+  weight (read the int8, write the f32, read it back) to buy AMX throughput.
+  That pays for a full-audio prefill of several hundred rows and is pure waste
+  below that. A kernel that reads each weight row once and accumulates against
+  every activation row moves 1.06 bytes per weight instead. Crossover measured
+  near 500 rows; the default threshold is 256. Streaming, which re-prefills a
+  few dozen rows per chunk, went from 18.6 s to 12.4 s on a 45s clip.
+
+  The kernel is instantiated for a compile-time row count. With a runtime count
+  the accumulator array is indexed dynamically, so it lives on the stack rather
+  than in registers; specialising for 1/2/4/8 rows and splitting the batch
+  across them was worth another 24% on batched decode.
+
+- **Batched segment decoding** (`--batch`, above) applies the same idea to
+  whole utterances, and **one prefill for the whole batch** applies it to the
+  prefill: prefill costs roughly 590 ms of fixed dequantize sweep plus 3.6 ms
+  per row, and concatenating a batch's segments into a single call pays the
+  fixed part once. Rows keep their own sequence's attention, so this is a
+  taller matrix, not a longer context.
 
 ### Compared To Other Runtimes
 

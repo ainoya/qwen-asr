@@ -60,6 +60,13 @@ gave the engine ~1.3 cores no matter how many threads were requested.
 So wasm lands at roughly 2.2x the native time — normal for SIMD128 without
 Accelerate's AMX-backed sgemm.
 
+For recordings long enough to segment, `_qwen_wasm_set_batch_size(n)` turns on
+batched segment decoding (the demo exposes it as the "batch" control next to
+"segment"). Generating a token reads every decoder weight once, so decoding
+several segments in lockstep costs barely more than one; it needs a segment
+size set and past-text conditioning off. See the `--batch` section of the top
+level README for the native measurements.
+
 Quality is checked with the same character-error metric as the native suite:
 
 ```bash

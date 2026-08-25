@@ -395,42 +395,84 @@ void qwen_q8_argmax_range_neon(const int8_t *qx, const float *sx,
 /* Batched Q8 matvec: one weight row load feeds m activation vectors. See the
  * generic version for why this beats dequantize-into-a-panel for short
  * sequences. */
+/* Batched Q8 matvec: one pass over the weight rows scores M activation rows.
+ *
+ * M has to be a compile-time constant. With a runtime row count the
+ * accumulator array is indexed dynamically, so it lives on the stack instead
+ * of in registers and the kernel spends its time spilling - measured at about
+ * a quarter of the throughput of the specialised versions below. */
+#define Q8_MATVEC_M_KERNEL(NAME, M)                                            \
+static void NAME(float *y, int ldy, const int8_t *qx, const float *sx,         \
+                 const int8_t *W, const float *ws, int in_dim, int rows) {     \
+    int nb = in_dim / Q8B;                                                     \
+    for (int o = 0; o < rows; o++) {                                           \
+        const int8_t *w = W + (size_t)o * in_dim;                              \
+        const float *s = ws + (size_t)o * nb;                                  \
+        float32x4_t facc[M];                                                   \
+        for (int r = 0; r < M; r++) facc[r] = vdupq_n_f32(0.0f);                \
+        for (int b = 0; b < nb; b++) {                                         \
+            const int8_t *wp = w + (size_t)b * Q8B;                            \
+            int8x16_t w0 = vld1q_s8(wp);                                       \
+            int8x16_t w1 = vld1q_s8(wp + 16);                                  \
+            int8x16_t w2 = vld1q_s8(wp + 32);                                  \
+            int8x16_t w3 = vld1q_s8(wp + 48);                                  \
+            float sc = s[b];                                                   \
+            for (int r = 0; r < M; r++) {                                      \
+                const int8_t *xp = qx + (size_t)r * in_dim + (size_t)b * Q8B;  \
+                int32x4_t a0 = vdotq_s32(vdupq_n_s32(0), w0, vld1q_s8(xp));    \
+                int32x4_t a1 = vdotq_s32(vdupq_n_s32(0), w1, vld1q_s8(xp + 16)); \
+                a0 = vdotq_s32(a0, w2, vld1q_s8(xp + 32));                     \
+                a1 = vdotq_s32(a1, w3, vld1q_s8(xp + 48));                     \
+                facc[r] = vfmaq_n_f32(facc[r], vcvtq_f32_s32(vaddq_s32(a0, a1)), \
+                                      sc * sx[(size_t)r * nb + b]);            \
+            }                                                                  \
+        }                                                                      \
+        for (int r = 0; r < M; r++)                                            \
+            y[(size_t)r * ldy + o] = vaddvq_f32(facc[r]);                      \
+    }                                                                          \
+}
+
+#ifdef __ARM_FEATURE_DOTPROD
+Q8_MATVEC_M_KERNEL(q8_mv_m1, 1)
+Q8_MATVEC_M_KERNEL(q8_mv_m2, 2)
+Q8_MATVEC_M_KERNEL(q8_mv_m4, 4)
+Q8_MATVEC_M_KERNEL(q8_mv_m8, 8)
+#endif
+
 void qwen_q8_matvec_m_neon(float *y, int ldy, const int8_t *qx, const float *sx,
                            int m, const int8_t *W, const float *ws,
                            int in_dim, int rows) {
     int nb = in_dim / Q8B;
+#ifdef __ARM_FEATURE_DOTPROD
+    int off = 0;
+    while (m - off > 0) {
+        int take = m - off;
+        const int8_t *x = qx + (size_t)off * in_dim;
+        const float *xs = sx + (size_t)off * nb;
+        float *dst = y + (size_t)off * ldy;
+        if (take >= 8)      { q8_mv_m8(dst, ldy, x, xs, W, ws, in_dim, rows); take = 8; }
+        else if (take >= 4) { q8_mv_m4(dst, ldy, x, xs, W, ws, in_dim, rows); take = 4; }
+        else if (take >= 2) { q8_mv_m2(dst, ldy, x, xs, W, ws, in_dim, rows); take = 2; }
+        else                { q8_mv_m1(dst, ldy, x, xs, W, ws, in_dim, rows); take = 1; }
+        off += take;
+    }
+#else
     for (int o = 0; o < rows; o++) {
         const int8_t *w = W + (size_t)o * in_dim;
         const float *s = ws + (size_t)o * nb;
-        float acc[16];
-        for (int r = 0; r < m; r++) acc[r] = 0.0f;
-
-        for (int b = 0; b < nb; b++) {
-            const int8_t *wp = w + (size_t)b * Q8B;
-            int8x16_t w0 = vld1q_s8(wp);
-            int8x16_t w1 = vld1q_s8(wp + 16);
-            int8x16_t w2 = vld1q_s8(wp + 32);
-            int8x16_t w3 = vld1q_s8(wp + 48);
-            float sc = s[b];
-
-            for (int r = 0; r < m; r++) {
-                const int8_t *xp = qx + (size_t)r * in_dim + (size_t)b * Q8B;
-#ifdef __ARM_FEATURE_DOTPROD
-                int32x4_t a = vdupq_n_s32(0);
-                a = vdotq_s32(a, w0, vld1q_s8(xp));
-                a = vdotq_s32(a, w1, vld1q_s8(xp + 16));
-                a = vdotq_s32(a, w2, vld1q_s8(xp + 32));
-                a = vdotq_s32(a, w3, vld1q_s8(xp + 48));
-                int32_t d = vaddvq_s32(a);
-#else
+        for (int r = 0; r < m; r++) {
+            float acc = 0.0f;
+            for (int b = 0; b < nb; b++) {
                 int32_t d = 0;
-                for (int i = 0; i < Q8B; i++) d += (int32_t)wp[i] * (int32_t)xp[i];
-#endif
-                acc[r] += (float)d * sc * sx[(size_t)r * nb + b];
+                for (int i = 0; i < Q8B; i++)
+                    d += (int32_t)w[(size_t)b * Q8B + i] *
+                         (int32_t)qx[(size_t)r * in_dim + (size_t)b * Q8B + i];
+                acc += (float)d * s[b] * sx[(size_t)r * nb + b];
             }
+            y[(size_t)r * ldy + o] = acc;
         }
-        for (int r = 0; r < m; r++) y[(size_t)r * ldy + o] = acc[r];
     }
+#endif
 }
 
 #endif /* __ARM_NEON */

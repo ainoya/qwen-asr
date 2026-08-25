@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 /* ========================================================================
  * Weight Loading
@@ -195,8 +196,20 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
  * Forward Pass
  * ======================================================================== */
 
+/* Coarse phase timing, so the conv stem and the transformer stack can be
+ * weighed against each other when deciding what to move to a GPU backend. */
+double qwen_enc_conv_ms = 0;
+double qwen_enc_layers_ms = 0;
+
+static double enc_now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
+}
+
 float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
                              int *out_seq_len) {
+    double enc_t0 = enc_now_ms();
     const qwen_config_t *cfg = &ctx->config;
     qwen_encoder_t *enc = &ctx->encoder;
 
@@ -312,6 +325,9 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
         token_offset += w3;
     }
 
+    qwen_enc_conv_ms = enc_now_ms() - enc_t0;
+    enc_t0 = enc_now_ms();
+
     /* ---- Build attention window boundaries ---- */
     /* Window size = tokens_per_chunk * (n_window_infer / chunk_size) */
     int window_token_size = tokens_per_chunk * (n_window_infer / chunk_size);
@@ -384,6 +400,11 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     free(attn_out); free(proj_out);
     free(ffn_mid); free(ffn_out);
     free(window_starts);
+
+    qwen_enc_layers_ms = enc_now_ms() - enc_t0;
+    if (qwen_verbose >= 2)
+        fprintf(stderr, "  Encoder: conv stem %.0f ms, transformer %.0f ms\n",
+                qwen_enc_conv_ms, qwen_enc_layers_ms);
 
     *out_seq_len = total_tokens;
     return enc_output;

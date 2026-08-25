@@ -433,7 +433,11 @@ static void gemm_worker(int tid, int n_threads, void *arg) {
     }
 }
 
-/* C[M,N] = A[M,K] @ B[K,N], both row-major (conv2d's im2col shape). */
+/* C[M,N] = A[M,K] @ B[K,N], both row-major (conv2d's im2col shape).
+ *
+ * Four output rows share each B read. A register-tiled 4x8 variant was tried
+ * and was 20% *slower* under wasm - the accumulator block does not survive the
+ * engine's register allocation - so this stays simple. */
 static void gemm_nn_tile(float *restrict C, const float *restrict A,
                          const float *restrict B, int K, int N,
                          int m0, int m1) {
@@ -1306,31 +1310,70 @@ int qwen_argmax_matvec_q8(const float *x, const qwen_q8_mat_t *W) {
  * Input: [C_in, H_in, W_in]
  * Output columns: [C_in * kH * kW, H_out * W_out]
  */
-static void im2col(const float *in, float *cols,
-                   int c_in, int h_in, int w_in,
-                   int kh, int kw, int stride, int padding,
-                   int h_out, int w_out) {
-    int col_len = h_out * w_out;
-    for (int ic = 0; ic < c_in; ic++) {
-        for (int ki = 0; ki < kh; ki++) {
-            for (int kj = 0; kj < kw; kj++) {
-                int col_row = (ic * kh + ki) * kw + kj;
-                float *col_ptr = cols + (size_t)col_row * col_len;
-                for (int oh = 0; oh < h_out; oh++) {
-                    int ih = oh * stride - padding + ki;
-                    for (int ow = 0; ow < w_out; ow++) {
-                        int iw = ow * stride - padding + kj;
-                        if (ih >= 0 && ih < h_in && iw >= 0 && iw < w_in) {
-                            col_ptr[oh * w_out + ow] = in[ic * h_in * w_in + ih * w_in + iw];
-                        } else {
-                            col_ptr[oh * w_out + ow] = 0.0f;
-                        }
-                    }
-                }
-            }
+/* im2col for one patch row (one (channel, ky, kx) triple).
+ *
+ * The source row index is fixed for the whole row, so the vertical bounds check
+ * hoists out; the horizontal one splits the output into a left pad, an interior
+ * run and a right pad, which removes the per-element branch from the hot loop. */
+static void im2col_row(const float *in, float *col_ptr,
+                       int ic, int ki, int kj,
+                       int h_in, int w_in, int stride, int padding,
+                       int h_out, int w_out) {
+    const float *plane = in + (size_t)ic * h_in * w_in;
+
+    /* Horizontal range of ow where iw = ow*stride - padding + kj is in bounds. */
+    int ow_lo = 0;
+    while (ow_lo < w_out && ow_lo * stride - padding + kj < 0) ow_lo++;
+    int ow_hi = w_out;
+    while (ow_hi > ow_lo && (ow_hi - 1) * stride - padding + kj >= w_in) ow_hi--;
+
+    for (int oh = 0; oh < h_out; oh++) {
+        float *dst = col_ptr + (size_t)oh * w_out;
+        int ih = oh * stride - padding + ki;
+        if (ih < 0 || ih >= h_in) {
+            memset(dst, 0, (size_t)w_out * sizeof(float));
+            continue;
+        }
+        const float *src = plane + (size_t)ih * w_in - padding + kj;
+        for (int ow = 0; ow < ow_lo; ow++) dst[ow] = 0.0f;
+        for (int ow = ow_lo; ow < ow_hi; ow++) dst[ow] = src[ow * stride];
+        for (int ow = ow_hi; ow < w_out; ow++) dst[ow] = 0.0f;
+    }
+}
+
+typedef struct {
+    const float *in;
+    float *cols;
+    int c_in, h_in, w_in, kh, kw, stride, padding, h_out, w_out;
+} im2col_task_t;
+
+static void im2col_worker(int tid, int n_threads, void *arg) {
+    (void)tid;
+    im2col_task_t *t = (im2col_task_t *)arg;
+    int rows = t->c_in * t->kh * t->kw;
+    int col_len = t->h_out * t->w_out;
+    int chunk = qwen_chunk_size(rows, n_threads, 1);
+
+    for (int c = qwen_claim_chunk(); ; c = qwen_claim_chunk()) {
+        int start = c * chunk;
+        if (start >= rows) return;
+        int end = start + chunk;
+        if (end > rows) end = rows;
+        for (int r = start; r < end; r++) {
+            int kj = r % t->kw;
+            int ki = (r / t->kw) % t->kh;
+            int ic = r / (t->kw * t->kh);
+            im2col_row(t->in, t->cols + (size_t)r * col_len, ic, ki, kj,
+                       t->h_in, t->w_in, t->stride, t->padding, t->h_out, t->w_out);
         }
     }
 }
+
+/* Reused across calls: the encoder runs this once per audio chunk, and the
+ * largest buffer here is ~14 MB, so re-allocating it 120 times per utterance is
+ * pure overhead. */
+static float *conv_cols = NULL;
+static size_t conv_cols_cap = 0;
 
 void qwen_conv2d(float *out, const float *in, const float *weight, const float *bias,
                  int c_in, int c_out, int h_in, int w_in,
@@ -1340,30 +1383,33 @@ void qwen_conv2d(float *out, const float *in, const float *weight, const float *
     int patch_size = c_in * kh * kw;
     int spatial_out = h_out * w_out;
 
-    /* im2col: input -> column matrix [patch_size, spatial_out] */
-    float *cols = (float *)malloc((size_t)patch_size * spatial_out * sizeof(float));
-    im2col(in, cols, c_in, h_in, w_in, kh, kw, stride, padding, h_out, w_out);
+    size_t need = (size_t)patch_size * spatial_out;
+    if (need > conv_cols_cap) {
+        free(conv_cols);
+        conv_cols = (float *)malloc(need * sizeof(float));
+        conv_cols_cap = conv_cols ? need : 0;
+        if (!conv_cols_cap) return;
+    }
 
-    /* GEMM: weight[c_out, patch_size] @ cols[patch_size, spatial_out] = out[c_out, spatial_out] */
+    im2col_task_t task = { in, conv_cols, c_in, h_in, w_in, kh, kw,
+                           stride, padding, h_out, w_out };
+    parallel_for(im2col_worker, &task);
+
+    /* GEMM: weight[c_out, patch_size] @ cols[patch_size, spatial_out] */
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 c_out, spatial_out, patch_size,
-                1.0f, weight, patch_size, cols, spatial_out,
+                1.0f, weight, patch_size, conv_cols, spatial_out,
                 0.0f, out, spatial_out);
 #else
-    qwen_gemm_nn_generic(out, weight, cols, c_out, patch_size, spatial_out);
+    qwen_gemm_nn_generic(out, weight, conv_cols, c_out, patch_size, spatial_out);
 #endif
 
-    free(cols);
-
-    /* Add bias */
     if (bias) {
         for (int oc = 0; oc < c_out; oc++) {
             float b = bias[oc];
-            float *row = out + oc * spatial_out;
-            for (int s = 0; s < spatial_out; s++) {
-                row[s] += b;
-            }
+            float *row = out + (size_t)oc * spatial_out;
+            for (int s = 0; s < spatial_out; s++) row[s] += b;
         }
     }
 }

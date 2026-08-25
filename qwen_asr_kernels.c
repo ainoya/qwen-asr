@@ -1100,8 +1100,25 @@ static void q8_linear_prefill(float *y, const float *x, const qwen_q8_mat_t *W,
     int cols = W->cols;
     int rows = W->rows;
 
-    /* Panel sized to stay comfortably inside the shared L2. */
-    int panel_rows = (2 * 1024 * 1024) / cols;
+    /* Dequantize in row panels, then let BLAS do the multiply.
+     *
+     * The panel wants to be *large*, not L2-sized: sgemm does its own blocking
+     * and a big B lets it pick good shapes, while the dequantize itself becomes
+     * one long streaming pass. Measured on a 549-token prefill (M1 Pro, 1.7B):
+     * 2 M floats 2087 ms, 8 M 1514 ms, 32 M 1406 ms. 32 M covers the largest
+     * matrix here (12288x2048) in a single panel, and panel_rows is capped at
+     * the row count below, so nothing is over-allocated for smaller ones.
+     * QWEN_PANEL_KF (in units of 1024 floats) overrides it for experiments. */
+    static int panel_floats = 0;
+    if (!panel_floats) {
+        panel_floats = 32 * 1024 * 1024;
+        const char *env = getenv("QWEN_PANEL_KF");
+        if (env && env[0]) {
+            int kf = atoi(env);
+            if (kf > 0) panel_floats = kf * 1024;
+        }
+    }
+    int panel_rows = panel_floats / cols;
     if (panel_rows < 64) panel_rows = 64;
     if (panel_rows > rows) panel_rows = rows;
 

@@ -69,6 +69,7 @@ void qwen_vec_scale_add_generic(float *dst, const float *src, float correction, 
  * ======================================================================== */
 
 #define Q8B 64
+#define QWEN_Q8_MAX_M 16
 
 void qwen_q8_quantize_row_generic(const float *x, int8_t *qx, float *sx, int n) {
     for (int b = 0; b < n; b += Q8B) {
@@ -133,3 +134,33 @@ void qwen_q8_argmax_range_generic(const int8_t *qx, const float *sx,
     *best_val_out = best_val;
 }
 
+
+/* Batched Q8 matvec: m activation vectors against one weight matrix.
+ *
+ * The point is that the weight row is read once and reused for all m outputs.
+ * The alternative for a short sequence - dequantize the matrix into a panel and
+ * call sgemm - moves ~9 bytes per weight instead of 1.06, which is a bad trade
+ * until the sequence is long enough for the GEMM efficiency to pay for it. */
+void qwen_q8_matvec_m_generic(float *y, int ldy, const int8_t *qx, const float *sx,
+                              int m, const int8_t *W, const float *ws,
+                              int in_dim, int rows) {
+    int nb = in_dim / Q8B;
+    for (int o = 0; o < rows; o++) {
+        const int8_t *w = W + (size_t)o * in_dim;
+        const float *s = ws + (size_t)o * nb;
+        float acc[QWEN_Q8_MAX_M];
+        for (int r = 0; r < m; r++) acc[r] = 0.0f;
+
+        for (int b = 0; b < nb; b++) {
+            const int8_t *wb = w + b * Q8B;
+            float sc = s[b];
+            for (int r = 0; r < m; r++) {
+                const int8_t *xb = qx + (size_t)r * in_dim + b * Q8B;
+                int32_t d = 0;
+                for (int i = 0; i < Q8B; i++) d += (int32_t)wb[i] * (int32_t)xb[i];
+                acc[r] += (float)d * sc * sx[(size_t)r * nb + b];
+            }
+        }
+        for (int r = 0; r < m; r++) y[(size_t)r * ldy + o] = acc[r];
+    }
+}

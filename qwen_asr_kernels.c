@@ -1035,6 +1035,25 @@ static int8_t *q8_act_q = NULL;
 static float *q8_act_s = NULL;
 static int q8_act_cap = 0;
 
+/* Quantize m activation rows into the shared scratch. */
+static int q8_act_prepare_m(const float *x, int n, int m) {
+    int need = n * m;
+    if (need > q8_act_cap) {
+        free(q8_act_q);
+        free(q8_act_s);
+        q8_act_q = (int8_t *)malloc((size_t)need);
+        q8_act_s = (float *)malloc(((size_t)need / QWEN_Q8_BLOCK + 1) * sizeof(float));
+        q8_act_cap = (q8_act_q && q8_act_s) ? need : 0;
+        if (!q8_act_cap) return -1;
+    }
+    int nb = n / QWEN_Q8_BLOCK;
+    for (int r = 0; r < m; r++)
+        qwen_q8_quantize_row_impl(x + (size_t)r * n,
+                                  q8_act_q + (size_t)r * n,
+                                  q8_act_s + (size_t)r * nb, n);
+    return 0;
+}
+
 static int q8_act_prepare(const float *x, int n) {
     if (n > q8_act_cap) {
         free(q8_act_q);
@@ -1074,6 +1093,62 @@ static void q8_matvec_worker(int tid, int n_threads, void *arg) {
                             W->q + (size_t)start * W->cols,
                             W->scales + (size_t)start * nb,
                             W->cols, end - start);
+    }
+}
+
+/* ---- Short sequences: batched matvec, no dequantize ---- */
+
+static int qwen_q8_batch_max(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = QWEN_Q8_BATCH_MAX;
+        const char *env = getenv("QWEN_BATCH_MAX");
+        if (env && env[0]) {
+            int n = atoi(env);
+            if (n >= 0) v = n;
+        }
+    }
+    return v;
+}
+
+typedef struct {
+    float *y;
+    int ldy;
+    const int8_t *qx;
+    const float *sx;
+    int m;
+    const qwen_q8_mat_t *W;
+} q8_matvec_m_task_t;
+
+static void q8_matvec_m_worker(int tid, int n_threads, void *arg) {
+    (void)tid;
+    q8_matvec_m_task_t *t = (q8_matvec_m_task_t *)arg;
+    const qwen_q8_mat_t *W = t->W;
+    int nb = W->cols / QWEN_Q8_BLOCK;
+    int chunk = qwen_chunk_size(W->rows, n_threads, 32);
+
+    for (int c = qwen_claim_chunk(); ; c = qwen_claim_chunk()) {
+        int start = c * chunk;
+        if (start >= W->rows) return;
+        int end = start + chunk;
+        if (end > W->rows) end = W->rows;
+        int rows = end - start;
+        const int8_t *wq = W->q + (size_t)start * W->cols;
+        const float *wsc = W->scales + (size_t)start * nb;
+
+        /* The kernel holds one accumulator per activation row in registers, so
+         * long sequences are walked in groups. The group loop is innermost so
+         * this chunk's weight rows are read from DRAM once and stay in cache
+         * for every group; hoisting it out would multiply weight traffic by
+         * the group count. */
+        for (int off = 0; off < t->m; off += QWEN_Q8_GROUP) {
+            int m = t->m - off;
+            if (m > QWEN_Q8_GROUP) m = QWEN_Q8_GROUP;
+            qwen_q8_matvec_m_impl(t->y + (size_t)off * t->ldy + start, t->ldy,
+                                  t->qx + (size_t)off * W->cols,
+                                  t->sx + (size_t)off * nb, m,
+                                  wq, wsc, W->cols, rows);
+        }
     }
 }
 
@@ -1173,6 +1248,17 @@ void qwen_linear_w(float *y, const float *x, const qwen_wmat_t *W,
 
 void qwen_linear_nobias_q8(float *y, const float *x, const qwen_q8_mat_t *W,
                            int seq_len) {
+    /* Short sequences (streaming chunks, the token right after a prefill) are
+     * badly served by the panel path: it moves ~9 bytes per weight where a
+     * batched matvec moves 1.06. Crossover measured near 500 rows on M1 Pro
+     * (where sgemm on AMX finally outruns SDOT); the default is set well below
+     * it so a full-audio prefill still takes the sgemm path. */
+    if (seq_len > 1 && seq_len <= qwen_q8_batch_max()) {
+        if (q8_act_prepare_m(x, W->cols, seq_len) != 0) return;
+        q8_matvec_m_task_t task = { y, W->rows, q8_act_q, q8_act_s, seq_len, W };
+        parallel_for(q8_matvec_m_worker, &task);
+        return;
+    }
     if (seq_len != 1) {
         q8_linear_prefill(y, x, W, seq_len);
         return;

@@ -391,4 +391,46 @@ void qwen_q8_argmax_range_neon(const int8_t *qx, const float *sx,
 
 
 
+
+/* Batched Q8 matvec: one weight row load feeds m activation vectors. See the
+ * generic version for why this beats dequantize-into-a-panel for short
+ * sequences. */
+void qwen_q8_matvec_m_neon(float *y, int ldy, const int8_t *qx, const float *sx,
+                           int m, const int8_t *W, const float *ws,
+                           int in_dim, int rows) {
+    int nb = in_dim / Q8B;
+    for (int o = 0; o < rows; o++) {
+        const int8_t *w = W + (size_t)o * in_dim;
+        const float *s = ws + (size_t)o * nb;
+        float acc[16];
+        for (int r = 0; r < m; r++) acc[r] = 0.0f;
+
+        for (int b = 0; b < nb; b++) {
+            const int8_t *wp = w + (size_t)b * Q8B;
+            int8x16_t w0 = vld1q_s8(wp);
+            int8x16_t w1 = vld1q_s8(wp + 16);
+            int8x16_t w2 = vld1q_s8(wp + 32);
+            int8x16_t w3 = vld1q_s8(wp + 48);
+            float sc = s[b];
+
+            for (int r = 0; r < m; r++) {
+                const int8_t *xp = qx + (size_t)r * in_dim + (size_t)b * Q8B;
+#ifdef __ARM_FEATURE_DOTPROD
+                int32x4_t a = vdupq_n_s32(0);
+                a = vdotq_s32(a, w0, vld1q_s8(xp));
+                a = vdotq_s32(a, w1, vld1q_s8(xp + 16));
+                a = vdotq_s32(a, w2, vld1q_s8(xp + 32));
+                a = vdotq_s32(a, w3, vld1q_s8(xp + 48));
+                int32_t d = vaddvq_s32(a);
+#else
+                int32_t d = 0;
+                for (int i = 0; i < Q8B; i++) d += (int32_t)wp[i] * (int32_t)xp[i];
+#endif
+                acc[r] += (float)d * sc * sx[(size_t)r * nb + b];
+            }
+        }
+        for (int r = 0; r < m; r++) y[(size_t)r * ldy + o] = acc[r];
+    }
+}
+
 #endif /* __ARM_NEON */

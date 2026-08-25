@@ -63,6 +63,15 @@ void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
 
 #define QWEN_Q8_BLOCK 64
 
+/* Sequence lengths at or below this use a batched matvec instead of the
+ * dequantize-into-a-panel path. Override with QWEN_Q8_BATCH_MAX at build time. */
+#ifndef QWEN_Q8_BATCH_MAX
+#define QWEN_Q8_BATCH_MAX 256
+#endif
+
+/* Activation rows handled per pass by the batched kernel (register budget). */
+#define QWEN_Q8_GROUP 16
+
 typedef struct {
     int8_t *q;        /* [rows * cols], row-major                */
     float  *scales;   /* [rows * cols / QWEN_Q8_BLOCK]           */

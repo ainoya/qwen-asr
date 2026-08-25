@@ -60,6 +60,12 @@ gave the engine ~1.3 cores no matter how many threads were requested.
 So wasm lands at roughly 2.2x the native time — normal for SIMD128 without
 Accelerate's AMX-backed sgemm.
 
+The encoder's conv stem now convolves mel chunks in groups rather than one at
+a time (see the top level README): 1653 ms -> 1159 ms on the 41s clip. What
+remains in wasm on the 41s clip, with the GPU decoder handling prefill and
+generation, is mel 254 ms, conv stem 1159 ms and the encoder transformer
+1254 ms.
+
 For recordings long enough to segment, `_qwen_wasm_set_batch_size(n)` turns on
 batched segment decoding (the demo exposes it as the "batch" control next to
 "segment"). Generating a token reads every decoder weight once, so decoding

@@ -110,9 +110,8 @@ From `qwen_load()` and CLI:
 - Threads: performance-core count (`hw.perflevel0.logicalcpu` on Apple silicon,
   else `_SC_NPROCESSORS_ONLN`). Adding efficiency cores is measurably slower
   because every parallel dispatch is barrier-synchronised.
-- Decoder weights: `--weights q8`
+- Decoder weights: `--weights q8-lm` (`qwen_weight_quant` in `qwen_asr.c`)
 - Segment mode default: `-S 0` (full-audio decode)
-- Segment batch size: `--batch 4` (only used when `-S > 0`, past-text off, weights quantized)
 - Segment batch size: `--batch 4` (only used when `-S > 0`, past-text off, weights quantized)
 - Segment cut search window: `-W 3.0`
 - Stream chunk: `2.0s`
@@ -131,6 +130,8 @@ From `qwen_load()` and CLI:
   - streaming chunk loop, encoder-window cache, rollback commit logic
 - `qwen_asr_encoder.c`
   - audio tower load + forward
+  - conv stem convolves mel chunks in groups (one GEMM per group per layer);
+    group size capped by an im2col scratch budget, `QWEN_CONV_BUDGET_MB` overrides
 - `qwen_asr_decoder.c`
   - decoder load + prefill + token step + KV cache
 - `qwen_asr_audio.c`
@@ -255,13 +256,6 @@ Important caveat:
 When `-S > 0`:
 - split points are chosen near low-energy regions inside `-W`
 - default emission is token-by-token ASAP
-
-When `--past-text no` (the default) and weights are quantized, segments are
-decoded `--batch` at a time through `decode_segment_group()` in `qwen_asr.c`:
-one `qwen_decoder_prefill_multi()` for the whole group, then lockstep
-`qwen_decoder_forward_batch()` steps. Each stream owns a `qwen_kv_t`. Output is
-emitted a segment at a time rather than a token at a time; `--batch 1` restores
-the old per-segment path.
 
 When `--past-text no` (the default) and weights are quantized, segments are
 decoded `--batch` at a time through `decode_segment_group()` in `qwen_asr.c`:

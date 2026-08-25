@@ -528,6 +528,20 @@ second route.
   than in registers; specialising for 1/2/4/8 rows and splitting the batch
   across them was worth another 24% on batched decode.
 
+- **The conv stem convolves chunks in groups.** The encoder splits mel into
+  100-frame chunks and runs the three-layer Conv2D stem on each one
+  separately. Per chunk the second layer is a 480x4320x800 GEMM — too narrow
+  to keep the machine busy — and each layer costs its own dispatch. Since the
+  chunks are independent, their im2col columns concatenate along the spatial
+  axis and one GEMM covers a group of them; the group size is capped by the
+  im2col scratch (64 MB). The conv stem went from 285 ms to 163 ms native and
+  1653 ms to 1159 ms in wasm on a 41s clip.
+
+  Blocking the portable `gemm_nn` over N was tried here and is *not* used: it
+  keeps B in cache across the M loop, but it also shortens the inner run to
+  the panel width, and the four strided A loads per k no longer amortize over
+  it. A 128-column panel measured 30% slower.
+
 - **Batched segment decoding** (`--batch`, above) applies the same idea to
   whole utterances, and **one prefill for the whole batch** applies it to the
   prefill: prefill costs roughly 590 ms of fixed dequantize sweep plus 3.6 ms

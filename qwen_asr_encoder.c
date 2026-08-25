@@ -257,73 +257,115 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     float *x = (float *)calloc((size_t)total_tokens * d_model, sizeof(float));
     int token_offset = 0;
 
-    /* Process each chunk through Conv2D + reshape + project + sinusoidal PE */
-    for (int c = 0; c < n_chunks; c++) {
-        int start = c * chunk_size;
-        int end = start + chunk_size;
-        if (end > mel_frames) end = mel_frames;
-        int chunk_w = end - start;
+    /* Process chunks through Conv2D + reshape + project + sinusoidal PE.
+     *
+     * Chunks are convolved in groups: alone, a 100-frame chunk gives the
+     * second conv layer a 480x4320x800 GEMM, too narrow to keep the machine
+     * busy, and every layer costs a separate dispatch. The group size is
+     * capped by the im2col scratch, which is the widest buffer here. */
+    size_t conv_col_budget = 64u << 20; /* bytes; 128 MB buys ~2% more */
+    const char *budget_env = getenv("QWEN_CONV_BUDGET_MB");
+    if (budget_env && atoi(budget_env) > 0)
+        conv_col_budget = (size_t)atoi(budget_env) << 20;
 
-        /* Extract chunk mel: [128, chunk_w] */
-        float *chunk_mel = (float *)malloc(128 * chunk_w * sizeof(float));
-        for (int m = 0; m < 128; m++) {
-            memcpy(chunk_mel + m * chunk_w, mel + m * mel_frames + start,
-                   chunk_w * sizeof(float));
+    /* The second conv layer holds the widest im2col: 480*3*3 rows by one
+     * chunk's [h2, w2] output positions. */
+    int fh1 = (128 + 2 - 3) / 2 + 1, fh2 = (fh1 + 2 - 3) / 2 + 1;
+    int fw1 = (chunk_size + 2 - 3) / 2 + 1, fw2 = (fw1 + 2 - 3) / 2 + 1;
+    size_t cols_per_chunk = (size_t)QWEN_CONV_HIDDEN * 9 * fh2 * fw2 * sizeof(float);
+    int group = (int)(conv_col_budget / (cols_per_chunk ? cols_per_chunk : 1));
+    if (group < 1) group = 1;
+    if (group > n_chunks) group = n_chunks;
+
+    float *pe = (float *)malloc((size_t)tokens_per_chunk * d_model * sizeof(float));
+    qwen_sinusoidal_pe(pe, tokens_per_chunk, d_model);
+
+    for (int c0 = 0; c0 < n_chunks; ) {
+        /* Only equal-sized chunks can share a batch; the tail runs alone. */
+        int g = 0;
+        while (c0 + g < n_chunks && g < group &&
+               (c0 + g) * chunk_size + chunk_size <= mel_frames) g++;
+        if (g == 0) g = 1;
+
+        int start = c0 * chunk_size;
+        int end = start + g * chunk_size;
+        if (end > mel_frames) end = mel_frames;
+        int chunk_w = (end - start) / g;
+
+        int w1 = (chunk_w + 2 - 3) / 2 + 1;
+        int w2 = (w1 + 2 - 3) / 2 + 1;
+        int w3 = (w2 + 2 - 3) / 2 + 1;
+        int h1 = (128 + 2 - 3) / 2 + 1; /* 64 */
+        int h2 = (h1 + 2 - 3) / 2 + 1; /* 32 */
+        int h3 = (h2 + 2 - 3) / 2 + 1; /* 16 */
+
+        /* Batched mel: [1][g][128][chunk_w] */
+        float *chunk_mel = (float *)malloc((size_t)g * 128 * chunk_w * sizeof(float));
+        for (int b = 0; b < g; b++) {
+            float *dst = chunk_mel + (size_t)b * 128 * chunk_w;
+            const float *src = mel + start + (size_t)b * chunk_w;
+            for (int m = 0; m < 128; m++)
+                memcpy(dst + (size_t)m * chunk_w, src + (size_t)m * mel_frames,
+                       (size_t)chunk_w * sizeof(float));
         }
 
-        /* Conv2D layer 1: [1, 128, chunk_w] -> [480, 64, w1] */
-        int h1 = (128 + 2 - 3) / 2 + 1; /* 64 */
-        int w1 = (chunk_w + 2 - 3) / 2 + 1;
-        float *c1 = (float *)malloc(QWEN_CONV_HIDDEN * h1 * w1 * sizeof(float));
-        qwen_conv2d(c1, chunk_mel, enc->conv1_weight, enc->conv1_bias,
-                     1, QWEN_CONV_HIDDEN, 128, chunk_w, 3, 3, 2, 1);
-        qwen_gelu(c1, QWEN_CONV_HIDDEN * h1 * w1);
+        /* Conv2D layer 1: [1, g, 128, chunk_w] -> [480, g, 64, w1] */
+        float *c1 = (float *)malloc((size_t)QWEN_CONV_HIDDEN * g * h1 * w1 * sizeof(float));
+        qwen_conv2d_batch(c1, chunk_mel, enc->conv1_weight, enc->conv1_bias,
+                          g, 1, QWEN_CONV_HIDDEN, 128, chunk_w, 3, 3, 2, 1);
+        qwen_gelu(c1, QWEN_CONV_HIDDEN * g * h1 * w1);
         free(chunk_mel);
 
-        /* Conv2D layer 2: [480, 64, w1] -> [480, 32, w2] */
-        int h2 = (h1 + 2 - 3) / 2 + 1; /* 32 */
-        int w2 = (w1 + 2 - 3) / 2 + 1;
-        float *c2 = (float *)malloc(QWEN_CONV_HIDDEN * h2 * w2 * sizeof(float));
-        qwen_conv2d(c2, c1, enc->conv2_weight, enc->conv2_bias,
-                     QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h1, w1, 3, 3, 2, 1);
-        qwen_gelu(c2, QWEN_CONV_HIDDEN * h2 * w2);
+        /* Conv2D layer 2: [480, g, 64, w1] -> [480, g, 32, w2] */
+        float *c2 = (float *)malloc((size_t)QWEN_CONV_HIDDEN * g * h2 * w2 * sizeof(float));
+        qwen_conv2d_batch(c2, c1, enc->conv2_weight, enc->conv2_bias,
+                          g, QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h1, w1, 3, 3, 2, 1);
+        qwen_gelu(c2, QWEN_CONV_HIDDEN * g * h2 * w2);
         free(c1);
 
-        /* Conv2D layer 3: [480, 32, w2] -> [480, 16, w3] */
-        int h3 = (h2 + 2 - 3) / 2 + 1; /* 16 */
-        int w3 = (w2 + 2 - 3) / 2 + 1;
-        float *c3 = (float *)malloc(QWEN_CONV_HIDDEN * h3 * w3 * sizeof(float));
-        qwen_conv2d(c3, c2, enc->conv3_weight, enc->conv3_bias,
-                     QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h2, w2, 3, 3, 2, 1);
-        qwen_gelu(c3, QWEN_CONV_HIDDEN * h3 * w3);
+        /* Conv2D layer 3: [480, g, 32, w2] -> [480, g, 16, w3] */
+        float *c3 = (float *)malloc((size_t)QWEN_CONV_HIDDEN * g * h3 * w3 * sizeof(float));
+        qwen_conv2d_batch(c3, c2, enc->conv3_weight, enc->conv3_bias,
+                          g, QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h2, w2, 3, 3, 2, 1);
+        qwen_gelu(c3, QWEN_CONV_HIDDEN * g * h3 * w3);
         free(c2);
 
-        /* Reshape [480, 16, w3] -> [w3, 480*16=7680] then project to d_model */
+        /* Reshape [480, g, 16, w3] -> [g*w3, 480*16=7680] */
         int conv_proj_dim = QWEN_CONV_HIDDEN * h3; /* 480 * 16 = 7680 */
-        float *reshaped = (float *)malloc(w3 * conv_proj_dim * sizeof(float));
-        for (int t = 0; t < w3; t++) {
-            for (int ch = 0; ch < QWEN_CONV_HIDDEN; ch++) {
-                for (int f = 0; f < h3; f++) {
-                    reshaped[t * conv_proj_dim + ch * h3 + f] =
-                        c3[ch * h3 * w3 + f * w3 + t];
+        float *reshaped = (float *)malloc((size_t)g * w3 * conv_proj_dim * sizeof(float));
+        for (int b = 0; b < g; b++) {
+            for (int t = 0; t < w3; t++) {
+                float *dst = reshaped + ((size_t)b * w3 + t) * conv_proj_dim;
+                for (int ch = 0; ch < QWEN_CONV_HIDDEN; ch++) {
+                    const float *plane = c3 + ((size_t)ch * g + b) * h3 * w3;
+                    for (int f = 0; f < h3; f++)
+                        dst[ch * h3 + f] = plane[(size_t)f * w3 + t];
                 }
             }
         }
         free(c3);
 
-        /* Project: [w3, 7680] -> [w3, d_model] (no bias) */
+        /* Project: [g*w3, 7680] -> [g*w3, d_model] (no bias) */
         float *projected = x + (size_t)token_offset * d_model;
-        qwen_linear_w(projected, reshaped, &enc->conv_out_weight, NULL, w3);
+        qwen_linear_w(projected, reshaped, &enc->conv_out_weight, NULL, g * w3);
         free(reshaped);
 
-        /* Add per-chunk sinusoidal position embeddings (starting from pos 0) */
-        float *pe = (float *)malloc(w3 * d_model * sizeof(float));
-        qwen_sinusoidal_pe(pe, w3, d_model);
-        qwen_add_inplace(projected, pe, w3 * d_model);
-        free(pe);
+        /* Position embeddings restart at 0 in every chunk. */
+        if (w3 == tokens_per_chunk) {
+            for (int b = 0; b < g; b++)
+                qwen_add_inplace(projected + (size_t)b * w3 * d_model, pe, w3 * d_model);
+        } else {
+            float *pe_tail = (float *)malloc((size_t)w3 * d_model * sizeof(float));
+            qwen_sinusoidal_pe(pe_tail, w3, d_model);
+            for (int b = 0; b < g; b++)
+                qwen_add_inplace(projected + (size_t)b * w3 * d_model, pe_tail, w3 * d_model);
+            free(pe_tail);
+        }
 
-        token_offset += w3;
+        token_offset += g * w3;
+        c0 += g;
     }
+    free(pe);
 
     qwen_enc_conv_ms = enc_now_ms() - enc_t0;
     enc_t0 = enc_now_ms();

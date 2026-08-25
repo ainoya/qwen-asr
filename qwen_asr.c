@@ -1297,9 +1297,17 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
     if (batch > 1 && ctx->past_text_conditioning == 0 && ctx->decoder.embed_quantized) {
         char *result = batched_segments(ctx, tokenizer, audio_samples,
                                         splits, n_splits, batch);
-        qwen_tokenizer_free(tokenizer);
-        free(compacted_samples);
-        return result;
+        if (result) {
+            qwen_tokenizer_free(tokenizer);
+            free(compacted_samples);
+            return result;
+        }
+        /* Each stream carries its own KV cache, so a large batch on a long
+         * segment can run out of memory - notably under wasm's address space
+         * limit. Fall through to the one-at-a-time path rather than failing. */
+        if (qwen_verbose >= 1)
+            fprintf(stderr, "Batched segment decode failed; falling back to "
+                            "one segment at a time\n");
     }
 
     /* Transcribe each segment and concatenate */

@@ -153,6 +153,13 @@ void qwen_conv2d(float *out, const float *in, const float *weight, const float *
                  int c_in, int c_out, int h_in, int w_in,
                  int kh, int kw, int stride, int padding);
 
+/* Same, for `batch` independent images laid out as [channels][batch][h][w].
+ * One GEMM covers the whole batch; see the note in qwen_asr_kernels.c. */
+void qwen_conv2d_batch(float *out, const float *in, const float *weight,
+                       const float *bias, int batch,
+                       int c_in, int c_out, int h_in, int w_in,
+                       int kh, int kw, int stride, int padding);
+
 /* ========================================================================
  * Normalization
  * ======================================================================== */

@@ -435,9 +435,13 @@ static void gemm_worker(int tid, int n_threads, void *arg) {
 
 /* C[M,N] = A[M,K] @ B[K,N], both row-major (conv2d's im2col shape).
  *
- * Four output rows share each B read. A register-tiled 4x8 variant was tried
- * and was 20% *slower* under wasm - the accumulator block does not survive the
- * engine's register allocation - so this stays simple. */
+ * Four output rows share each B read. Two variants were tried and are both
+ * slower, so this stays simple: a register-tiled 4x8 block was 20% slower
+ * under wasm (the accumulators do not survive the engine's register
+ * allocation), and blocking over N was 30% slower on the conv stem's
+ * 480x4320x3200 shapes - it keeps B in cache across the M loop but shortens
+ * the inner run to the panel width, and the four A loads per k are strided by
+ * K and stop amortizing over it. */
 static void gemm_nn_tile(float *restrict C, const float *restrict A,
                          const float *restrict B, int K, int N,
                          int m0, int m1) {
@@ -1488,12 +1492,10 @@ int qwen_argmax_matvec_q8_batch(const float *x, int m,
  * The source row index is fixed for the whole row, so the vertical bounds check
  * hoists out; the horizontal one splits the output into a left pad, an interior
  * run and a right pad, which removes the per-element branch from the hot loop. */
-static void im2col_row(const float *in, float *col_ptr,
-                       int ic, int ki, int kj,
+static void im2col_row(const float *plane, float *col_ptr,
+                       int ki, int kj,
                        int h_in, int w_in, int stride, int padding,
                        int h_out, int w_out) {
-    const float *plane = in + (size_t)ic * h_in * w_in;
-
     /* Horizontal range of ow where iw = ow*stride - padding + kj is in bounds. */
     int ow_lo = 0;
     while (ow_lo < w_out && ow_lo * stride - padding + kj < 0) ow_lo++;
@@ -1517,6 +1519,7 @@ static void im2col_row(const float *in, float *col_ptr,
 typedef struct {
     const float *in;
     float *cols;
+    int batch;
     int c_in, h_in, w_in, kh, kw, stride, padding, h_out, w_out;
 } im2col_task_t;
 
@@ -1524,7 +1527,9 @@ static void im2col_worker(int tid, int n_threads, void *arg) {
     (void)tid;
     im2col_task_t *t = (im2col_task_t *)arg;
     int rows = t->c_in * t->kh * t->kw;
-    int col_len = t->h_out * t->w_out;
+    int spatial = t->h_out * t->w_out;
+    int col_len = t->batch * spatial;
+    size_t plane_in = (size_t)t->h_in * t->w_in;
     int chunk = qwen_chunk_size(rows, n_threads, 1);
 
     for (int c = qwen_claim_chunk(); ; c = qwen_claim_chunk()) {
@@ -1536,8 +1541,12 @@ static void im2col_worker(int tid, int n_threads, void *arg) {
             int kj = r % t->kw;
             int ki = (r / t->kw) % t->kh;
             int ic = r / (t->kw * t->kh);
-            im2col_row(t->in, t->cols + (size_t)r * col_len, ic, ki, kj,
-                       t->h_in, t->w_in, t->stride, t->padding, t->h_out, t->w_out);
+            float *dst = t->cols + (size_t)r * col_len;
+            for (int b = 0; b < t->batch; b++)
+                im2col_row(t->in + ((size_t)ic * t->batch + b) * plane_in,
+                           dst + (size_t)b * spatial, ki, kj,
+                           t->h_in, t->w_in, t->stride, t->padding,
+                           t->h_out, t->w_out);
         }
     }
 }
@@ -1548,15 +1557,25 @@ static void im2col_worker(int tid, int n_threads, void *arg) {
 static float *conv_cols = NULL;
 static size_t conv_cols_cap = 0;
 
-void qwen_conv2d(float *out, const float *in, const float *weight, const float *bias,
-                 int c_in, int c_out, int h_in, int w_in,
-                 int kh, int kw, int stride, int padding) {
+/* Convolve `batch` independent images in one call.
+ *
+ * Layout is [channels][batch][h][w] throughout, so the im2col columns of every
+ * image concatenate along the spatial axis and a single GEMM covers the batch.
+ * The encoder's conv stem runs on 100-frame chunks, which alone give a GEMM of
+ * 480x4320x800 - too narrow to keep the machine busy - and one dispatch per
+ * chunk per layer. Batching widens N and cuts the dispatch count by the same
+ * factor. */
+void qwen_conv2d_batch(float *out, const float *in, const float *weight,
+                       const float *bias, int batch,
+                       int c_in, int c_out, int h_in, int w_in,
+                       int kh, int kw, int stride, int padding) {
     int h_out = (h_in + 2 * padding - kh) / stride + 1;
     int w_out = (w_in + 2 * padding - kw) / stride + 1;
     int patch_size = c_in * kh * kw;
     int spatial_out = h_out * w_out;
+    int n_cols = batch * spatial_out;
 
-    size_t need = (size_t)patch_size * spatial_out;
+    size_t need = (size_t)patch_size * n_cols;
     if (need > conv_cols_cap) {
         free(conv_cols);
         conv_cols = (float *)malloc(need * sizeof(float));
@@ -1564,27 +1583,34 @@ void qwen_conv2d(float *out, const float *in, const float *weight, const float *
         if (!conv_cols_cap) return;
     }
 
-    im2col_task_t task = { in, conv_cols, c_in, h_in, w_in, kh, kw,
+    im2col_task_t task = { in, conv_cols, batch, c_in, h_in, w_in, kh, kw,
                            stride, padding, h_out, w_out };
     parallel_for(im2col_worker, &task);
 
-    /* GEMM: weight[c_out, patch_size] @ cols[patch_size, spatial_out] */
+    /* GEMM: weight[c_out, patch_size] @ cols[patch_size, batch*spatial_out] */
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                c_out, spatial_out, patch_size,
-                1.0f, weight, patch_size, conv_cols, spatial_out,
-                0.0f, out, spatial_out);
+                c_out, n_cols, patch_size,
+                1.0f, weight, patch_size, conv_cols, n_cols,
+                0.0f, out, n_cols);
 #else
-    qwen_gemm_nn_generic(out, weight, conv_cols, c_out, patch_size, spatial_out);
+    qwen_gemm_nn_generic(out, weight, conv_cols, c_out, patch_size, n_cols);
 #endif
 
     if (bias) {
         for (int oc = 0; oc < c_out; oc++) {
             float b = bias[oc];
-            float *row = out + (size_t)oc * spatial_out;
-            for (int s = 0; s < spatial_out; s++) row[s] += b;
+            float *row = out + (size_t)oc * n_cols;
+            for (int s = 0; s < n_cols; s++) row[s] += b;
         }
     }
+}
+
+void qwen_conv2d(float *out, const float *in, const float *weight, const float *bias,
+                 int c_in, int c_out, int h_in, int w_in,
+                 int kh, int kw, int stride, int padding) {
+    qwen_conv2d_batch(out, in, weight, bias, 1, c_in, c_out,
+                      h_in, w_in, kh, kw, stride, padding);
 }
 
 /* ========================================================================

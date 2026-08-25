@@ -9,3 +9,9 @@ __pycache__/
 samples/extra
 Qwen3-ASR
 TODO.md
+
+# Browser build outputs and packed model images (local artifacts)
+qwen3-asr-1.7b-q8/
+wasm/demo/qwen_asr.js
+wasm/demo/qwen_asr.wasm
+wasm/demo/*.worker.js

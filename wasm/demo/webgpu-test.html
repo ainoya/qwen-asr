@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WebGPU decoder check</title>
+<style>
+  body { background:#12141a; color:#e6e8ef; font:14px/1.6 -apple-system,sans-serif; padding:24px; max-width:1000px; margin:0 auto; }
+  pre { background:#0e1015; border:1px solid #2c3040; border-radius:8px; padding:14px; white-space:pre-wrap; word-break:break-word; }
+  button { background:#6ea8fe; color:#101218; border:0; border-radius:7px; padding:9px 16px; font-weight:600; cursor:pointer; margin-right:8px; }
+  button:disabled { opacity:.45; cursor:default; }
+  .warn { color:#f0a35e; }
+</style>
+</head>
+<body>
+<h2>WebGPU decoder check</h2>
+<p>Runs the same utterance twice — once with the wasm decoder, once with token
+generation on the GPU — and compares the transcripts. Timings are only
+meaningful with this tab visible and focused; browsers throttle hidden tabs
+hard.</p>
+<p>
+  <button id="load">Load model</button>
+  <button id="run" disabled>Run comparison</button>
+  <button id="runall" disabled>Run all samples</button>
+  <label>sample
+    <select id="sample">
+      <option value="../../samples/jfk.wav">jfk 11s (English)</option>
+      <option value="../../samples/extra/ja_bench.wav">ja_bench 41s (Japanese)</option>
+      <option value="../../samples/night_of_the_living_dead_1968/10s_back_down_the_road.wav">10s English</option>
+      <option value="../../samples/night_of_the_living_dead_1968/89s_ill_come_back_down_as_soon_as.wav">89s English</option>
+    </select>
+  </label>
+  <label>threads <input id="threads" type="number" min="1" max="12" value="6" style="width:56px"></label>
+  <label>maxNew <input id="maxnew" type="number" min="64" max="2048" step="64" value="512" style="width:70px"></label>
+  <label><input id="sweep" type="checkbox"> sweep matvec width</label>
+  <label><input id="modes" type="checkbox" checked> compare q8 / f32 activations</label>
+</p>
+<pre id="out">idle</pre>
+
+<script src="qwen_asr.js"></script>
+<script type="module">
+import { WebGPUDecoder } from "./webgpu-decoder.js";
+
+const MODEL_BASE = "../../qwen3-asr-1.7b-q8";
+const out = document.getElementById("out");
+const say = (s = "") => { out.textContent += s + "\n"; };
+const P = (x) => x >>> 0;
+
+let M = null, gpu = null;
+
+function cstr(s) {
+  const len = M.lengthBytesUTF8(s) + 1;
+  const p = P(M._qwen_wasm_alloc(len));
+  M.stringToUTF8(s, p, len);
+  return p;
+}
+
+async function decodeTo16k(bytes) {
+  const probe = new AudioContext();
+  const dec = await probe.decodeAudioData(bytes.slice(0));
+  probe.close();
+  const off = new OfflineAudioContext(1, Math.ceil(dec.duration * 16000), 16000);
+  const src = off.createBufferSource();
+  src.buffer = dec;
+  src.connect(off.destination);
+  src.start();
+  return (await off.startRendering()).getChannelData(0);
+}
+
+document.getElementById("load").onclick = async () => {
+  document.getElementById("load").disabled = true;
+  out.textContent = "";
+  try {
+    const probe = await WebGPUDecoder.probe();
+    say(`WebGPU: ${probe.ok ? "available" : "unavailable — " + probe.why}`);
+    if (probe.ok) {
+      say(`  adapter ${probe.info.vendor || "?"} ${probe.info.architecture || ""}`);
+      say(`  maxStorageBufferBindingSize ${(probe.maxBinding / 1e9).toFixed(2)} GB`);
+    }
+    say(`visibility: ${document.visibilityState}` +
+        (document.visibilityState !== "visible" ? "  <- throttled, timings unreliable" : ""));
+    say();
+
+    say("instantiating wasm...");
+    M = await createQwenASR();
+    M.FS.mkdirTree("/model");
+    for (const f of ["vocab.json", "merges.txt"]) {
+      const r = await fetch(`${MODEL_BASE}/${f}`);
+      M.FS.writeFile(`/model/${f}`, new Uint8Array(await r.arrayBuffer()));
+    }
+    const head = await fetch(`${MODEL_BASE}/qwen-asr-q8.bin`, { method: "HEAD" });
+    const total = Number(head.headers.get("content-length"));
+    say(`fetching ${(total / 1e9).toFixed(2)} GB model...`);
+    const ptr = P(M._qwen_wasm_alloc(total));
+    const res = await fetch(`${MODEL_BASE}/qwen-asr-q8.bin`);
+    const rd = res.body.getReader();
+    let o = 0;
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      M.HEAPU8.set(value, ptr + o);
+      o += value.length;
+    }
+    const threads = Number(document.getElementById("threads").value) || 6;
+    const dir = cstr("/model");
+    if (M._qwen_wasm_init(ptr, total, dir, threads, 0) !== 0) throw new Error("init failed");
+    M._qwen_wasm_release(dir);
+    say(`wasm ready, ${M._qwen_wasm_threads()} threads`);
+
+    if (probe.ok) {
+      gpu = new WebGPUDecoder(M);
+      window.__gpu = gpu;
+      await gpu.init((m) => say("  " + m));
+      say(`GPU decoder ready (${(gpu.weightBytes / 1e9).toFixed(2)} GB of weights resident)`);
+    }
+    document.getElementById("run").disabled = false;
+    document.getElementById("runall").disabled = false;
+  } catch (e) {
+    say("error: " + e.message);
+    console.error(e);
+  }
+};
+
+async function runOne() {
+  try {
+    const url = document.getElementById("sample").value;
+    const samples = await decodeTo16k(await (await fetch(url)).arrayBuffer());
+    const audioSec = samples.length / 16000;
+    say(`\n=== ${url.split("/").pop()} (${audioSec.toFixed(1)}s) ===`);
+
+    const sp = P(M._qwen_wasm_alloc(samples.length * 4));
+    M.HEAPF32.set(samples, sp / 4);
+
+    // --- CPU reference ---
+    say("\n[cpu] running...");
+    let t0 = performance.now();
+    if (M._qwen_wasm_batch_start(sp, samples.length) !== 0) throw new Error("cpu start failed");
+    while (!M._qwen_wasm_job_done()) await new Promise((r) => setTimeout(r, 15));
+    const rp = P(M._qwen_wasm_job_take());
+    const cpuText = rp ? M.UTF8ToString(rp) : "";
+    if (rp) M._free(rp);
+    const cpuWall = performance.now() - t0;
+    say(`[cpu] ${(cpuWall / 1000).toFixed(2)}s wall, encode ${Math.round(M._qwen_wasm_encode_ms())}ms, ` +
+        `decode ${Math.round(M._qwen_wasm_decode_ms())}ms, ${M._qwen_wasm_text_tokens()} tokens`);
+    say(`[cpu] ${cpuText}`);
+
+    if (!gpu) { say("\nno GPU backend; stopping here"); return; }
+
+    // --- GPU generation on top of a CPU prefill ---
+    say("\n[gpu] prefill on cpu, generation on gpu...");
+    t0 = performance.now();
+    if (M._qwen_wasm_prefill_start(sp, samples.length) !== 0) throw new Error("prefill start failed");
+    while (!M._qwen_wasm_prefill_done()) await new Promise((r) => setTimeout(r, 15));
+    const first = M._qwen_wasm_prefill_finish();
+    if (first < 0) throw new Error("prefill failed");
+    const prefillWall = performance.now() - t0;
+    const kvLen = M._qwen_wasm_kv_len();
+    say(`[gpu] prefill ${(prefillWall / 1000).toFixed(2)}s (mel ${Math.round(M._qwen_wasm_embeds_mel_ms())}ms, ` +
+        `enc ${Math.round(M._qwen_wasm_embeds_enc_ms())}ms, dec-prefill ${Math.round(M._qwen_wasm_prefill_ms())}ms), ` +
+        `kv=${kvLen}, first token ${first}`);
+
+    const maxNew = Number(document.getElementById("maxnew").value) || 512;
+    const widths = document.getElementById("sweep").checked ? [32, 64, 128, 256] : [64];
+    const modes = document.getElementById("modes").checked ? [true, false] : [true];
+    let best = null;
+    for (const q8 of modes) {
+      gpu.setQuantizeActivations(q8);
+      for (const wg of widths) {
+        gpu.setMatvecWidth(wg);
+        const t1 = performance.now();
+        const r = await gpu.generate(first, kvLen, maxNew, null);
+        const genWall = performance.now() - t1;
+        const perTok = genWall / Math.max(1, r.tokens - 1);
+        const same = r.text.trim() === cpuText.trim();
+        say(`[gpu] act=${q8 ? "int8" : "f32 "} width ${wg}: ${(genWall / 1000).toFixed(2)}s for ` +
+            `${r.tokens} tokens (${perTok.toFixed(1)} ms/token, ` +
+            `${(1.83 / (perTok / 1000)).toFixed(0)} GB/s) match=${same ? "yes" : "NO"}`);
+        if (same && (!best || perTok < best.perTok)) best = { wg, perTok, genWall, r, q8 };
+        if (!best) best = { wg, perTok, genWall, r, q8 };
+      }
+    }
+    const r = best.r;
+    const genWall = best.genWall;
+    say(`[gpu] best: act=${best.q8 ? "int8" : "f32"} width ${best.wg}`);
+    say(`[gpu] total ${((prefillWall + genWall) / 1000).toFixed(2)}s ` +
+        `(${(audioSec * 1000 / (prefillWall + genWall)).toFixed(2)}x realtime)`);
+    say(`[gpu] ${r.text}`);
+
+    say(`match (gpu generation): ${r.text.trim() === cpuText.trim() ? "IDENTICAL" : "DIFFERENT"}`);
+
+    /* --- everything after the encoder on the GPU --- */
+    say("\n[gpu2] prefill AND generation on gpu...");
+    let t2 = performance.now();
+    if (M._qwen_wasm_embeds_start(sp, samples.length) !== 0) throw new Error("embeds start failed");
+    while (!M._qwen_wasm_embeds_done()) await new Promise((res) => setTimeout(res, 15));
+    const seq = M._qwen_wasm_embeds_finish();
+    if (!seq) throw new Error("embeds failed");
+    const embPtr = P(M._qwen_wasm_embeds_ptr());
+    const embWall = performance.now() - t2;
+    say(`[gpu2] mel+encoder+embeds ${(embWall / 1000).toFixed(2)}s (mel ${Math.round(M._qwen_wasm_embeds_mel_ms())}ms, ` +
+        `enc ${Math.round(M._qwen_wasm_embeds_enc_ms())}ms), seq=${seq}`);
+
+    t2 = performance.now();
+    const r2 = await gpu.prefillAndGenerate(embPtr, seq, maxNew, null);
+    const gpuWall = performance.now() - t2;
+    say(`[gpu2] gpu prefill ${(gpu.prefillMs / 1000).toFixed(2)}s, ` +
+        `total decode ${(gpuWall / 1000).toFixed(2)}s for ${r2.tokens} tokens`);
+    say(`[gpu2] end-to-end ${((embWall + gpuWall) / 1000).toFixed(2)}s ` +
+        `(${(audioSec * 1000 / (embWall + gpuWall)).toFixed(2)}x realtime)`);
+    say(`[gpu2] ${r2.text}`);
+    say(`match (gpu prefill+gen): ${r2.text.trim() === cpuText.trim() ? "IDENTICAL" : "DIFFERENT"}`);
+    if (r.text.trim() !== cpuText.trim()) {
+      const a = cpuText.trim(), b = r.text.trim();
+      let i = 0;
+      while (i < a.length && i < b.length && a[i] === b[i]) i++;
+      say(`first divergence at char ${i}: cpu "...${a.slice(Math.max(0, i - 20), i + 30)}"`);
+      say(`                              gpu "...${b.slice(Math.max(0, i - 20), i + 30)}"`);
+    }
+    M._qwen_wasm_release(sp);
+  } catch (e) {
+    say("error: " + e.message);
+    console.error(e);
+  }
+}
+
+document.getElementById("run").onclick = async () => {
+  document.getElementById("run").disabled = true;
+  await runOne();
+  document.getElementById("run").disabled = false;
+};
+
+document.getElementById("runall").onclick = async () => {
+  document.getElementById("run").disabled = true;
+  document.getElementById("runall").disabled = true;
+  const sel = document.getElementById("sample");
+  for (let i = 0; i < sel.options.length; i++) {
+    sel.selectedIndex = i;
+    await runOne();
+  }
+  document.getElementById("run").disabled = false;
+  document.getElementById("runall").disabled = false;
+};
+</script>
+</body>
+</html>

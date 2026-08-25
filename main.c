@@ -53,7 +53,12 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -i <file>     Input WAV file (16-bit PCM, any sample rate)\n");
     fprintf(stderr, "  --stdin       Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
     fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  -t <n>        Number of threads (default: all CPUs)\n");
+    fprintf(stderr, "  -t <n>        Number of threads (default: performance cores)\n");
+    fprintf(stderr, "  --weights <q8|q8-lm|bf16>  Decoder weight storage (default: q8)\n");
+    fprintf(stderr, "                       q8    = layers block-quantized to int8, LM head bf16\n");
+    fprintf(stderr, "                       q8-lm = quantize the LM head too (faster; lossless on\n");
+    fprintf(stderr, "                               1.7B, but degrades 0.6B)\n");
+    fprintf(stderr, "                       bf16  = no quantization\n");
     fprintf(stderr, "  -S <secs>     Segment target seconds (default: 0 = full-audio decode)\n");
     fprintf(stderr, "  -W <secs>     Segment-cutting silence search window ± seconds (default: 3.0)\n");
     fprintf(stderr, "  --stream      Streaming mode: process in chunks with prefix rollback\n");
@@ -69,6 +74,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --debug       Debug output (per-layer details)\n");
     fprintf(stderr, "  --silent      No status output (only final transcription on stdout)\n");
     fprintf(stderr, "                 with -i + --stream, uses non-interactive final refinement\n");
+    fprintf(stderr, "  --pack-q8 <out>  Write a pre-quantized single-file model image and exit\n");
+    fprintf(stderr, "                   (used by the wasm/browser build; see README)\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
 
@@ -88,6 +95,7 @@ int main(int argc, char **argv) {
     int past_text_conditioning_mode = -1; /* -1 auto, 0 off, 1 on */
     int skip_silence = 0;
     int emit_tokens = 1;
+    const char *pack_out = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -121,6 +129,21 @@ int main(int argc, char **argv) {
             prompt_text = argv[++i];
         } else if (strcmp(argv[i], "--language") == 0 && i + 1 < argc) {
             force_language = argv[++i];
+        } else if (strcmp(argv[i], "--weights") == 0 && i + 1 < argc) {
+            const char *w = argv[++i];
+            if (strcmp(w, "q8") == 0) {
+                qwen_weight_quant = QWEN_WEIGHTS_Q8;
+            } else if (strcmp(w, "q8-lm") == 0) {
+                qwen_weight_quant = QWEN_WEIGHTS_Q8_LM;
+            } else if (strcmp(w, "bf16") == 0) {
+                qwen_weight_quant = QWEN_WEIGHTS_BF16;
+            } else {
+                fprintf(stderr,
+                        "Error: --weights must be q8, q8-lm or bf16, got '%s'\n", w);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--pack-q8") == 0 && i + 1 < argc) {
+            pack_out = argv[++i];
         } else if (strcmp(argv[i], "--stdin") == 0) {
             use_stdin = 1;
         } else if (strcmp(argv[i], "--monitor") == 0) {
@@ -137,6 +160,13 @@ int main(int argc, char **argv) {
             usage(argv[0]);
             return 1;
         }
+    }
+
+    if (model_dir && pack_out) {
+        qwen_verbose = verbosity;
+        if (n_threads <= 0) n_threads = qwen_get_num_cpus();
+        qwen_set_threads(n_threads);
+        return qwen_pack_q8(model_dir, pack_out) == 0 ? 0 : 1;
     }
 
     if (!model_dir || (!input_wav && !use_stdin)) {

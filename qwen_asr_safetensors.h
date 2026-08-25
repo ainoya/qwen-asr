@@ -12,6 +12,10 @@
 #define SAFETENSORS_MAX_TENSORS 1024
 #define SAFETENSORS_MAX_SHARDS 8
 
+/* Pre-quantized single-file image written by qwen_pack_q8(). When a model
+ * directory contains this file it is used instead of the original weights. */
+#define QWEN_PACKED_MODEL_NAME "qwen-asr-q8.bin"
+
 typedef enum {
     DTYPE_F32 = 0,
     DTYPE_F16 = 1,
@@ -19,6 +23,7 @@ typedef enum {
     DTYPE_I32 = 3,
     DTYPE_I64 = 4,
     DTYPE_BOOL = 5,
+    DTYPE_I8 = 6,
     DTYPE_UNKNOWN = -1
 } safetensor_dtype_t;
 
@@ -34,6 +39,7 @@ typedef struct {
 typedef struct {
     char *path;
     void *data;
+    int owns_data;             /* 0 = mmap'd (munmap), 1 = caller-owned memory */
     size_t file_size;
     size_t header_size;
     char *header_json;
@@ -49,6 +55,12 @@ typedef struct {
 
 /* Open a single safetensors file (memory-mapped) */
 safetensors_file_t *safetensors_open(const char *path);
+
+/* Open a safetensors image already resident in memory. The buffer must stay
+ * alive for the lifetime of the returned handle and is NOT freed by
+ * safetensors_close(). Used by the wasm build, which fetches the model instead
+ * of mmapping it. */
+safetensors_file_t *safetensors_open_memory(void *data, size_t size);
 void safetensors_close(safetensors_file_t *sf);
 
 /* Open model from directory (auto-detects single file or multi-shard) */

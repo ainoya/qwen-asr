@@ -271,4 +271,124 @@ void qwen_vec_scale_add_neon(float *dst, const float *src, float correction, int
     for (; i < n; i++) dst[i] = dst[i] * correction + src[i];
 }
 
+
+/* ========================================================================
+ * Q8 block-quantized kernels
+ *
+ * One block is 64 int8 weights sharing one f32 scale. SDOT consumes 16 int8
+ * pairs per instruction, so a block is 4 SDOTs; four blocks are reduced
+ * together with pairwise adds so the scale multiply happens once per 4 blocks.
+ * ======================================================================== */
+
+#define Q8B 64
+
+void qwen_q8_quantize_row_neon(const float *x, int8_t *qx, float *sx, int n) {
+    for (int b = 0; b < n; b += Q8B) {
+        const float *xb = x + b;
+        float32x4_t amaxv = vdupq_n_f32(0.0f);
+        for (int i = 0; i < Q8B; i += 4)
+            amaxv = vmaxq_f32(amaxv, vabsq_f32(vld1q_f32(xb + i)));
+        float amax = vmaxvq_f32(amaxv);
+
+        float scale = amax / 127.0f;
+        float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+        sx[b / Q8B] = scale;
+
+        float32x4_t invv = vdupq_n_f32(inv);
+        for (int i = 0; i < Q8B; i += 16) {
+            int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + i), invv));
+            int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + i + 4), invv));
+            int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + i + 8), invv));
+            int32x4_t i3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + i + 12), invv));
+            int16x8_t s0 = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
+            int16x8_t s1 = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
+            vst1q_s8(qx + b + i, vcombine_s8(vqmovn_s16(s0), vqmovn_s16(s1)));
+        }
+    }
+}
+
+#ifdef __ARM_FEATURE_DOTPROD
+
+/* Dot one row of quantized weights against the quantized activation. */
+static inline float q8_row_dot(const int8_t *w, const float *s,
+                               const int8_t *qx, const float *sx, int nb) {
+    float32x4_t accf = vdupq_n_f32(0.0f);
+    int b = 0;
+    for (; b + 4 <= nb; b += 4) {
+        const int8_t *wp = w + (size_t)b * Q8B;
+        const int8_t *xp = qx + (size_t)b * Q8B;
+        int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+        int32x4_t a2 = vdupq_n_s32(0), a3 = vdupq_n_s32(0);
+        for (int i = 0; i < Q8B; i += 16) {
+            a0 = vdotq_s32(a0, vld1q_s8(wp + i), vld1q_s8(xp + i));
+            a1 = vdotq_s32(a1, vld1q_s8(wp + Q8B + i), vld1q_s8(xp + Q8B + i));
+            a2 = vdotq_s32(a2, vld1q_s8(wp + 2 * Q8B + i), vld1q_s8(xp + 2 * Q8B + i));
+            a3 = vdotq_s32(a3, vld1q_s8(wp + 3 * Q8B + i), vld1q_s8(xp + 3 * Q8B + i));
+        }
+        /* [sum(a0), sum(a1), sum(a2), sum(a3)] */
+        int32x4_t sums = vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3));
+        float32x4_t sc = vmulq_f32(vld1q_f32(s + b), vld1q_f32(sx + b));
+        accf = vfmaq_f32(accf, vcvtq_f32_s32(sums), sc);
+    }
+    float sum = vaddvq_f32(accf);
+    for (; b < nb; b++) {
+        const int8_t *wp = w + (size_t)b * Q8B;
+        const int8_t *xp = qx + (size_t)b * Q8B;
+        int32x4_t a = vdupq_n_s32(0);
+        for (int i = 0; i < Q8B; i += 16)
+            a = vdotq_s32(a, vld1q_s8(wp + i), vld1q_s8(xp + i));
+        sum += (float)vaddvq_s32(a) * s[b] * sx[b];
+    }
+    return sum;
+}
+
+#else /* NEON without the dot-product extension */
+
+static inline float q8_row_dot(const int8_t *w, const float *s,
+                               const int8_t *qx, const float *sx, int nb) {
+    float sum = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const int8_t *wp = w + (size_t)b * Q8B;
+        const int8_t *xp = qx + (size_t)b * Q8B;
+        int32x4_t a = vdupq_n_s32(0);
+        for (int i = 0; i < Q8B; i += 16) {
+            int8x16_t wv = vld1q_s8(wp + i);
+            int8x16_t xv = vld1q_s8(xp + i);
+            int16x8_t lo = vmull_s8(vget_low_s8(wv), vget_low_s8(xv));
+            int16x8_t hi = vmull_s8(vget_high_s8(wv), vget_high_s8(xv));
+            a = vpadalq_s16(a, lo);
+            a = vpadalq_s16(a, hi);
+        }
+        sum += (float)vaddvq_s32(a) * s[b] * sx[b];
+    }
+    return sum;
+}
+
+#endif
+
+void qwen_q8_matvec_neon(float *y, const int8_t *qx, const float *sx,
+                         const int8_t *W, const float *ws,
+                         int in_dim, int rows) {
+    int nb = in_dim / Q8B;
+    for (int o = 0; o < rows; o++)
+        y[o] = q8_row_dot(W + (size_t)o * in_dim, ws + (size_t)o * nb, qx, sx, nb);
+}
+
+void qwen_q8_argmax_range_neon(const int8_t *qx, const float *sx,
+                               const int8_t *W, const float *ws,
+                               int in_dim, int rows, int row_base,
+                               int *best_out, float *best_val_out) {
+    int nb = in_dim / Q8B;
+    int best = row_base;
+    float best_val = -1e30f;
+    for (int o = 0; o < rows; o++) {
+        float sum = q8_row_dot(W + (size_t)o * in_dim, ws + (size_t)o * nb, qx, sx, nb);
+        if (sum > best_val) { best_val = sum; best = row_base + o; }
+    }
+    *best_out = best;
+    *best_val_out = best_val;
+}
+
+
+
 #endif /* __ARM_NEON */

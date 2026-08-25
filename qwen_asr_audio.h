@@ -39,4 +39,10 @@ qwen_live_audio_t *qwen_live_audio_start_stdin(void);
 /* Join reader thread and free all resources. */
 void qwen_live_audio_free(qwen_live_audio_t *la);
 
+/* Live audio fed by the caller instead of by a reader thread (wasm/browser:
+ * the page pushes microphone chunks in as they arrive). */
+qwen_live_audio_t *qwen_live_audio_create(void);
+void qwen_live_audio_push(qwen_live_audio_t *la, const float *samples, int n);
+void qwen_live_audio_set_eof(qwen_live_audio_t *la);
+
 #endif /* QWEN_ASR_AUDIO_H */

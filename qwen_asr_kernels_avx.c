@@ -499,4 +499,86 @@ void qwen_vec_scale_add_avx(float *dst, const float *src, float correction, int 
 #endif
 }
 
+
+/* ========================================================================
+ * Q8 block-quantized kernels
+ *
+ * AVX2 has no int8 dot product, so widen to int16 and use vpmaddwd. On
+ * AVX-512 VNNI capable builds the compiler folds this into vpdpbusd.
+ * ======================================================================== */
+
+#define Q8B 64
+
+void qwen_q8_quantize_row_avx(const float *x, int8_t *qx, float *sx, int n) {
+    const __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    for (int b = 0; b < n; b += Q8B) {
+        const float *xb = x + b;
+        __m256 amaxv = _mm256_setzero_ps();
+        for (int i = 0; i < Q8B; i += 8)
+            amaxv = _mm256_max_ps(amaxv, _mm256_and_ps(_mm256_loadu_ps(xb + i), sign_mask));
+        __m128 lo = _mm_max_ps(_mm256_castps256_ps128(amaxv), _mm256_extractf128_ps(amaxv, 1));
+        lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+        lo = _mm_max_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+        float amax = _mm_cvtss_f32(lo);
+
+        float scale = amax / 127.0f;
+        float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+        sx[b / Q8B] = scale;
+
+        for (int i = 0; i < Q8B; i++) {
+            float v = xb[i] * inv;
+            int q = (int)(v < 0.0f ? v - 0.5f : v + 0.5f);
+            if (q > 127) q = 127;
+            if (q < -127) q = -127;
+            qx[b + i] = (int8_t)q;
+        }
+    }
+}
+
+static inline float q8_row_dot_avx(const int8_t *w, const float *s,
+                                   const int8_t *qx, const float *sx, int nb) {
+    float sum = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const int8_t *wp = w + (size_t)b * Q8B;
+        const int8_t *xp = qx + (size_t)b * Q8B;
+        __m256i acc = _mm256_setzero_si256();
+        for (int i = 0; i < Q8B; i += 16) {
+            __m256i wv = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(wp + i)));
+            __m256i xv = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(xp + i)));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(wv, xv));
+        }
+        __m128i h = _mm_add_epi32(_mm256_castsi256_si128(acc),
+                                  _mm256_extracti128_si256(acc, 1));
+        h = _mm_add_epi32(h, _mm_shuffle_epi32(h, 0x4e));
+        h = _mm_add_epi32(h, _mm_shuffle_epi32(h, 0xb1));
+        sum += (float)_mm_cvtsi128_si32(h) * s[b] * sx[b];
+    }
+    return sum;
+}
+
+void qwen_q8_matvec_avx(float *y, const int8_t *qx, const float *sx,
+                        const int8_t *W, const float *ws,
+                        int in_dim, int rows) {
+    int nb = in_dim / Q8B;
+    for (int o = 0; o < rows; o++)
+        y[o] = q8_row_dot_avx(W + (size_t)o * in_dim, ws + (size_t)o * nb, qx, sx, nb);
+}
+
+void qwen_q8_argmax_range_avx(const int8_t *qx, const float *sx,
+                              const int8_t *W, const float *ws,
+                              int in_dim, int rows, int row_base,
+                              int *best_out, float *best_val_out) {
+    int nb = in_dim / Q8B;
+    int best = row_base;
+    float best_val = -1e30f;
+    for (int o = 0; o < rows; o++) {
+        float sum = q8_row_dot_avx(W + (size_t)o * in_dim, ws + (size_t)o * nb, qx, sx, nb);
+        if (sum > best_val) { best_val = sum; best = row_base + o; }
+    }
+    *best_out = best;
+    *best_val_out = best_val;
+}
+
+
+
 #endif /* __AVX2__ && __FMA__ */

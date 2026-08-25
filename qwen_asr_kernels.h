@@ -52,6 +52,76 @@ void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                          int M, int K, int N);
 
 /* ========================================================================
+ * Q8 Block-Quantized Weights
+ *
+ * Decoder token generation streams every decoder weight from RAM once per
+ * token, so it is memory-bandwidth bound rather than compute bound.  Storing
+ * the weights as blocks of QWEN_Q8_BLOCK int8 values plus one f32 scale cuts
+ * the bytes per weight from 2.0 (bf16) to 1.0625, and the dot products run on
+ * the integer SDOT/VPDPBUSD units (or i32x4.dot_i16x8 under wasm).
+ * ======================================================================== */
+
+#define QWEN_Q8_BLOCK 64
+
+typedef struct {
+    int8_t *q;        /* [rows * cols], row-major                */
+    float  *scales;   /* [rows * cols / QWEN_Q8_BLOCK]           */
+    int rows;
+    int cols;         /* must be a multiple of QWEN_Q8_BLOCK     */
+    int owns;         /* 0 when q/scales point into a mapped model file */
+} qwen_q8_mat_t;
+
+/* Point a matrix at pre-quantized data owned by someone else (a packed model
+ * file). qwen_q8_free() will not release it. */
+void qwen_q8_attach(qwen_q8_mat_t *m, int8_t *q, float *scales, int rows, int cols);
+
+/* A weight matrix in whichever representation the model file provided. */
+typedef struct {
+    float *f32;          /* non-NULL when stored as f32          */
+    qwen_q8_mat_t q8;    /* q8.q non-NULL when stored as Q8      */
+    int rows;
+    int cols;
+} qwen_wmat_t;
+
+/* y = x @ W^T (+ bias), dispatching on how W is stored. */
+void qwen_linear_w(float *y, const float *x, const qwen_wmat_t *W,
+                   const float *bias, int seq_len);
+
+/* y = x @ W^T + bias with a Q8 weight matrix. */
+void qwen_linear_bias_q8(float *y, const float *x, const qwen_q8_mat_t *W,
+                         const float *bias, int seq_len);
+
+void qwen_wmat_free(qwen_wmat_t *w);
+
+/* Quantize a row-major bf16 weight matrix. Returns 0 on success. */
+int qwen_q8_from_bf16(qwen_q8_mat_t *m, const uint16_t *W_bf16, int rows, int cols);
+
+/* Quantize two bf16 matrices into one, interleaving their rows as
+ * [A0, B0, A1, B1, ...] (used to fuse the SwiGLU gate/up projections). */
+int qwen_q8_from_bf16_interleave2(qwen_q8_mat_t *m, const uint16_t *A,
+                                  const uint16_t *B, int rows_each, int cols);
+
+void qwen_q8_free(qwen_q8_mat_t *m);
+
+/* Total bytes held by a quantized matrix (for reporting). */
+size_t qwen_q8_bytes(const qwen_q8_mat_t *m);
+
+/* Dequantize one row into f32 (used for token embedding lookup). */
+void qwen_q8_row_to_f32(float *dst, const qwen_q8_mat_t *m, int row);
+
+/* y = x @ W^T, W quantized. Handles both seq_len==1 (matvec) and prefill. */
+void qwen_linear_nobias_q8(float *y, const float *x, const qwen_q8_mat_t *W,
+                           int seq_len);
+
+/* seq=1 fast path: Q/K/V matvecs under a single threaded dispatch. */
+void qwen_linear_nobias_q8_qkv(float *q, float *k, float *v, const float *x,
+                               const qwen_q8_mat_t *Wq, const qwen_q8_mat_t *Wk,
+                               const qwen_q8_mat_t *Wv);
+
+/* argmax(W @ x) without materializing logits. */
+int qwen_argmax_matvec_q8(const float *x, const qwen_q8_mat_t *W);
+
+/* ========================================================================
  * 2D Convolution (for audio encoder conv stem)
  * ======================================================================== */
 
@@ -89,6 +159,9 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
 /* ========================================================================
  * Activation Functions
  * ======================================================================== */
+
+/* dst[i] = expf(src[i]); vectorized (vForce on Apple, poly elsewhere) */
+void qwen_vec_expf(float *dst, const float *src, int n);
 
 void qwen_silu(float *x, int n);
 void qwen_gelu(float *x, int n);
@@ -163,6 +236,14 @@ int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
 /* Set number of threads for parallel operations (default: 1).
  * Creates a persistent thread pool. Call before inference. */
 void qwen_set_threads(int n);
+
+/* Number of threads actually running (may be lower than requested if the
+ * platform refused to create them). */
+int qwen_get_threads(void);
+
+/* Diagnostic: run `rounds` empty dispatches, report the average number of
+ * threads that participated and the total wall time. */
+void qwen_pool_selftest(int rounds, int *out_participants, double *out_ms);
 
 /* Get number of available CPU cores */
 int qwen_get_num_cpus(void);

@@ -64,6 +64,41 @@ static float *load_bf16_as_f32(multi_safetensors_t *ms, const char *name) {
     return f32;
 }
 
+/* Load a weight matrix in whichever form the model file carries it: either
+ * pre-quantized ("<name>.q8" + "<name>.q8s", used in place) or the original
+ * bf16, converted to f32. */
+static int load_wmat(multi_safetensors_t *ms, const char *name, qwen_wmat_t *out) {
+    char qn[512];
+    safetensors_file_t *sf = NULL;
+
+    snprintf(qn, sizeof(qn), "%s.q8", name);
+    const safetensor_t *tq = multi_safetensors_find(ms, qn, &sf);
+    if (tq && tq->ndim == 2) {
+        safetensors_file_t *sfs = NULL;
+        snprintf(qn, sizeof(qn), "%s.q8s", name);
+        const safetensor_t *ts = multi_safetensors_find(ms, qn, &sfs);
+        if (ts) {
+            out->rows = (int)tq->shape[0];
+            out->cols = (int)tq->shape[1];
+            qwen_q8_attach(&out->q8,
+                           (int8_t *)safetensors_data(sf, tq),
+                           (float *)safetensors_data(sfs, ts),
+                           out->rows, out->cols);
+            return 0;
+        }
+    }
+
+    const safetensor_t *t = multi_safetensors_find(ms, name, &sf);
+    if (!t) {
+        fprintf(stderr, "encoder: weight not found: %s\n", name);
+        return -1;
+    }
+    out->rows = t->ndim >= 1 ? (int)t->shape[0] : 0;
+    out->cols = t->ndim >= 2 ? (int)t->shape[1] : 0;
+    out->f32 = load_bf16_as_f32(ms, name);
+    return out->f32 ? 0 : -1;
+}
+
 int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
                        const qwen_config_t *cfg) {
     char name[512];
@@ -86,8 +121,7 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
 
     /* Conv output projection (bf16, no bias) */
     snprintf(name, sizeof(name), "%sconv_out.weight", ENC_PREFIX);
-    enc->conv_out_weight = load_bf16_as_f32(ms, name);
-    if (!enc->conv_out_weight) return -1;
+    if (load_wmat(ms, name, &enc->conv_out_weight) != 0) return -1;
 
     /* Transformer layers */
     for (int i = 0; i < cfg->enc_layers; i++) {
@@ -96,19 +130,19 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
 
         /* Attention weights (bf16) and biases (f32) */
         snprintf(name, sizeof(name), "%s.%d.self_attn.q_proj.weight", lp, i);
-        l->wq_weight = load_bf16_as_f32(ms, name);
+        if (load_wmat(ms, name, &l->wq_weight) != 0) return -1;
         snprintf(name, sizeof(name), "%s.%d.self_attn.q_proj.bias", lp, i);
         l->wq_bias = load_f32(ms, name);
         snprintf(name, sizeof(name), "%s.%d.self_attn.k_proj.weight", lp, i);
-        l->wk_weight = load_bf16_as_f32(ms, name);
+        if (load_wmat(ms, name, &l->wk_weight) != 0) return -1;
         snprintf(name, sizeof(name), "%s.%d.self_attn.k_proj.bias", lp, i);
         l->wk_bias = load_f32(ms, name);
         snprintf(name, sizeof(name), "%s.%d.self_attn.v_proj.weight", lp, i);
-        l->wv_weight = load_bf16_as_f32(ms, name);
+        if (load_wmat(ms, name, &l->wv_weight) != 0) return -1;
         snprintf(name, sizeof(name), "%s.%d.self_attn.v_proj.bias", lp, i);
         l->wv_bias = load_f32(ms, name);
         snprintf(name, sizeof(name), "%s.%d.self_attn.out_proj.weight", lp, i);
-        l->wo_weight = load_bf16_as_f32(ms, name);
+        if (load_wmat(ms, name, &l->wo_weight) != 0) return -1;
         snprintf(name, sizeof(name), "%s.%d.self_attn.out_proj.bias", lp, i);
         l->wo_bias = load_f32(ms, name);
 
@@ -120,11 +154,11 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
 
         /* FFN weights (bf16) and biases (f32) */
         snprintf(name, sizeof(name), "%s.%d.fc1.weight", lp, i);
-        l->fc1_weight = load_bf16_as_f32(ms, name);
+        if (load_wmat(ms, name, &l->fc1_weight) != 0) return -1;
         snprintf(name, sizeof(name), "%s.%d.fc1.bias", lp, i);
         l->fc1_bias = load_f32(ms, name);
         snprintf(name, sizeof(name), "%s.%d.fc2.weight", lp, i);
-        l->fc2_weight = load_bf16_as_f32(ms, name);
+        if (load_wmat(ms, name, &l->fc2_weight) != 0) return -1;
         snprintf(name, sizeof(name), "%s.%d.fc2.bias", lp, i);
         l->fc2_bias = load_f32(ms, name);
 
@@ -133,12 +167,6 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
         l->ffn_norm_weight = load_f32(ms, name);
         snprintf(name, sizeof(name), "%s.%d.final_layer_norm.bias", lp, i);
         l->ffn_norm_bias = load_f32(ms, name);
-
-        if (!l->wq_weight || !l->wk_weight ||
-            !l->wv_weight || !l->wo_weight) {
-            fprintf(stderr, "encoder: failed to load layer %d weights\n", i);
-            return -1;
-        }
 
     }
 
@@ -150,16 +178,15 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
 
     /* Projection layers */
     snprintf(name, sizeof(name), "%sproj1.weight", ENC_PREFIX);
-    enc->proj1_weight = load_bf16_as_f32(ms, name);
+    if (load_wmat(ms, name, &enc->proj1_weight) != 0) return -1;
     snprintf(name, sizeof(name), "%sproj1.bias", ENC_PREFIX);
     enc->proj1_bias = load_f32(ms, name);
     snprintf(name, sizeof(name), "%sproj2.weight", ENC_PREFIX);
-    enc->proj2_weight = load_bf16_as_f32(ms, name);
+    if (load_wmat(ms, name, &enc->proj2_weight) != 0) return -1;
     snprintf(name, sizeof(name), "%sproj2.bias", ENC_PREFIX);
     enc->proj2_bias = load_f32(ms, name);
 
-    if (!enc->ln_post_weight || !enc->proj1_weight || !enc->proj2_weight)
-        return -1;
+    if (!enc->ln_post_weight) return -1;
 
     return 0;
 }
@@ -273,8 +300,7 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
 
         /* Project: [w3, 7680] -> [w3, d_model] (no bias) */
         float *projected = x + (size_t)token_offset * d_model;
-        qwen_linear_nobias(projected, reshaped, enc->conv_out_weight,
-                            w3, conv_proj_dim, d_model);
+        qwen_linear_w(projected, reshaped, &enc->conv_out_weight, NULL, w3);
         free(reshaped);
 
         /* Add per-chunk sinusoidal position embeddings (starting from pos 0) */
@@ -316,20 +342,16 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
         qwen_layer_norm(x_norm, x, l->attn_norm_weight, l->attn_norm_bias,
                         total_tokens, d_model, 1e-5f);
 
-        qwen_linear(q, x_norm, l->wq_weight, l->wq_bias,
-                     total_tokens, d_model, d_model);
-        qwen_linear(k, x_norm, l->wk_weight, l->wk_bias,
-                     total_tokens, d_model, d_model);
-        qwen_linear(v, x_norm, l->wv_weight, l->wv_bias,
-                     total_tokens, d_model, d_model);
+        qwen_linear_w(q, x_norm, &l->wq_weight, l->wq_bias, total_tokens);
+        qwen_linear_w(k, x_norm, &l->wk_weight, l->wk_bias, total_tokens);
+        qwen_linear_w(v, x_norm, &l->wv_weight, l->wv_bias, total_tokens);
 
         qwen_bidirectional_attention(attn_out, q, k, v,
                                       total_tokens, n_heads, head_dim, scale,
                                       window_starts, n_windows);
 
         /* Output projection + residual */
-        qwen_linear(proj_out, attn_out, l->wo_weight, l->wo_bias,
-                     total_tokens, d_model, d_model);
+        qwen_linear_w(proj_out, attn_out, &l->wo_weight, l->wo_bias, total_tokens);
         qwen_add_inplace(x, proj_out, total_tokens * d_model);
 
         /* ---- FFN ---- */
@@ -337,11 +359,9 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
                         total_tokens, d_model, 1e-5f);
 
         /* GELU FFN: fc1 -> GELU -> fc2 */
-        qwen_linear(ffn_mid, x_norm, l->fc1_weight, l->fc1_bias,
-                     total_tokens, d_model, ffn_dim);
+        qwen_linear_w(ffn_mid, x_norm, &l->fc1_weight, l->fc1_bias, total_tokens);
         qwen_gelu(ffn_mid, total_tokens * ffn_dim);
-        qwen_linear(ffn_out, ffn_mid, l->fc2_weight, l->fc2_bias,
-                     total_tokens, ffn_dim, d_model);
+        qwen_linear_w(ffn_out, ffn_mid, &l->fc2_weight, l->fc2_bias, total_tokens);
         qwen_add_inplace(x, ffn_out, total_tokens * d_model);
 
     }
@@ -352,13 +372,11 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
 
     /* Projection: proj1 (GELU) -> proj2 */
     float *proj_mid = (float *)malloc(total_tokens * d_model * sizeof(float));
-    qwen_linear(proj_mid, x, enc->proj1_weight, enc->proj1_bias,
-                 total_tokens, d_model, d_model);
+    qwen_linear_w(proj_mid, x, &enc->proj1_weight, enc->proj1_bias, total_tokens);
     qwen_gelu(proj_mid, total_tokens * d_model);
 
     float *enc_output = (float *)malloc(total_tokens * output_dim * sizeof(float));
-    qwen_linear(enc_output, proj_mid, enc->proj2_weight, enc->proj2_bias,
-                 total_tokens, d_model, output_dim);
+    qwen_linear_w(enc_output, proj_mid, &enc->proj2_weight, enc->proj2_bias, total_tokens);
     free(proj_mid);
 
     /* Clean up */

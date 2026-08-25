@@ -20,6 +20,7 @@
 
 /* Global verbose flag */
 int qwen_verbose = 0;
+int qwen_weight_quant = QWEN_WEIGHTS_Q8_LM;
 int qwen_monitor = 0;
 
 void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata) {
@@ -142,9 +143,13 @@ static int detect_config(qwen_ctx_t *ctx) {
     /* Check if thinker.audio_tower.layers.17 exists (0.6B has 18 layers, 1.7B has 24) */
     multi_safetensors_t *ms = (multi_safetensors_t *)ctx->safetensors;
 
-    /* Check for layer 18 (0-indexed) in encoder - if it exists, it's 1.7B */
+    /* Check for layer 18 (0-indexed) in encoder - if it exists, it's 1.7B.
+     * A packed Q8 image stores the same matrix under a ".q8" suffix. */
     const safetensor_t *test = multi_safetensors_find(ms,
         "thinker.audio_tower.layers.18.self_attn.q_proj.weight", NULL);
+    if (!test)
+        test = multi_safetensors_find(ms,
+            "thinker.audio_tower.layers.18.self_attn.q_proj.weight.q8", NULL);
 
     if (test) {
         /* 1.7B model */
@@ -194,21 +199,15 @@ static int detect_config(qwen_ctx_t *ctx) {
  * Model Loading
  * ======================================================================== */
 
-qwen_ctx_t *qwen_load(const char *model_dir) {
+/* Shared tail of qwen_load() / qwen_load_memory(): everything after the
+ * safetensors handle exists. Takes ownership of `ms`. */
+static qwen_ctx_t *qwen_load_with(multi_safetensors_t *ms, const char *aux_dir) {
     qwen_ctx_t *ctx = (qwen_ctx_t *)calloc(1, sizeof(qwen_ctx_t));
-    if (!ctx) return NULL;
-    snprintf(ctx->model_dir, sizeof(ctx->model_dir), "%s", model_dir);
-
-    /* Open safetensors (multi-shard) */
-    if (qwen_verbose >= 1)
-        fprintf(stderr, "Loading model from %s\n", model_dir);
-
-    multi_safetensors_t *ms = multi_safetensors_open(model_dir);
-    if (!ms) {
-        fprintf(stderr, "qwen_load: cannot open safetensors in %s\n", model_dir);
-        free(ctx);
+    if (!ctx) {
+        multi_safetensors_close(ms);
         return NULL;
     }
+    snprintf(ctx->model_dir, sizeof(ctx->model_dir), "%s", aux_dir);
     ctx->safetensors = ms;
 
     /* Detect model configuration */
@@ -246,6 +245,35 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     return ctx;
 }
 
+qwen_ctx_t *qwen_load(const char *model_dir) {
+    if (qwen_verbose >= 1)
+        fprintf(stderr, "Loading model from %s\n", model_dir);
+
+    multi_safetensors_t *ms = multi_safetensors_open(model_dir);
+    if (!ms) {
+        fprintf(stderr, "qwen_load: cannot open safetensors in %s\n", model_dir);
+        return NULL;
+    }
+    return qwen_load_with(ms, model_dir);
+}
+
+qwen_ctx_t *qwen_load_memory(void *model_data, size_t model_size,
+                             const char *aux_dir) {
+    safetensors_file_t *sf = safetensors_open_memory(model_data, model_size);
+    if (!sf) {
+        fprintf(stderr, "qwen_load_memory: not a safetensors image\n");
+        return NULL;
+    }
+    multi_safetensors_t *ms = (multi_safetensors_t *)calloc(1, sizeof(*ms));
+    if (!ms) {
+        safetensors_close(sf);
+        return NULL;
+    }
+    ms->shards[0] = sf;
+    ms->num_shards = 1;
+    return qwen_load_with(ms, aux_dir);
+}
+
 /* ========================================================================
  * Free
  * ======================================================================== */
@@ -259,23 +287,23 @@ void qwen_free(qwen_ctx_t *ctx) {
     FREE0(ctx->encoder.conv1_weight); FREE0(ctx->encoder.conv1_bias);
     FREE0(ctx->encoder.conv2_weight); FREE0(ctx->encoder.conv2_bias);
     FREE0(ctx->encoder.conv3_weight); FREE0(ctx->encoder.conv3_bias);
-    FREE0(ctx->encoder.conv_out_weight);
+    qwen_wmat_free(&ctx->encoder.conv_out_weight);
 
     /* Encoder layers (weights are pre-converted f32, all allocated) */
     for (int i = 0; i < ctx->config.enc_layers; i++) {
         qwen_enc_layer_t *l = &ctx->encoder.layers[i];
-        FREE0(l->wq_weight); FREE0(l->wq_bias);
-        FREE0(l->wk_weight); FREE0(l->wk_bias);
-        FREE0(l->wv_weight); FREE0(l->wv_bias);
-        FREE0(l->wo_weight); FREE0(l->wo_bias);
+        qwen_wmat_free(&l->wq_weight); FREE0(l->wq_bias);
+        qwen_wmat_free(&l->wk_weight); FREE0(l->wk_bias);
+        qwen_wmat_free(&l->wv_weight); FREE0(l->wv_bias);
+        qwen_wmat_free(&l->wo_weight); FREE0(l->wo_bias);
         FREE0(l->attn_norm_weight); FREE0(l->attn_norm_bias);
-        FREE0(l->fc1_weight); FREE0(l->fc1_bias);
-        FREE0(l->fc2_weight); FREE0(l->fc2_bias);
+        qwen_wmat_free(&l->fc1_weight); FREE0(l->fc1_bias);
+        qwen_wmat_free(&l->fc2_weight); FREE0(l->fc2_bias);
         FREE0(l->ffn_norm_weight); FREE0(l->ffn_norm_bias);
     }
     FREE0(ctx->encoder.ln_post_weight); FREE0(ctx->encoder.ln_post_bias);
-    FREE0(ctx->encoder.proj1_weight); FREE0(ctx->encoder.proj1_bias);
-    FREE0(ctx->encoder.proj2_weight); FREE0(ctx->encoder.proj2_bias);
+    qwen_wmat_free(&ctx->encoder.proj1_weight); FREE0(ctx->encoder.proj1_bias);
+    qwen_wmat_free(&ctx->encoder.proj2_weight); FREE0(ctx->encoder.proj2_bias);
 
     /* Decoder layers */
     for (int i = 0; i < ctx->config.dec_layers; i++) {
@@ -283,7 +311,11 @@ void qwen_free(qwen_ctx_t *ctx) {
         FREE0(l->q_norm_weight); FREE0(l->k_norm_weight);
         FREE0(l->input_norm); FREE0(l->post_attn_norm);
         FREE0(l->gate_up_fused_bf16);
+        qwen_q8_free(&l->wq_q8); qwen_q8_free(&l->wk_q8);
+        qwen_q8_free(&l->wv_q8); qwen_q8_free(&l->wo_q8);
+        qwen_q8_free(&l->gate_up_q8); qwen_q8_free(&l->down_q8);
     }
+    qwen_q8_free(&ctx->decoder.tok_embeddings_q8);
     FREE0(ctx->decoder.norm);
 
     #undef FREE0
@@ -357,6 +389,15 @@ static void tok_embed_bf16_to_f32(float *dst, const uint16_t *tok_emb_bf16,
         uint32_t f32_bits = ((uint32_t)src[i]) << 16;
         memcpy(&dst[i], &f32_bits, sizeof(float));
     }
+}
+
+/* Embedding lookup that works for either weight representation. */
+static void tok_embed_lookup(const qwen_decoder_t *dec, float *dst,
+                             int token_id, int dim) {
+    if (dec->embed_quantized)
+        qwen_q8_row_to_f32(dst, &dec->tok_embeddings_q8, token_id);
+    else
+        tok_embed_bf16_to_f32(dst, dec->tok_embeddings_bf16, token_id, dim);
 }
 
 static double get_time_ms(void) {
@@ -587,14 +628,18 @@ static int find_split_point(const float *samples, int n_samples,
  * Transcribe a single audio segment. Returns malloc'd text or NULL.
  * The tokenizer is passed in so we only load it once.
  */
-static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
-                                int n_samples, qwen_tokenizer_t *tokenizer,
+/* Mel + encoder + prompt/audio embedding assembly for one segment.
+ *
+ * Split out of transcribe_segment() so an alternative decoder backend (the
+ * WebGPU one in wasm/webgpu/) can reuse everything up to the point where the
+ * decoder takes over. Returns a malloc'd [*out_seq, dec_hidden] buffer, or NULL. */
+static float *build_input_embeds(qwen_ctx_t *ctx, const float *samples, int n_samples,
+                                qwen_tokenizer_t *tokenizer,
                                 const int *past_tokens, int n_past_tokens,
-                                int *out_text_tokens) {
+                                int *out_seq, double *out_mel_ms, double *out_enc_ms,
+                                int *out_enc_seq_len) {
     const qwen_config_t *cfg = &ctx->config;
     int dim = cfg->dec_hidden;
-    double seg_t0 = get_time_ms();
-    int n_text_tokens = 0;
 
     /* ---- Mel spectrogram ---- */
     double t0 = get_time_ms();
@@ -639,25 +684,22 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     /* Embed prefix head: <|im_start|>system\n */
     int off = 0;
     for (int i = 0; i < PREFIX_HEAD_LEN; i++) {
-        tok_embed_bf16_to_f32(input_embeds + off * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              PROMPT_PREFIX_HEAD[i], dim);
+        tok_embed_lookup(&ctx->decoder, input_embeds + off * dim,
+                             PROMPT_PREFIX_HEAD[i], dim);
         off++;
     }
 
     /* Embed optional prompt text (system content) */
     for (int i = 0; i < ctx->n_prompt_tokens; i++) {
-        tok_embed_bf16_to_f32(input_embeds + off * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              ctx->prompt_tokens[i], dim);
+        tok_embed_lookup(&ctx->decoder, input_embeds + off * dim,
+                             ctx->prompt_tokens[i], dim);
         off++;
     }
 
     /* Embed prefix tail: <|im_end|>\n<|im_start|>user\n<|audio_start|> */
     for (int i = 0; i < PREFIX_TAIL_LEN; i++) {
-        tok_embed_bf16_to_f32(input_embeds + off * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              PROMPT_PREFIX_TAIL[i], dim);
+        tok_embed_lookup(&ctx->decoder, input_embeds + off * dim,
+                             PROMPT_PREFIX_TAIL[i], dim);
         off++;
     }
 
@@ -672,16 +714,14 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     /* Embed suffix base: <|audio_end|><|im_end|>\n<|im_start|>assistant\n */
     int suffix_off = prefix_len + enc_seq_len;
     for (int i = 0; i < SUFFIX_BASE_LEN; i++) {
-        tok_embed_bf16_to_f32(input_embeds + (suffix_off + i) * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              PROMPT_SUFFIX_BASE[i], dim);
+        tok_embed_lookup(&ctx->decoder, input_embeds + (suffix_off + i) * dim,
+                             PROMPT_SUFFIX_BASE[i], dim);
     }
 
     /* Optional forced-language suffix: "language X" + <asr_text> */
     for (int i = 0; i < ctx->n_force_prompt_tokens; i++) {
-        tok_embed_bf16_to_f32(input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              ctx->force_prompt_tokens[i], dim);
+        tok_embed_lookup(&ctx->decoder, input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
+                             ctx->force_prompt_tokens[i], dim);
     }
 
     /* Optional past-text conditioning tokens (for segmented mode).
@@ -689,18 +729,42 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
      * restarts from a new ASR span instead of terminating immediately. */
     int past_off = suffix_off + suffix_len;
     for (int i = 0; i < n_past_tokens; i++) {
-        tok_embed_bf16_to_f32(input_embeds + (past_off + i) * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              past_tokens[i], dim);
+        tok_embed_lookup(&ctx->decoder, input_embeds + (past_off + i) * dim,
+                             past_tokens[i], dim);
     }
     if (n_past_tokens > 0) {
-        tok_embed_bf16_to_f32(input_embeds + (past_off + n_past_tokens) * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              QWEN_TOKEN_ASR_TEXT, dim);
+        tok_embed_lookup(&ctx->decoder, input_embeds + (past_off + n_past_tokens) * dim,
+                             QWEN_TOKEN_ASR_TEXT, dim);
     }
 
+
+    if (out_seq) *out_seq = total_seq;
+    if (out_mel_ms) *out_mel_ms = mel_ms;
+    if (out_enc_ms) *out_enc_ms = enc_ms;
+    if (out_enc_seq_len) *out_enc_seq_len = enc_seq_len;
+    free(tmp_embed);
+    return input_embeds;
+}
+
+static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
+                                int n_samples, qwen_tokenizer_t *tokenizer,
+                                const int *past_tokens, int n_past_tokens,
+                                int *out_text_tokens) {
+    const qwen_config_t *cfg = &ctx->config;
+    int dim = cfg->dec_hidden;
+    double seg_t0 = get_time_ms();
+    int n_text_tokens = 0;
+
+    double mel_ms = 0, enc_ms = 0;
+    int enc_seq_len = 0;
+    int total_seq = 0;
+    float *input_embeds = build_input_embeds(ctx, samples, n_samples, tokenizer,
+                                            past_tokens, n_past_tokens, &total_seq,
+                                            &mel_ms, &enc_ms, &enc_seq_len);
+    if (!input_embeds) return NULL;
+
     /* ---- Decoder prefill ---- */
-    t0 = get_time_ms();
+    double t0 = get_time_ms();
     ctx->kv_cache_len = 0; /* Reset KV cache for this segment */
     int prefill_len = total_seq - 1; /* prefill all but last */
     qwen_decoder_prefill(ctx, input_embeds, prefill_len);
@@ -709,6 +773,9 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     float *last_embed = input_embeds + (size_t)prefill_len * dim;
     int token = qwen_decoder_forward(ctx, last_embed);
     free(input_embeds);
+
+    float *tmp_embed = (float *)malloc((size_t)dim * sizeof(float));
+    if (!tmp_embed) return NULL;
 
     double prefill_ms = get_time_ms() - t0;
     if (qwen_verbose >= 2)
@@ -754,7 +821,8 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
         }
 
         /* Embed and generate next token */
-        tok_embed_bf16_to_f32(tmp_embed, ctx->decoder.tok_embeddings_bf16, token, dim);
+        tok_embed_lookup(&ctx->decoder, tmp_embed,
+                             token, dim);
         token = qwen_decoder_forward(ctx, tmp_embed);
     }
 
@@ -836,6 +904,22 @@ static void segment_emit_cb(const char *piece, void *userdata) {
         }
     }
     st->downstream_cb(piece, st->downstream_userdata);
+}
+
+float *qwen_build_embeds(qwen_ctx_t *ctx, const float *samples, int n_samples,
+                         int *out_seq_len, double *out_mel_ms, double *out_enc_ms) {
+    char vocab_path[1024];
+    snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", ctx->model_dir);
+    qwen_tokenizer_t *tokenizer = qwen_tokenizer_load(vocab_path);
+    if (!tokenizer) {
+        fprintf(stderr, "qwen_build_embeds: cannot load tokenizer from %s\n", vocab_path);
+        return NULL;
+    }
+    int enc_seq_len = 0;
+    float *embeds = build_input_embeds(ctx, samples, n_samples, tokenizer, NULL, 0,
+                                      out_seq_len, out_mel_ms, out_enc_ms, &enc_seq_len);
+    qwen_tokenizer_free(tokenizer);
+    return embeds;
 }
 
 char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples) {
@@ -1704,21 +1788,18 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
         int off = 0;
         for (int i = 0; i < PREFIX_HEAD_LEN; i++) {
-            tok_embed_bf16_to_f32(input_embeds + off * dim,
-                                  ctx->decoder.tok_embeddings_bf16,
-                                  PROMPT_PREFIX_HEAD[i], dim);
+            tok_embed_lookup(&ctx->decoder, input_embeds + off * dim,
+                             PROMPT_PREFIX_HEAD[i], dim);
             off++;
         }
         for (int i = 0; i < ctx->n_prompt_tokens; i++) {
-            tok_embed_bf16_to_f32(input_embeds + off * dim,
-                                  ctx->decoder.tok_embeddings_bf16,
-                                  ctx->prompt_tokens[i], dim);
+            tok_embed_lookup(&ctx->decoder, input_embeds + off * dim,
+                             ctx->prompt_tokens[i], dim);
             off++;
         }
         for (int i = 0; i < PREFIX_TAIL_LEN; i++) {
-            tok_embed_bf16_to_f32(input_embeds + off * dim,
-                                  ctx->decoder.tok_embeddings_bf16,
-                                  PROMPT_PREFIX_TAIL[i], dim);
+            tok_embed_lookup(&ctx->decoder, input_embeds + off * dim,
+                             PROMPT_PREFIX_TAIL[i], dim);
             off++;
         }
 
@@ -1730,20 +1811,17 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
         int suffix_off = prefix_len + enc_seq_len;
         for (int i = 0; i < SUFFIX_BASE_LEN; i++)
-            tok_embed_bf16_to_f32(input_embeds + (suffix_off + i) * dim,
-                                  ctx->decoder.tok_embeddings_bf16,
-                                  PROMPT_SUFFIX_BASE[i], dim);
+            tok_embed_lookup(&ctx->decoder, input_embeds + (suffix_off + i) * dim,
+                             PROMPT_SUFFIX_BASE[i], dim);
 
         for (int i = 0; i < ctx->n_force_prompt_tokens; i++)
-            tok_embed_bf16_to_f32(input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
-                                  ctx->decoder.tok_embeddings_bf16,
-                                  ctx->force_prompt_tokens[i], dim);
+            tok_embed_lookup(&ctx->decoder, input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
+                             ctx->force_prompt_tokens[i], dim);
 
         int text_off = suffix_off + suffix_len;
         for (int i = 0; i < n_prefix_tokens; i++)
-            tok_embed_bf16_to_f32(input_embeds + (text_off + i) * dim,
-                                  ctx->decoder.tok_embeddings_bf16,
-                                  raw_tokens[prefix_offset + i], dim);
+            tok_embed_lookup(&ctx->decoder, input_embeds + (text_off + i) * dim,
+                             raw_tokens[prefix_offset + i], dim);
 
         /* ---- Decoder prefill + first token ---- */
         t0 = get_time_ms();
@@ -1824,7 +1902,8 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
             chunk_tokens[n_chunk_tokens++] = token;
 
-            tok_embed_bf16_to_f32(tmp_embed, ctx->decoder.tok_embeddings_bf16, token, dim);
+            tok_embed_lookup(&ctx->decoder, tmp_embed,
+                             token, dim);
             token = qwen_decoder_forward(ctx, tmp_embed);
         }
 

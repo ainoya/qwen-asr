@@ -594,6 +594,26 @@ qwen_live_audio_t *qwen_live_audio_start_stdin(void) {
     return la;
 }
 
+qwen_live_audio_t *qwen_live_audio_create(void) {
+    qwen_live_audio_t *la = (qwen_live_audio_t *)calloc(1, sizeof(qwen_live_audio_t));
+    if (!la) return NULL;
+    pthread_mutex_init(&la->mutex, NULL);
+    pthread_cond_init(&la->cond, NULL);
+    return la;
+}
+
+void qwen_live_audio_push(qwen_live_audio_t *la, const float *samples, int n) {
+    live_audio_append(la, samples, n);
+}
+
+void qwen_live_audio_set_eof(qwen_live_audio_t *la) {
+    if (!la) return;
+    pthread_mutex_lock(&la->mutex);
+    la->eof = 1;
+    pthread_cond_broadcast(&la->cond);
+    pthread_mutex_unlock(&la->mutex);
+}
+
 void qwen_live_audio_free(qwen_live_audio_t *la) {
     if (!la) return;
     /* If thread was started, wait for it to finish */

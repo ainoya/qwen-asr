@@ -9,12 +9,19 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include <pthread.h>
+#include <stdatomic.h>
+#include <sched.h>
+#include <time.h>
 #if (defined(__AVX512F__) || defined(__AVX2__)) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #endif
 #ifdef __APPLE__
 #include <sys/sysctl.h>
+#include <pthread/qos.h>
 #else
 #include <unistd.h>
 #endif
@@ -33,9 +40,32 @@
 
 /* ========================================================================
  * Thread Pool
+ *
+ * Hybrid barrier: workers spin briefly on an atomic generation counter
+ * before parking on a condvar, and the dispatcher spins on an atomic
+ * completion counter.  Decoder token steps issue ~110 tiny parallel
+ * dispatches each, so futex round-trips dominated the sync cost with the
+ * previous mutex/condvar-only barrier.
  * ======================================================================== */
 
 #define QWEN_MAX_THREADS 16
+
+/* How long a thread spins before parking on the condvar.
+ *
+ * Parking is what costs: a futex round trip is tens of microseconds natively,
+ * but in a browser it goes through Atomics.wait/notify between Web Workers and
+ * measured ~4 ms per hop on Chrome. A decoder token issues ~110 dispatches, so
+ * parking between them turned a 22 ms/token native step into 990 ms/token under
+ * wasm. Spinning for a couple of milliseconds instead keeps the pool hot across
+ * back-to-back dispatches while still releasing the cores when inference stops.
+ */
+/* Budgets are iteration counts, deliberately not wall-clock: reading a clock
+ * from a wasm worker goes through JS and is far too expensive to do inside a
+ * spin loop. ~1M iterations is on the order of a millisecond either side of the
+ * native/wasm divide, which is enough to bridge back-to-back dispatches. */
+#define QWEN_WORKER_SPINS    1000000
+#define QWEN_JOIN_SPINS      1000000
+#define QWEN_PARK_TIMEOUT_MS 2
 
 typedef void (*parallel_fn_t)(int tid, int n_threads, void *arg);
 
@@ -43,50 +73,106 @@ static struct {
     pthread_t threads[QWEN_MAX_THREADS - 1];
     int tids[QWEN_MAX_THREADS - 1];
     int n_threads;
-    int shutdown;
+    _Atomic int shutdown;
 
     parallel_fn_t fn;
     void *arg;
-    int generation;
+    _Atomic int generation;
+    _Atomic int n_done;
+    _Atomic int n_parked;
+    _Atomic int cursor;      /* dynamic work-stealing cursor for the current job */
 
     pthread_mutex_t mutex;
     pthread_cond_t cond_work;
-    pthread_cond_t cond_done;
-    int n_done;
 } tp = {
     .n_threads = 1,
     .shutdown = 0,
     .generation = 0,
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .cond_work = PTHREAD_COND_INITIALIZER,
-    .cond_done = PTHREAD_COND_INITIALIZER,
 };
+
+static inline void qwen_cpu_relax(void) {
+#if defined(__ARM_ARCH) || defined(__aarch64__)
+    __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#else
+    /* wasm and friends: nothing useful to emit, the atomic load is the fence */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+/* Block until tp.generation moves past my_gen (or shutdown). Returns the new
+ * generation. Spins first, then parks on the condvar with a bounded timeout so
+ * a missed wakeup can never hang the pool. */
+static int worker_wait_for_work(int my_gen) {
+    for (int spins = 0; spins < QWEN_WORKER_SPINS; spins++) {
+        int gen = atomic_load(&tp.generation);
+        if (gen != my_gen || atomic_load(&tp.shutdown)) return gen;
+        qwen_cpu_relax();
+    }
+
+    pthread_mutex_lock(&tp.mutex);
+    atomic_fetch_add(&tp.n_parked, 1);
+    for (;;) {
+        int gen = atomic_load(&tp.generation);
+        if (gen != my_gen || atomic_load(&tp.shutdown)) {
+            atomic_fetch_sub(&tp.n_parked, 1);
+            pthread_mutex_unlock(&tp.mutex);
+            return gen;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += QWEN_PARK_TIMEOUT_MS * 1000 * 1000; /* safety net */
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&tp.cond_work, &tp.mutex, &ts);
+    }
+}
 
 static void *worker_loop(void *arg) {
     int tid = *(int *)arg;
     int my_gen = 0;
 
     for (;;) {
-        pthread_mutex_lock(&tp.mutex);
-        while (tp.generation == my_gen && !tp.shutdown)
-            pthread_cond_wait(&tp.cond_work, &tp.mutex);
-        if (tp.shutdown) {
-            pthread_mutex_unlock(&tp.mutex);
-            return NULL;
-        }
-        my_gen = tp.generation;
+        int gen = worker_wait_for_work(my_gen);
+        if (atomic_load(&tp.shutdown)) return NULL;
+
+        my_gen = gen;
         parallel_fn_t fn = tp.fn;
         void *a = tp.arg;
         int nt = tp.n_threads;
-        pthread_mutex_unlock(&tp.mutex);
 
         fn(tid, nt, a);
 
-        pthread_mutex_lock(&tp.mutex);
-        if (++tp.n_done >= tp.n_threads - 1)
-            pthread_cond_signal(&tp.cond_done);
-        pthread_mutex_unlock(&tp.mutex);
+        atomic_fetch_add(&tp.n_done, 1);
     }
+}
+
+/* Number of *performance* cores. On Apple silicon the efficiency cores are
+ * several times slower than the P cores, so handing them an equal share of a
+ * barrier-synchronised split makes every dispatch wait for the slowest core.
+ * Measured on an M1 Pro (8P+2E): using all 10 logical CPUs is ~1.35x slower
+ * than using the 8 P cores alone. */
+int qwen_get_num_cpus(void) {
+#ifdef __APPLE__
+    int nlevels = 0;
+    size_t len = sizeof(nlevels);
+    if (sysctlbyname("hw.nperflevels", &nlevels, &len, NULL, 0) == 0 && nlevels > 1) {
+        int p = 0;
+        len = sizeof(p);
+        /* perflevel0 is the fastest level. */
+        if (sysctlbyname("hw.perflevel0.logicalcpu", &p, &len, NULL, 0) == 0 && p > 0)
+            return p;
+    }
+    int n = 0;
+    len = sizeof(n);
+    sysctlbyname("hw.ncpu", &n, &len, NULL, 0);
+    return n > 0 ? n : 1;
+#else
+    int n = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? n : 1;
+#endif
 }
 
 void qwen_set_threads(int n) {
@@ -96,60 +182,139 @@ void qwen_set_threads(int n) {
     /* Shutdown existing workers */
     if (tp.n_threads > 1) {
         pthread_mutex_lock(&tp.mutex);
-        tp.shutdown = 1;
+        atomic_store(&tp.shutdown, 1);
+        atomic_fetch_add(&tp.generation, 1);
         pthread_cond_broadcast(&tp.cond_work);
         pthread_mutex_unlock(&tp.mutex);
         for (int i = 0; i < tp.n_threads - 1; i++)
             pthread_join(tp.threads[i], NULL);
-        tp.shutdown = 0;
-        tp.generation = 0;
+        atomic_store(&tp.shutdown, 0);
+        atomic_store(&tp.generation, 0);
+        atomic_store(&tp.n_parked, 0);
     }
 
     tp.n_threads = n;
     if (n <= 1) return;
 
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+#if defined(__APPLE__)
+    /* Ask the scheduler to keep the pool on performance cores. */
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+
+    /* Count what actually started: a barrier that waits on a worker which was
+     * never created would hang forever. Browsers in particular can refuse to
+     * spawn more workers than the preallocated pool. */
+    int started = 0;
     for (int i = 0; i < n - 1; i++) {
-        tp.tids[i] = i + 1;
-        pthread_create(&tp.threads[i], NULL, worker_loop, &tp.tids[i]);
+        tp.tids[i] = started + 1;
+        if (pthread_create(&tp.threads[started], &attr, worker_loop,
+                           &tp.tids[started]) == 0)
+            started++;
+    }
+    pthread_attr_destroy(&attr);
+
+    if (started != n - 1) {
+        fprintf(stderr, "Thread pool: could only start %d of %d threads\n",
+                started + 1, n);
+        tp.n_threads = started + 1;
     }
 
-    if (qwen_verbose >= 2)
-        fprintf(stderr, "Thread pool: %d threads\n", n);
+    if (qwen_verbose >= 1)
+        fprintf(stderr, "Thread pool: %d threads\n", tp.n_threads);
 }
 
-int qwen_get_num_cpus(void) {
-#ifdef __APPLE__
-    int n = 0;
-    size_t len = sizeof(n);
-    sysctlbyname("hw.ncpu", &n, &len, NULL, 0);
-    return n > 0 ? n : 1;
-#else
-    int n = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    return n > 0 ? n : 1;
-#endif
+int qwen_get_threads(void) { return tp.n_threads; }
+
+/* Claim the next chunk index of the current job.
+ *
+ * Static row splits leave the dispatcher waiting on whichever worker the OS
+ * happened to preempt; handing out small chunks on demand keeps every core
+ * busy until the job is actually finished. */
+static inline int qwen_claim_chunk(void) {
+    return atomic_fetch_add_explicit(&tp.cursor, 1, memory_order_relaxed);
+}
+
+/* Chunk size that gives each thread several bites at the work. */
+static inline int qwen_chunk_size(int total, int n_threads, int min_chunk) {
+    if (n_threads <= 1) return total > 0 ? total : 1;
+    int c = (total + n_threads * 4 - 1) / (n_threads * 4);
+    if (c < min_chunk) c = min_chunk;
+    return c > 0 ? c : 1;
 }
 
 /* Dispatch work to all threads; main thread is tid=0 */
 static void parallel_for(parallel_fn_t fn, void *arg) {
+    /* Reset before the single-thread shortcut too: workers that hand out work
+     * with qwen_claim_chunk() would otherwise see a cursor left over from the
+     * previous job and silently skip every chunk. */
+    atomic_store(&tp.cursor, 0);
+
     if (tp.n_threads <= 1) {
         fn(0, 1, arg);
         return;
     }
 
-    pthread_mutex_lock(&tp.mutex);
+    int expect = tp.n_threads - 1;
     tp.fn = fn;
     tp.arg = arg;
-    tp.n_done = 0;
-    tp.generation++;
-    pthread_cond_broadcast(&tp.cond_work);
-    pthread_mutex_unlock(&tp.mutex);
+    atomic_store(&tp.n_done, 0);
+    atomic_fetch_add(&tp.generation, 1);
+
+    /* Only pay for a futex wake if somebody actually parked. The seq_cst
+     * ordering between the generation store and this load guarantees a worker
+     * that is about to park has already been counted. */
+    if (atomic_load(&tp.n_parked) > 0) {
+        pthread_mutex_lock(&tp.mutex);
+        pthread_cond_broadcast(&tp.cond_work);
+        pthread_mutex_unlock(&tp.mutex);
+    }
 
     fn(0, tp.n_threads, arg);
 
-    pthread_mutex_lock(&tp.mutex);
-    while (tp.n_done < tp.n_threads - 1)
-        pthread_cond_wait(&tp.cond_done, &tp.mutex);
-    pthread_mutex_unlock(&tp.mutex);
+    for (int spins = 0; spins < QWEN_JOIN_SPINS; spins++) {
+        if (atomic_load(&tp.n_done) >= expect) return;
+        qwen_cpu_relax();
+    }
+    /* Fallback: a worker got descheduled. Yield instead of burning the core. */
+    while (atomic_load(&tp.n_done) < expect)
+        sched_yield();
+}
+
+/* Diagnostic: how many pool threads actually pick up a dispatch, and how long
+ * a round trip costs. Useful when porting to a new threading substrate (wasm
+ * workers in particular), where a barrier that silently runs single-threaded
+ * looks like a slow kernel. */
+typedef struct {
+    _Atomic int participants;
+    _Atomic int spins;
+} pool_test_t;
+
+static void pool_test_worker(int tid, int n_threads, void *arg) {
+    (void)tid; (void)n_threads;
+    pool_test_t *t = (pool_test_t *)arg;
+    atomic_fetch_add(&t->participants, 1);
+    /* A little work so the dispatcher cannot finish before workers start. */
+    volatile int acc = 0;
+    for (int i = 0; i < 200000; i++) acc += i;
+    atomic_fetch_add(&t->spins, acc & 1);
+}
+
+void qwen_pool_selftest(int rounds, int *out_participants, double *out_ms) {
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    int total = 0;
+    for (int r = 0; r < rounds; r++) {
+        pool_test_t t;
+        atomic_store(&t.participants, 0);
+        atomic_store(&t.spins, 0);
+        parallel_for(pool_test_worker, &t);
+        total += atomic_load(&t.participants);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    if (out_participants) *out_participants = rounds > 0 ? total / rounds : 0;
+    if (out_ms) *out_ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
 }
 
 /* ========================================================================
@@ -176,20 +341,175 @@ void qwen_copy(float *dst, const float *src, int n) {
  * Matrix Operations
  * ======================================================================== */
 
+#ifndef USE_BLAS
+/* Portable blocked GEMM used when no BLAS is linked (wasm builds, or Linux
+ * without OpenBLAS). C[M,N] = A[M,K] @ B[N,K]^T, optionally + bias and with a
+ * caller-supplied row stride for C.
+ *
+ * A 4x4 register tile keeps 16 running dot products alive over the shared k
+ * loop, which clang vectorizes to NEON / SSE / wasm-simd128. The naive triple
+ * loop it replaces reloaded both operands for every single multiply. */
+#define QWEN_GEMM_MR 4
+#define QWEN_GEMM_NR 4
+
+/* 4x4 register tile over C = A @ B^T. Explicit scalar accumulators (rather
+ * than an array) keep all 16 values in registers across the k loop. */
+static void gemm_t_tile(float *C, int ldc, const float *restrict A,
+                        const float *restrict B, const float *bias,
+                        int M, int n0, int n1, int K) {
+    for (int m = 0; m < M; m += QWEN_GEMM_MR) {
+        int mr = M - m < QWEN_GEMM_MR ? M - m : QWEN_GEMM_MR;
+        for (int n = n0; n < n1; n += QWEN_GEMM_NR) {
+            int nr = n1 - n < QWEN_GEMM_NR ? n1 - n : QWEN_GEMM_NR;
+
+            if (mr == 4 && nr == 4) {
+                const float *restrict a0 = A + (size_t)(m + 0) * K;
+                const float *restrict a1 = A + (size_t)(m + 1) * K;
+                const float *restrict a2 = A + (size_t)(m + 2) * K;
+                const float *restrict a3 = A + (size_t)(m + 3) * K;
+                const float *restrict b0 = B + (size_t)(n + 0) * K;
+                const float *restrict b1 = B + (size_t)(n + 1) * K;
+                const float *restrict b2 = B + (size_t)(n + 2) * K;
+                const float *restrict b3 = B + (size_t)(n + 3) * K;
+                float c00 = 0, c01 = 0, c02 = 0, c03 = 0;
+                float c10 = 0, c11 = 0, c12 = 0, c13 = 0;
+                float c20 = 0, c21 = 0, c22 = 0, c23 = 0;
+                float c30 = 0, c31 = 0, c32 = 0, c33 = 0;
+                for (int k = 0; k < K; k++) {
+                    float av0 = a0[k], av1 = a1[k], av2 = a2[k], av3 = a3[k];
+                    float bv0 = b0[k], bv1 = b1[k], bv2 = b2[k], bv3 = b3[k];
+                    c00 += av0 * bv0; c01 += av0 * bv1; c02 += av0 * bv2; c03 += av0 * bv3;
+                    c10 += av1 * bv0; c11 += av1 * bv1; c12 += av1 * bv2; c13 += av1 * bv3;
+                    c20 += av2 * bv0; c21 += av2 * bv1; c22 += av2 * bv2; c23 += av2 * bv3;
+                    c30 += av3 * bv0; c31 += av3 * bv1; c32 += av3 * bv2; c33 += av3 * bv3;
+                }
+                float b0v = bias ? bias[n + 0] : 0.0f, b1v = bias ? bias[n + 1] : 0.0f;
+                float b2v = bias ? bias[n + 2] : 0.0f, b3v = bias ? bias[n + 3] : 0.0f;
+                float *r0 = C + (size_t)(m + 0) * ldc + n;
+                float *r1 = C + (size_t)(m + 1) * ldc + n;
+                float *r2 = C + (size_t)(m + 2) * ldc + n;
+                float *r3 = C + (size_t)(m + 3) * ldc + n;
+                r0[0] = c00 + b0v; r0[1] = c01 + b1v; r0[2] = c02 + b2v; r0[3] = c03 + b3v;
+                r1[0] = c10 + b0v; r1[1] = c11 + b1v; r1[2] = c12 + b2v; r1[3] = c13 + b3v;
+                r2[0] = c20 + b0v; r2[1] = c21 + b1v; r2[2] = c22 + b2v; r2[3] = c23 + b3v;
+                r3[0] = c30 + b0v; r3[1] = c31 + b1v; r3[2] = c32 + b2v; r3[3] = c33 + b3v;
+            } else {
+                for (int i = 0; i < mr; i++) {
+                    const float *restrict a = A + (size_t)(m + i) * K;
+                    for (int j = 0; j < nr; j++) {
+                        const float *restrict b = B + (size_t)(n + j) * K;
+                        float sum = 0.0f;
+                        for (int k = 0; k < K; k++) sum += a[k] * b[k];
+                        C[(size_t)(m + i) * ldc + n + j] =
+                            sum + (bias ? bias[n + j] : 0.0f);
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef struct {
+    float *C;
+    int ldc;
+    const float *A;
+    const float *B;
+    const float *bias;
+    int M, K, N;
+} gemm_task_t;
+
+static void gemm_worker(int tid, int n_threads, void *arg) {
+    (void)tid;
+    gemm_task_t *t = (gemm_task_t *)arg;
+    int chunk = qwen_chunk_size(t->N, n_threads, QWEN_GEMM_NR);
+    chunk = ((chunk + QWEN_GEMM_NR - 1) / QWEN_GEMM_NR) * QWEN_GEMM_NR;
+
+    for (int c = qwen_claim_chunk(); ; c = qwen_claim_chunk()) {
+        int n0 = c * chunk;
+        if (n0 >= t->N) return;
+        int n1 = n0 + chunk;
+        if (n1 > t->N) n1 = t->N;
+        gemm_t_tile(t->C, t->ldc, t->A, t->B, t->bias, t->M, n0, n1, t->K);
+    }
+}
+
+/* C[M,N] = A[M,K] @ B[K,N], both row-major (conv2d's im2col shape). */
+static void gemm_nn_tile(float *restrict C, const float *restrict A,
+                         const float *restrict B, int K, int N,
+                         int m0, int m1) {
+    for (int m = m0; m < m1; m += 4) {
+        int mr = m1 - m < 4 ? m1 - m : 4;
+        for (int j = 0; j < mr; j++)
+            memset(C + (size_t)(m + j) * N, 0, (size_t)N * sizeof(float));
+
+        for (int k = 0; k < K; k++) {
+            const float *restrict brow = B + (size_t)k * N;
+            if (mr == 4) {
+                float a0 = A[(size_t)(m + 0) * K + k];
+                float a1 = A[(size_t)(m + 1) * K + k];
+                float a2 = A[(size_t)(m + 2) * K + k];
+                float a3 = A[(size_t)(m + 3) * K + k];
+                float *restrict r0 = C + (size_t)(m + 0) * N;
+                float *restrict r1 = C + (size_t)(m + 1) * N;
+                float *restrict r2 = C + (size_t)(m + 2) * N;
+                float *restrict r3 = C + (size_t)(m + 3) * N;
+                for (int n = 0; n < N; n++) {
+                    float b = brow[n];
+                    r0[n] += a0 * b; r1[n] += a1 * b;
+                    r2[n] += a2 * b; r3[n] += a3 * b;
+                }
+            } else {
+                for (int j = 0; j < mr; j++) {
+                    float a = A[(size_t)(m + j) * K + k];
+                    float *restrict r = C + (size_t)(m + j) * N;
+                    for (int n = 0; n < N; n++) r[n] += a * brow[n];
+                }
+            }
+        }
+    }
+}
+
+static void gemm_nn_worker(int tid, int n_threads, void *arg) {
+    (void)tid;
+    gemm_task_t *t = (gemm_task_t *)arg;
+    int chunk = qwen_chunk_size(t->M, n_threads, 4);
+    chunk = ((chunk + 3) / 4) * 4;
+    for (int c = qwen_claim_chunk(); ; c = qwen_claim_chunk()) {
+        int m0 = c * chunk;
+        if (m0 >= t->M) return;
+        int m1 = m0 + chunk;
+        if (m1 > t->M) m1 = t->M;
+        gemm_nn_tile(t->C, t->A, t->B, t->K, t->N, m0, m1);
+    }
+}
+
+static void qwen_gemm_nn_generic(float *C, const float *A, const float *B,
+                                 int M, int K, int N) {
+    gemm_task_t task = { C, N, A, B, NULL, M, K, N };
+    if (tp.n_threads > 1 && M >= 8) {
+        parallel_for(gemm_nn_worker, &task);
+        return;
+    }
+    gemm_nn_tile(C, A, B, K, N, 0, M);
+}
+
+static void qwen_gemm_t_generic(float *C, int ldc, const float *A, const float *B,
+                                const float *bias, int M, int K, int N) {
+    gemm_task_t task = { C, ldc, A, B, bias, M, K, N };
+    if (tp.n_threads > 1 && N >= 32) {
+        parallel_for(gemm_worker, &task);
+        return;
+    }
+    gemm_t_tile(C, ldc, A, B, bias, M, 0, N, K);
+}
+#endif /* !USE_BLAS */
+
 void qwen_matmul_t(float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
 #else
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
-                sum += A[m * K + k] * B[n * K + k];
-            }
-            C[m * N + n] = sum;
-        }
-    }
+    qwen_gemm_t_generic(C, N, A, B, NULL, M, K, N);
 #endif
 }
 
@@ -208,18 +528,7 @@ void qwen_linear(float *y, const float *x, const float *W, const float *b,
         }
     }
 #else
-    for (int s = 0; s < seq_len; s++) {
-        const float *x_row = x + s * in_dim;
-        float *y_row = y + s * out_dim;
-        for (int o = 0; o < out_dim; o++) {
-            const float *w_row = W + o * in_dim;
-            float sum = (b != NULL) ? b[o] : 0.0f;
-            for (int i = 0; i < in_dim; i++) {
-                sum += x_row[i] * w_row[i];
-            }
-            y_row[o] = sum;
-        }
-    }
+    qwen_gemm_t_generic(y, out_dim, x, W, b, seq_len, in_dim, out_dim);
 #endif
 }
 
@@ -555,6 +864,423 @@ void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
 }
 
 /* ========================================================================
+ * Q8 Block-Quantized Weights
+ * ======================================================================== */
+
+static inline float q8_bf16_to_f32(uint16_t h) {
+    uint32_t bits = ((uint32_t)h) << 16;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+size_t qwen_q8_bytes(const qwen_q8_mat_t *m) {
+    if (!m || !m->q) return 0;
+    size_t n = (size_t)m->rows * m->cols;
+    return n + (n / QWEN_Q8_BLOCK) * sizeof(float);
+}
+
+void qwen_q8_free(qwen_q8_mat_t *m) {
+    if (!m) return;
+    if (m->owns) {
+        free(m->q);
+        free(m->scales);
+    }
+    m->q = NULL;
+    m->scales = NULL;
+    m->rows = m->cols = 0;
+    m->owns = 0;
+}
+
+void qwen_q8_attach(qwen_q8_mat_t *m, int8_t *q, float *scales, int rows, int cols) {
+    m->q = q;
+    m->scales = scales;
+    m->rows = rows;
+    m->cols = cols;
+    m->owns = 0;
+}
+
+void qwen_wmat_free(qwen_wmat_t *w) {
+    if (!w) return;
+    free(w->f32);
+    w->f32 = NULL;
+    qwen_q8_free(&w->q8);
+    w->rows = w->cols = 0;
+}
+
+/* Quantize one row of bf16 weights into int8 blocks with per-block f32 scale. */
+static void q8_quantize_bf16_row(int8_t *q, float *s, const uint16_t *w, int cols) {
+    for (int b = 0; b < cols; b += QWEN_Q8_BLOCK) {
+        float amax = 0.0f;
+        for (int i = 0; i < QWEN_Q8_BLOCK; i++) {
+            float v = q8_bf16_to_f32(w[b + i]);
+            float a = v < 0.0f ? -v : v;
+            if (a > amax) amax = a;
+        }
+        float scale = amax / 127.0f;
+        float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+        s[b / QWEN_Q8_BLOCK] = scale;
+        for (int i = 0; i < QWEN_Q8_BLOCK; i++) {
+            float v = q8_bf16_to_f32(w[b + i]) * inv;
+            int qi = (int)(v < 0.0f ? v - 0.5f : v + 0.5f);
+            if (qi > 127) qi = 127;
+            if (qi < -127) qi = -127;
+            q[b + i] = (int8_t)qi;
+        }
+    }
+}
+
+typedef struct {
+    qwen_q8_mat_t *m;
+    const uint16_t *A;
+    const uint16_t *B; /* NULL unless interleaving two sources */
+    int rows_each;
+} q8_quant_task_t;
+
+static void q8_quant_worker(int tid, int n_threads, void *arg) {
+    q8_quant_task_t *t = (q8_quant_task_t *)arg;
+    qwen_q8_mat_t *m = t->m;
+    int cols = m->cols;
+    int nb = cols / QWEN_Q8_BLOCK;
+    int chunk = (m->rows + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > m->rows) end = m->rows;
+
+    for (int r = start; r < end; r++) {
+        const uint16_t *src;
+        if (t->B) {
+            /* rows alternate A0, B0, A1, B1, ... */
+            const uint16_t *base = (r & 1) ? t->B : t->A;
+            src = base + (size_t)(r >> 1) * cols;
+        } else {
+            src = t->A + (size_t)r * cols;
+        }
+        q8_quantize_bf16_row(m->q + (size_t)r * cols,
+                             m->scales + (size_t)r * nb, src, cols);
+    }
+}
+
+static int q8_alloc(qwen_q8_mat_t *m, int rows, int cols) {
+    if (cols % QWEN_Q8_BLOCK != 0) {
+        fprintf(stderr, "q8: cols=%d not a multiple of %d\n", cols, QWEN_Q8_BLOCK);
+        return -1;
+    }
+    size_t n = (size_t)rows * cols;
+    m->q = (int8_t *)malloc(n);
+    m->scales = (float *)malloc((n / QWEN_Q8_BLOCK) * sizeof(float));
+    if (!m->q || !m->scales) {
+        qwen_q8_free(m);
+        return -1;
+    }
+    m->rows = rows;
+    m->cols = cols;
+    m->owns = 1;
+    return 0;
+}
+
+int qwen_q8_from_bf16(qwen_q8_mat_t *m, const uint16_t *W_bf16, int rows, int cols) {
+    if (q8_alloc(m, rows, cols) != 0) return -1;
+    q8_quant_task_t task = { m, W_bf16, NULL, rows };
+    parallel_for(q8_quant_worker, &task);
+    return 0;
+}
+
+int qwen_q8_from_bf16_interleave2(qwen_q8_mat_t *m, const uint16_t *A,
+                                  const uint16_t *B, int rows_each, int cols) {
+    if (q8_alloc(m, 2 * rows_each, cols) != 0) return -1;
+    q8_quant_task_t task = { m, A, B, rows_each };
+    parallel_for(q8_quant_worker, &task);
+    return 0;
+}
+
+void qwen_q8_row_to_f32(float *dst, const qwen_q8_mat_t *m, int row) {
+    int nb = m->cols / QWEN_Q8_BLOCK;
+    const int8_t *q = m->q + (size_t)row * m->cols;
+    const float *s = m->scales + (size_t)row * nb;
+    for (int b = 0; b < nb; b++) {
+        float sc = s[b];
+        const int8_t *qb = q + b * QWEN_Q8_BLOCK;
+        float *db = dst + b * QWEN_Q8_BLOCK;
+#if defined(__ARM_NEON)
+        float32x4_t scv = vdupq_n_f32(sc);
+        for (int i = 0; i < QWEN_Q8_BLOCK; i += 16) {
+            int8x16_t v = vld1q_s8(qb + i);
+            int16x8_t lo = vmovl_s8(vget_low_s8(v));
+            int16x8_t hi = vmovl_s8(vget_high_s8(v));
+            vst1q_f32(db + i,      vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))),  scv));
+            vst1q_f32(db + i + 4,  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))), scv));
+            vst1q_f32(db + i + 8,  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))),  scv));
+            vst1q_f32(db + i + 12, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))), scv));
+        }
+#elif defined(__AVX2__)
+        __m256 scv = _mm256_set1_ps(sc);
+        for (int i = 0; i < QWEN_Q8_BLOCK; i += 8) {
+            __m256i wi = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(qb + i)));
+            _mm256_storeu_ps(db + i, _mm256_mul_ps(_mm256_cvtepi32_ps(wi), scv));
+        }
+#else
+        for (int i = 0; i < QWEN_Q8_BLOCK; i++) db[i] = (float)qb[i] * sc;
+#endif
+    }
+}
+
+/* ---- Activation quantization scratch (single-threaded producer) ---- */
+
+static int8_t *q8_act_q = NULL;
+static float *q8_act_s = NULL;
+static int q8_act_cap = 0;
+
+static int q8_act_prepare(const float *x, int n) {
+    if (n > q8_act_cap) {
+        free(q8_act_q);
+        free(q8_act_s);
+        q8_act_q = (int8_t *)malloc((size_t)n);
+        q8_act_s = (float *)malloc(((size_t)n / QWEN_Q8_BLOCK + 1) * sizeof(float));
+        q8_act_cap = (q8_act_q && q8_act_s) ? n : 0;
+        if (!q8_act_cap) return -1;
+    }
+    qwen_q8_quantize_row_impl(x, q8_act_q, q8_act_s, n);
+    return 0;
+}
+
+/* ---- Threaded matvec ---- */
+
+typedef struct {
+    float *y;
+    const int8_t *qx;
+    const float *sx;
+    const qwen_q8_mat_t *W;
+} q8_matvec_task_t;
+
+static void q8_matvec_worker(int tid, int n_threads, void *arg) {
+    (void)tid;
+    q8_matvec_task_t *t = (q8_matvec_task_t *)arg;
+    const qwen_q8_mat_t *W = t->W;
+    int nb = W->cols / QWEN_Q8_BLOCK;
+    int chunk = qwen_chunk_size(W->rows, n_threads, 32);
+
+    for (int c = qwen_claim_chunk(); ; c = qwen_claim_chunk()) {
+        int start = c * chunk;
+        if (start >= W->rows) return;
+        int end = start + chunk;
+        if (end > W->rows) end = W->rows;
+
+        qwen_q8_matvec_impl(t->y + start, t->qx, t->sx,
+                            W->q + (size_t)start * W->cols,
+                            W->scales + (size_t)start * nb,
+                            W->cols, end - start);
+    }
+}
+
+/* ---- Prefill: dequantize row panels and hand them to sgemm ---- */
+
+static float *q8_panel = NULL;
+static size_t q8_panel_cap = 0;
+
+typedef struct {
+    float *dst;
+    const qwen_q8_mat_t *W;
+    int row0;
+    int nrows;
+} q8_dequant_task_t;
+
+static void q8_dequant_worker(int tid, int n_threads, void *arg) {
+    q8_dequant_task_t *t = (q8_dequant_task_t *)arg;
+    int chunk = (t->nrows + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->nrows) end = t->nrows;
+    for (int r = start; r < end; r++)
+        qwen_q8_row_to_f32(t->dst + (size_t)r * t->W->cols, t->W, t->row0 + r);
+}
+
+static void q8_linear_prefill(float *y, const float *x, const qwen_q8_mat_t *W,
+                              int seq_len) {
+    int cols = W->cols;
+    int rows = W->rows;
+
+    /* Panel sized to stay comfortably inside the shared L2. */
+    int panel_rows = (2 * 1024 * 1024) / cols;
+    if (panel_rows < 64) panel_rows = 64;
+    if (panel_rows > rows) panel_rows = rows;
+
+    size_t need = (size_t)panel_rows * cols;
+    if (need > q8_panel_cap) {
+        free(q8_panel);
+        q8_panel = (float *)malloc(need * sizeof(float));
+        q8_panel_cap = q8_panel ? need : 0;
+        if (!q8_panel_cap) return;
+    }
+
+    for (int r0 = 0; r0 < rows; r0 += panel_rows) {
+        int nr = rows - r0;
+        if (nr > panel_rows) nr = panel_rows;
+
+        q8_dequant_task_t task = { q8_panel, W, r0, nr };
+        parallel_for(q8_dequant_worker, &task);
+
+#ifdef USE_BLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    seq_len, nr, cols,
+                    1.0f, x, cols, q8_panel, cols,
+                    0.0f, y + r0, rows);
+#else
+        qwen_gemm_t_generic(y + r0, rows, x, q8_panel, NULL, seq_len, cols, nr);
+#endif
+    }
+}
+
+void qwen_linear_bias_q8(float *y, const float *x, const qwen_q8_mat_t *W,
+                         const float *bias, int seq_len) {
+    qwen_linear_nobias_q8(y, x, W, seq_len);
+    if (!bias) return;
+    int out_dim = W->rows;
+    for (int s = 0; s < seq_len; s++) {
+        float *row = y + (size_t)s * out_dim;
+        for (int o = 0; o < out_dim; o++) row[o] += bias[o];
+    }
+}
+
+void qwen_linear_w(float *y, const float *x, const qwen_wmat_t *W,
+                   const float *bias, int seq_len) {
+    if (W->q8.q)
+        qwen_linear_bias_q8(y, x, &W->q8, bias, seq_len);
+    else
+        qwen_linear(y, x, W->f32, bias, seq_len, W->cols, W->rows);
+}
+
+void qwen_linear_nobias_q8(float *y, const float *x, const qwen_q8_mat_t *W,
+                           int seq_len) {
+    if (seq_len != 1) {
+        q8_linear_prefill(y, x, W, seq_len);
+        return;
+    }
+
+    if (q8_act_prepare(x, W->cols) != 0) return;
+
+    q8_matvec_task_t task = { y, q8_act_q, q8_act_s, W };
+    parallel_for(q8_matvec_worker, &task);
+}
+
+/* ---- Fused Q/K/V matvec: one activation quantization, one dispatch ---- */
+
+typedef struct {
+    float *y[3];
+    const qwen_q8_mat_t *W[3];
+    const int8_t *qx;
+    const float *sx;
+    int total_rows;
+} q8_qkv_task_t;
+
+static void q8_qkv_worker(int tid, int n_threads, void *arg) {
+    (void)tid;
+    q8_qkv_task_t *t = (q8_qkv_task_t *)arg;
+    int chunk = qwen_chunk_size(t->total_rows, n_threads, 32);
+
+    for (int c = qwen_claim_chunk(); ; c = qwen_claim_chunk()) {
+        int start = c * chunk;
+        if (start >= t->total_rows) return;
+        int end = start + chunk;
+        if (end > t->total_rows) end = t->total_rows;
+
+        int base = 0;
+        for (int m = 0; m < 3; m++) {
+            const qwen_q8_mat_t *W = t->W[m];
+            int lo = start > base ? start - base : 0;
+            int hi = end - base;
+            if (hi > W->rows) hi = W->rows;
+            if (lo < hi) {
+                int nb = W->cols / QWEN_Q8_BLOCK;
+                qwen_q8_matvec_impl(t->y[m] + lo, t->qx, t->sx,
+                                    W->q + (size_t)lo * W->cols,
+                                    W->scales + (size_t)lo * nb,
+                                    W->cols, hi - lo);
+            }
+            base += W->rows;
+        }
+    }
+}
+
+void qwen_linear_nobias_q8_qkv(float *q, float *k, float *v, const float *x,
+                               const qwen_q8_mat_t *Wq, const qwen_q8_mat_t *Wk,
+                               const qwen_q8_mat_t *Wv) {
+    if (q8_act_prepare(x, Wq->cols) != 0) return;
+
+    q8_qkv_task_t task;
+    task.y[0] = q; task.y[1] = k; task.y[2] = v;
+    task.W[0] = Wq; task.W[1] = Wk; task.W[2] = Wv;
+    task.qx = q8_act_q;
+    task.sx = q8_act_s;
+    task.total_rows = Wq->rows + Wk->rows + Wv->rows;
+
+    parallel_for(q8_qkv_worker, &task);
+}
+
+/* ---- Streaming argmax over the (quantized) tied LM head ---- */
+
+typedef struct {
+    const int8_t *qx;
+    const float *sx;
+    const qwen_q8_mat_t *W;
+    int best_idx[QWEN_MAX_THREADS];
+    float best_val[QWEN_MAX_THREADS];
+} q8_argmax_task_t;
+
+static void q8_argmax_worker(int tid, int n_threads, void *arg) {
+    q8_argmax_task_t *t = (q8_argmax_task_t *)arg;
+    const qwen_q8_mat_t *W = t->W;
+    int nb = W->cols / QWEN_Q8_BLOCK;
+    int chunk = qwen_chunk_size(W->rows, n_threads, 256);
+
+    float best_val = -1e30f;
+    int best_idx = 0;
+
+    for (int c = qwen_claim_chunk(); ; c = qwen_claim_chunk()) {
+        int start = c * chunk;
+        if (start >= W->rows) break;
+        int end = start + chunk;
+        if (end > W->rows) end = W->rows;
+
+        int idx;
+        float val;
+        qwen_q8_argmax_range_impl(t->qx, t->sx,
+                                  W->q + (size_t)start * W->cols,
+                                  W->scales + (size_t)start * nb,
+                                  W->cols, end - start, start, &idx, &val);
+        if (val > best_val) { best_val = val; best_idx = idx; }
+    }
+
+    t->best_val[tid] = best_val;
+    t->best_idx[tid] = best_idx;
+}
+
+int qwen_argmax_matvec_q8(const float *x, const qwen_q8_mat_t *W) {
+    if (q8_act_prepare(x, W->cols) != 0) return 0;
+
+    q8_argmax_task_t task;
+    task.qx = q8_act_q;
+    task.sx = q8_act_s;
+    task.W = W;
+
+    if (tp.n_threads <= 1) {
+        parallel_for(q8_argmax_worker, &task);
+        return task.best_idx[0];
+    }
+    parallel_for(q8_argmax_worker, &task);
+
+    int best = task.best_idx[0];
+    float best_val = task.best_val[0];
+    for (int i = 1; i < tp.n_threads; i++) {
+        if (task.best_val[i] > best_val) {
+            best_val = task.best_val[i];
+            best = task.best_idx[i];
+        }
+    }
+    return best;
+}
+
+/* ========================================================================
  * 2D Convolution (im2col + BLAS sgemm)
  * ======================================================================== */
 
@@ -608,15 +1334,7 @@ void qwen_conv2d(float *out, const float *in, const float *weight, const float *
                 1.0f, weight, patch_size, cols, spatial_out,
                 0.0f, out, spatial_out);
 #else
-    for (int oc = 0; oc < c_out; oc++) {
-        for (int s = 0; s < spatial_out; s++) {
-            float sum = 0.0f;
-            for (int p = 0; p < patch_size; p++) {
-                sum += weight[oc * patch_size + p] * cols[p * spatial_out + s];
-            }
-            out[oc * spatial_out + s] = sum;
-        }
-    }
+    qwen_gemm_nn_generic(out, weight, cols, c_out, patch_size, spatial_out);
 #endif
 
     free(cols);
@@ -876,19 +1594,91 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
  * Activation Functions
  * ======================================================================== */
 
-void qwen_silu(float *x, int n) {
+/* Vectorized exp over a buffer.
+ *
+ * On Apple this is vForce; elsewhere it is a branch-free 2^k * poly(f)
+ * expansion that clang auto-vectorizes to NEON/SSE/wasm-simd. Both are far
+ * cheaper than a scalar libm call, and the encoder evaluates one per GELU. */
+void qwen_vec_expf(float *dst, const float *src, int n) {
+#if defined(__APPLE__) && defined(USE_BLAS)
+    int cnt = n;
+    vvexpf(dst, src, &cnt);
+#else
+    const float log2e = 1.44269504088896341f;
     for (int i = 0; i < n; i++) {
-        float val = x[i];
-        x[i] = val / (1.0f + expf(-val));
+        float x = src[i];
+        if (x < -87.0f) x = -87.0f;
+        if (x > 88.0f) x = 88.0f;
+        float t = x * log2e;
+        int k = (int)(t + (t >= 0.0f ? 0.5f : -0.5f));
+        float f = t - (float)k;
+        /* degree-5 minimax for 2^f on [-0.5, 0.5] */
+        float p = 0.0013333558f;
+        p = p * f + 0.0096181291f;
+        p = p * f + 0.0555041087f;
+        p = p * f + 0.2402265069f;
+        p = p * f + 0.6931471805f;
+        p = p * f + 1.0f;
+        union { uint32_t u; float f; } sc;
+        sc.u = (uint32_t)((k + 127) << 23);
+        dst[i] = p * sc.f;
+    }
+#endif
+}
+
+typedef struct {
+    float *x;
+    int n;
+} elemwise_task_t;
+
+/* GELU (tanh approximation), rewritten through the exact identity
+ *   0.5 * (1 + tanh(z)) == sigmoid(2z)
+ * so one vectorized exp replaces a scalar tanhf per element. */
+static void gelu_range(float *x, int n) {
+    enum { TILE = 1024 };
+    float tmp[TILE];
+    for (int off = 0; off < n; off += TILE) {
+        int m = n - off;
+        if (m > TILE) m = TILE;
+        float *xp = x + off;
+        for (int i = 0; i < m; i++) {
+            float v = xp[i];
+            tmp[i] = -1.5957691216057308f * (v + 0.044715f * v * v * v);
+        }
+        qwen_vec_expf(tmp, tmp, m);
+        for (int i = 0; i < m; i++) xp[i] = xp[i] / (1.0f + tmp[i]);
     }
 }
 
+static void gelu_worker(int tid, int n_threads, void *arg) {
+    elemwise_task_t *t = (elemwise_task_t *)arg;
+    int chunk = (t->n + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->n) end = t->n;
+    if (start >= end) return;
+    gelu_range(t->x + start, end - start);
+}
+
 void qwen_gelu(float *x, int n) {
-    for (int i = 0; i < n; i++) {
-        float val = x[i];
-        float x3 = val * val * val;
-        float inner = 0.7978845608028654f * (val + 0.044715f * x3);
-        x[i] = 0.5f * val * (1.0f + tanhf(inner));
+    if (tp.n_threads > 1 && n >= 8192) {
+        elemwise_task_t task = { x, n };
+        parallel_for(gelu_worker, &task);
+        return;
+    }
+    gelu_range(x, n);
+}
+
+void qwen_silu(float *x, int n) {
+    enum { TILE = 1024 };
+    float tmp[TILE];
+    for (int off = 0; off < n; off += TILE) {
+        int m = n - off;
+        if (m > TILE) m = TILE;
+        float *xp = x + off;
+        for (int i = 0; i < m; i++) tmp[i] = -xp[i];
+        qwen_vec_expf(tmp, tmp, m);
+        for (int i = 0; i < m; i++) xp[i] = xp[i] / (1.0f + tmp[i]);
     }
 }
 
@@ -995,103 +1785,166 @@ static inline void qwen_vec_axpy_inplace(float *dst, const float *src, float alp
     qwen_vec_axpy_inplace_impl(dst, src, alpha, n);
 }
 
-/* dst = dst * correction + src */
-static inline void qwen_vec_scale_add(float *dst, const float *src, float correction, int n) {
-    qwen_vec_scale_add_impl(dst, src, correction, n);
+/* Per-thread scratch for attention scores. Only one parallel_for runs at a
+ * time, so a flat per-tid table is enough. */
+static float *attn_scores[QWEN_MAX_THREADS];
+static int attn_scores_cap[QWEN_MAX_THREADS];
+
+static float *attn_scores_get(int tid, int n) {
+    if (n > attn_scores_cap[tid]) {
+        free(attn_scores[tid]);
+        attn_scores[tid] = (float *)malloc((size_t)n * sizeof(float));
+        attn_scores_cap[tid] = attn_scores[tid] ? n : 0;
+    }
+    return attn_scores[tid];
+}
+
+/* softmax over scores[0..n) in place; returns 1/sum. */
+static float attn_softmax_inplace(float *scores, int n) {
+    float max_score = scores[0];
+    for (int j = 1; j < n; j++)
+        if (scores[j] > max_score) max_score = scores[j];
+
+#if defined(__APPLE__) && defined(USE_BLAS)
+    /* vForce exp is several times faster than a scalar expf loop, and decoder
+     * attention evaluates ~300k of them per generated token. */
+    for (int j = 0; j < n; j++) scores[j] -= max_score;
+    int cnt = n;
+    vvexpf(scores, scores, &cnt);
+#else
+    for (int j = 0; j < n; j++) scores[j] = expf(scores[j] - max_score);
+#endif
+
+    float sum = 0.0f;
+    for (int j = 0; j < n; j++) sum += scores[j];
+    return sum > 0.0f ? 1.0f / sum : 0.0f;
+}
+
+/* out_row = sum_j w[j] * V[j*stride], four keys at a time for ILP. */
+static void attn_weighted_sum(float *o_row, const float *V, int v_stride,
+                              const float *w, int n, int head_dim) {
+    memset(o_row, 0, (size_t)head_dim * sizeof(float));
+    int j = 0;
+    for (; j + 4 <= n; j += 4) {
+        qwen_vec_axpy_inplace(o_row, V + (size_t)j * v_stride, w[j], head_dim);
+        qwen_vec_axpy_inplace(o_row, V + (size_t)(j + 1) * v_stride, w[j + 1], head_dim);
+        qwen_vec_axpy_inplace(o_row, V + (size_t)(j + 2) * v_stride, w[j + 2], head_dim);
+        qwen_vec_axpy_inplace(o_row, V + (size_t)(j + 3) * v_stride, w[j + 3], head_dim);
+    }
+    for (; j < n; j++)
+        qwen_vec_axpy_inplace(o_row, V + (size_t)j * v_stride, w[j], head_dim);
+}
+
+static void qwen_bidirectional_attention_heads(float *out, const float *Q, const float *K,
+                                               const float *V, int n_heads, int head_dim,
+                                               float scale, const int *window_starts,
+                                               int n_windows, int head_start, int head_end,
+                                               int tid) {
+    int hidden = n_heads * head_dim;
+
+    for (int h = head_start; h < head_end; h++) {
+        for (int w = 0; w < n_windows; w++) {
+            int ws = window_starts[w];
+            int we = window_starts[w + 1];
+            int n = we - ws;
+            if (n <= 0) continue;
+
+            float *scores = attn_scores_get(tid, n);
+            if (!scores) return;
+
+            const float *k_base = K + (size_t)ws * hidden + h * head_dim;
+            const float *v_base = V + (size_t)ws * hidden + h * head_dim;
+
+            for (int i = ws; i < we; i++) {
+                const float *q_row = Q + (size_t)i * hidden + h * head_dim;
+                float *o_row = out + (size_t)i * hidden + h * head_dim;
+
+                for (int j = 0; j < n; j++)
+                    scores[j] = qwen_dot_f32(q_row, k_base + (size_t)j * hidden, head_dim) * scale;
+
+                float inv_sum = attn_softmax_inplace(scores, n);
+                attn_weighted_sum(o_row, v_base, hidden, scores, n, head_dim);
+                qwen_vec_scale_inplace(o_row, inv_sum, head_dim);
+            }
+        }
+    }
+}
+
+typedef struct {
+    float *out;
+    const float *Q;
+    const float *K;
+    const float *V;
+    int n_heads, head_dim;
+    float scale;
+    const int *window_starts;
+    int n_windows;
+} bidir_attn_task_t;
+
+static void bidir_attn_worker(int tid, int n_threads, void *arg) {
+    bidir_attn_task_t *t = (bidir_attn_task_t *)arg;
+    int chunk = (t->n_heads + n_threads - 1) / n_threads;
+    int h0 = tid * chunk;
+    int h1 = h0 + chunk;
+    if (h1 > t->n_heads) h1 = t->n_heads;
+    if (h0 >= h1) return;
+
+    qwen_bidirectional_attention_heads(t->out, t->Q, t->K, t->V, t->n_heads,
+                                       t->head_dim, t->scale, t->window_starts,
+                                       t->n_windows, h0, h1, tid);
 }
 
 void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
                                    const float *V, int seq __attribute__((unused)),
                                    int n_heads, int head_dim, float scale,
                                    const int *window_starts, int n_windows) {
-    int hidden = n_heads * head_dim;
-
-    for (int h = 0; h < n_heads; h++) {
-        for (int w = 0; w < n_windows; w++) {
-            int ws = window_starts[w];
-            int we = window_starts[w + 1];
-
-            for (int i = ws; i < we; i++) {
-                const float *q_row = Q + i * hidden + h * head_dim;
-                float *o_row = out + i * hidden + h * head_dim;
-
-                /* Online softmax */
-                float max_score = -1e30f;
-                float sum_exp = 0.0f;
-                for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
-
-                for (int j = ws; j < we; j++) {
-                    const float *k_row = K + j * hidden + h * head_dim;
-                    const float *v_row = V + j * hidden + h * head_dim;
-
-                    float score = qwen_dot_f32(q_row, k_row, head_dim) * scale;
-
-                    if (score > max_score) {
-                        float correction = expf(max_score - score);
-                        sum_exp = sum_exp * correction + 1.0f;
-                        qwen_vec_scale_add(o_row, v_row, correction, head_dim);
-                        max_score = score;
-                    } else {
-                        float wt = expf(score - max_score);
-                        sum_exp += wt;
-                        qwen_vec_axpy_inplace(o_row, v_row, wt, head_dim);
-                    }
-                }
-
-                if (sum_exp > 0.0f) {
-                    float inv_sum = 1.0f / sum_exp;
-                    qwen_vec_scale_inplace(o_row, inv_sum, head_dim);
-                }
-            }
-        }
+    if (tp.n_threads > 1 && n_heads >= 2) {
+        bidir_attn_task_t task = {
+            .out = out, .Q = Q, .K = K, .V = V,
+            .n_heads = n_heads, .head_dim = head_dim, .scale = scale,
+            .window_starts = window_starts, .n_windows = n_windows
+        };
+        parallel_for(bidir_attn_worker, &task);
+        return;
     }
+    qwen_bidirectional_attention_heads(out, Q, K, V, n_heads, head_dim, scale,
+                                       window_starts, n_windows, 0, n_heads, 0);
 }
 
 static void qwen_causal_attention_heads(float *out, const float *Q, const float *K,
                                         const float *V, int seq_q, int seq_k,
                                         int n_heads, int n_kv_heads, int head_dim,
                                         float scale, int q_offset,
-                                        int head_start, int head_end) {
+                                        int head_start, int head_end, int tid) {
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
 
     for (int h = head_start; h < head_end; h++) {
         int kv_h = h / heads_per_kv;
+        const float *k_base = K + (size_t)kv_h * head_dim;
+        const float *v_base = V + (size_t)kv_h * head_dim;
 
         for (int i = 0; i < seq_q; i++) {
-            const float *q_row = Q + i * q_hidden + h * head_dim;
-            float *o_row = out + i * q_hidden + h * head_dim;
+            const float *q_row = Q + (size_t)i * q_hidden + h * head_dim;
+            float *o_row = out + (size_t)i * q_hidden + h * head_dim;
             int global_pos = q_offset + i;
             int k_end = global_pos + 1;
             if (k_end > seq_k) k_end = seq_k;
-
-            float max_score = -1e30f;
-            float sum_exp = 0.0f;
-            for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
-
-            for (int j = 0; j < k_end; j++) {
-                const float *k_row = K + j * kv_hidden + kv_h * head_dim;
-                const float *v_row = V + j * kv_hidden + kv_h * head_dim;
-
-                float score = qwen_dot_f32(q_row, k_row, head_dim) * scale;
-
-                if (score > max_score) {
-                    float correction = expf(max_score - score);
-                    sum_exp = sum_exp * correction + 1.0f;
-                    qwen_vec_scale_add(o_row, v_row, correction, head_dim);
-                    max_score = score;
-                } else {
-                    float wt = expf(score - max_score);
-                    sum_exp += wt;
-                    qwen_vec_axpy_inplace(o_row, v_row, wt, head_dim);
-                }
+            if (k_end <= 0) {
+                memset(o_row, 0, (size_t)head_dim * sizeof(float));
+                continue;
             }
 
-            if (sum_exp > 0.0f) {
-                float inv_sum = 1.0f / sum_exp;
-                qwen_vec_scale_inplace(o_row, inv_sum, head_dim);
-            }
+            float *scores = attn_scores_get(tid, k_end);
+            if (!scores) return;
+
+            for (int j = 0; j < k_end; j++)
+                scores[j] = qwen_dot_f32(q_row, k_base + (size_t)j * kv_hidden, head_dim) * scale;
+
+            float inv_sum = attn_softmax_inplace(scores, k_end);
+            attn_weighted_sum(o_row, v_base, kv_hidden, scores, k_end, head_dim);
+            qwen_vec_scale_inplace(o_row, inv_sum, head_dim);
         }
     }
 }
@@ -1118,12 +1971,97 @@ static void causal_attn_worker(int tid, int n_threads, void *arg) {
 
     qwen_causal_attention_heads(t->out, t->Q, t->K, t->V,
                                 t->seq_q, t->seq_k, t->n_heads, t->n_kv_heads,
-                                t->head_dim, t->scale, t->q_offset, h0, h1);
+                                t->head_dim, t->scale, t->q_offset, h0, h1, tid);
 }
+
+#ifdef USE_BLAS
+/* Prefill attention through GEMM.
+ *
+ * The row-at-a-time path costs O(seq_q * seq_k) dot products on the NEON unit;
+ * for a 1170-token prefill that is ~200 GFLOP of the total. Scores and the
+ * probability-weighted V sum are both plain matrix products with strided
+ * operands, which cblas_sgemm handles directly (and runs on the AMX blocks).
+ * Query tiling keeps the score buffer small for long audio. */
+#define QWEN_ATTN_QTILE 256
+
+static float *attn_gemm_scores = NULL;
+static size_t attn_gemm_cap = 0;
+
+static int causal_attention_gemm(float *out, const float *Q, const float *K, const float *V,
+                                 int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                 int head_dim, float scale, int q_offset) {
+    int heads_per_kv = n_heads / n_kv_heads;
+    int q_hidden = n_heads * head_dim;
+    int kv_hidden = n_kv_heads * head_dim;
+
+    size_t need = (size_t)QWEN_ATTN_QTILE * seq_k;
+    if (need > attn_gemm_cap) {
+        float *tmp = (float *)realloc(attn_gemm_scores, need * sizeof(float));
+        if (!tmp) return -1;
+        attn_gemm_scores = tmp;
+        attn_gemm_cap = need;
+    }
+    float *S = attn_gemm_scores;
+
+    for (int h = 0; h < n_heads; h++) {
+        int kv_h = h / heads_per_kv;
+        const float *k_head = K + (size_t)kv_h * head_dim;
+        const float *v_head = V + (size_t)kv_h * head_dim;
+
+        for (int q0 = 0; q0 < seq_q; q0 += QWEN_ATTN_QTILE) {
+            int qb = seq_q - q0 < QWEN_ATTN_QTILE ? seq_q - q0 : QWEN_ATTN_QTILE;
+
+            /* Widest key range any query in this tile can attend to. */
+            int k_max = q_offset + q0 + qb;
+            if (k_max > seq_k) k_max = seq_k;
+            if (k_max <= 0) {
+                for (int i = 0; i < qb; i++)
+                    memset(out + (size_t)(q0 + i) * q_hidden + h * head_dim, 0,
+                           (size_t)head_dim * sizeof(float));
+                continue;
+            }
+
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        qb, k_max, head_dim,
+                        scale,
+                        Q + (size_t)q0 * q_hidden + h * head_dim, q_hidden,
+                        k_head, kv_hidden,
+                        0.0f, S, k_max);
+
+            for (int i = 0; i < qb; i++) {
+                float *row = S + (size_t)i * k_max;
+                int valid = q_offset + q0 + i + 1;
+                if (valid > k_max) valid = k_max;
+                if (valid <= 0) {
+                    memset(row, 0, (size_t)k_max * sizeof(float));
+                    continue;
+                }
+                float inv_sum = attn_softmax_inplace(row, valid);
+                for (int j = 0; j < valid; j++) row[j] *= inv_sum;
+                if (valid < k_max)
+                    memset(row + valid, 0, (size_t)(k_max - valid) * sizeof(float));
+            }
+
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        qb, head_dim, k_max,
+                        1.0f, S, k_max,
+                        v_head, kv_hidden,
+                        0.0f, out + (size_t)q0 * q_hidden + h * head_dim, q_hidden);
+        }
+    }
+    return 0;
+}
+#endif /* USE_BLAS */
 
 void qwen_causal_attention(float *out, const float *Q, const float *K, const float *V,
                             int seq_q, int seq_k, int n_heads, int n_kv_heads,
                             int head_dim, float scale, int q_offset) {
+#ifdef USE_BLAS
+    if (seq_q >= 8 &&
+        causal_attention_gemm(out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads,
+                              head_dim, scale, q_offset) == 0)
+        return;
+#endif
     if (tp.n_threads > 1 && n_heads >= 2 && (seq_q >= 2 || seq_k >= 128)) {
         causal_attn_task_t task = {
             .out = out, .Q = Q, .K = K, .V = V,
@@ -1137,7 +2075,7 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
 
     qwen_causal_attention_heads(out, Q, K, V,
                                 seq_q, seq_k, n_heads, n_kv_heads,
-                                head_dim, scale, q_offset, 0, n_heads);
+                                head_dim, scale, q_offset, 0, n_heads, 0);
 }
 
 /* ========================================================================

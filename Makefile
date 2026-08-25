@@ -9,7 +9,7 @@ LDFLAGS = -lm -lpthread
 UNAME_S := $(shell uname -s)
 
 # Source files
-SRCS = qwen_asr.c qwen_asr_kernels.c qwen_asr_kernels_generic.c qwen_asr_kernels_neon.c qwen_asr_kernels_avx.c qwen_asr_audio.c qwen_asr_encoder.c qwen_asr_decoder.c qwen_asr_tokenizer.c qwen_asr_safetensors.c
+SRCS = qwen_asr.c qwen_asr_kernels.c qwen_asr_kernels_generic.c qwen_asr_kernels_neon.c qwen_asr_kernels_avx.c qwen_asr_kernels_wasm.c qwen_asr_audio.c qwen_asr_encoder.c qwen_asr_decoder.c qwen_asr_tokenizer.c qwen_asr_safetensors.c qwen_asr_pack.c
 OBJS = $(SRCS:.c=.o)
 MAIN = main.c
 TARGET = qwen_asr
@@ -17,7 +17,7 @@ TARGET = qwen_asr
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug info help blas test test-stream-cache
+.PHONY: all clean debug info help blas noblas test test-stream-cache
 
 # Default: show available targets
 all: help
@@ -27,6 +27,8 @@ help:
 	@echo ""
 	@echo "Choose a backend:"
 	@echo "  make blas     - With BLAS acceleration (Accelerate/OpenBLAS)"
+	@echo "  make noblas   - Portable kernels only, no BLAS dependency"
+	@echo "                  (what a wasm/browser build compiles; ~1.6x slower here)"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make debug    - Debug build with AddressSanitizer"
@@ -52,6 +54,20 @@ blas:
 	@$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
 	@echo ""
 	@echo "Built with BLAS backend"
+
+# =============================================================================
+# Backend: noblas (portable blocked GEMM + Q8 kernels, no external BLAS)
+#
+# This is the configuration a wasm/browser build compiles: no Accelerate, no
+# OpenBLAS, everything through the in-tree kernels. Transcripts match the BLAS
+# build exactly.
+# =============================================================================
+noblas: CFLAGS = $(CFLAGS_BASE)
+noblas:
+	@$(MAKE) clean
+	@$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
+	@echo ""
+	@echo "Built without BLAS (portable kernels)"
 
 # =============================================================================
 # Build rules
@@ -80,9 +96,9 @@ info:
 	@echo "Compiler: $(CC)"
 	@echo ""
 ifeq ($(UNAME_S),Darwin)
-	@echo "Backend: blas (Apple Accelerate)"
+	@echo "Backends: blas (Apple Accelerate), noblas (portable)"
 else
-	@echo "Backend: blas (OpenBLAS)"
+	@echo "Backends: blas (OpenBLAS), noblas (portable)"
 endif
 
 test:
@@ -96,9 +112,11 @@ qwen_asr_kernels.o: qwen_asr_kernels.c qwen_asr_kernels.h qwen_asr_kernels_impl.
 qwen_asr_kernels_generic.o: qwen_asr_kernels_generic.c qwen_asr_kernels_impl.h
 qwen_asr_kernels_neon.o: qwen_asr_kernels_neon.c qwen_asr_kernels_impl.h
 qwen_asr_kernels_avx.o: qwen_asr_kernels_avx.c qwen_asr_kernels_impl.h
+qwen_asr_kernels_wasm.o: qwen_asr_kernels_wasm.c qwen_asr_kernels_impl.h
 qwen_asr_audio.o: qwen_asr_audio.c qwen_asr_audio.h
 qwen_asr_encoder.o: qwen_asr_encoder.c qwen_asr.h qwen_asr_kernels.h qwen_asr_safetensors.h
 qwen_asr_decoder.o: qwen_asr_decoder.c qwen_asr.h qwen_asr_kernels.h qwen_asr_safetensors.h
 qwen_asr_tokenizer.o: qwen_asr_tokenizer.c qwen_asr_tokenizer.h
 qwen_asr_safetensors.o: qwen_asr_safetensors.c qwen_asr_safetensors.h
+qwen_asr_pack.o: qwen_asr_pack.c qwen_asr.h qwen_asr_kernels.h qwen_asr_safetensors.h
 main.o: main.c qwen_asr.h qwen_asr_kernels.h

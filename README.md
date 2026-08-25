@@ -30,6 +30,10 @@ make blas
 ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
     ./qwen_asr -d qwen3-asr-0.6b --stdin
 
+# Browser demo (WebAssembly) - see wasm/README.md
+./wasm/build.sh && ./qwen_asr -d qwen3-asr-1.7b --pack-q8 qwen3-asr-1.7b-q8/qwen-asr-q8.bin
+./wasm/serve.py     # then open http://localhost:8765/wasm/demo/
+
 # Streaming mode (incremental output for live audio)
 ./qwen_asr -d qwen3-asr-0.6b -i long_recording.wav --stream
 ```
@@ -45,6 +49,10 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 - **Prompt biasing**: `--prompt` injects a system prompt to bias the model toward specific terms or spellings. Note that prompt biasing is very soft. The models may or may not care about your instructions. Usually spelling instructions are followed decently.
 - **Optional silence skipping**: `--skip-silence` drops long silent spans before inference (off by default). It may use less CPU for the same file.
 - **Memory-mapped weights**: BF16 weights are mmap'd directly from safetensors files — loading is near-instant.
+- **Q8 quantized decoder**: the decoder's transformer weights are block-quantized to int8 at load time (`--weights q8`, the default). Token generation is memory-bandwidth bound, so cutting the bytes per weight is close to a direct speedup: ~1.8x end-to-end on an M1 Pro. Quality is unchanged on the regression suite. `--weights q8-lm` also quantizes the LM head for a bit more speed, `--weights bf16` disables quantization.
+- **Runs in a browser**: `wasm/build.sh` compiles the same engine to WebAssembly with SIMD128 and pthreads; `wasm/demo/` is a batch + streaming demo that loads the 1.7B model into a tab. See [wasm/README.md](wasm/README.md).
+- **Pre-quantized model images**: `--pack-q8` writes a single 2.2 GB file (from 4.7 GB of bf16) that both the native and wasm builds use in place, which makes startup instant and is what makes the browser build feasible at all.
+- **Performance-core aware threading**: the default thread count is the number of performance cores. On an Apple M1 Pro (8P+2E), including the efficiency cores in a barrier-synchronised split makes every dispatch wait for the slowest core and is measurably slower.
 - **WAV input**: Supports 16-bit PCM WAV files at any sample rate (auto-resampled to 16kHz).
 - **Stdin input**: Reads from stdin with auto-detection (WAV header or raw s16le 16kHz mono).
 - **Optional segment splitting**: use `-S 20` / `-S 30` for large files with segment-cutting silence search (`-W 3`).
@@ -68,12 +76,37 @@ Tokens stream to stdout as they are generated. By default, timing info is printe
 ./qwen_asr -d qwen3-asr-0.6b -i audio.wav --debug      # per-layer/per-chunk details
 ```
 
-Token emission behavior depends on mode:
-- With `-S 0`, text is emitted token-by-token as soon as each decode step produces it.
-- With segmented mode (`-S > 0`), default behavior is still token-by-token ASAP.
-- With segmented mode plus `--past-text yes`, boundary cleanup is enabled automatically and output is emitted once per segment after post-processing.
+### Weight Precision (`--weights`)
 
-For very long files, decoder cost still grows with sequence history. Use `--stream` when you need incremental output while audio is arriving.
+```bash
+./qwen_asr -d qwen3-asr-1.7b -i audio.wav                    # q8 (default)
+./qwen_asr -d qwen3-asr-1.7b -i audio.wav --weights q8-lm    # also quantize the LM head
+./qwen_asr -d qwen3-asr-1.7b -i audio.wav --weights bf16     # no quantization
+```
+
+Token generation reads every decoder weight from RAM once per token, so it is
+memory-bandwidth bound rather than compute bound. `q8` stores each weight matrix
+as blocks of 64 int8 values with one f32 scale — 1.0625 bytes per weight against
+2.0 for bf16 — and the dot products run on the integer SDOT / VPDPBUSD units.
+
+| Mode | What is quantized | 1.7B decoder bytes | Notes |
+|------|-------------------|--------------------|-------|
+| `bf16` | nothing | 3.44 GB | reference precision |
+| `q8` (default) | the 28 transformer layers | 1.50 GB + 0.62 GB bf16 LM head | quality-neutral on both models |
+| `q8-lm` | layers **and** the tied embedding / LM head | 1.83 GB | fastest; identical output on 1.7B, degrades 0.6B |
+
+The LM head is left in bf16 by default on purpose. It is only 18% of the bytes,
+but it decides the token: on the 0.6B model, block-int8 weights there flip
+near-tied logits and drop whole phrases from quiet passages (normalized error on
+the sample set rises from 3.1% to 5.0%). On the 1.7B model `q8-lm` is
+output-identical across the whole regression suite, so it is a reasonable choice
+if you only run the large model. Quantizing the activation instead of the weight
+was ruled out as the cause — an f32-activation argmax made no difference.
+
+Quantization happens at load time from the mmap'd bf16 tensors, so no separate
+model file is needed; it adds a few hundred milliseconds to startup.
+`QWEN_WEIGHTS=bf16|q8|q8-lm` overrides the flag, which is handy when driving the
+binary from a script or test harness.
 
 ### Which Mode To Use (By File Length)
 
@@ -390,7 +423,152 @@ sudo dnf install openblas-devel
 
 ## How Fast Is It?
 
-Benchmarks were recomputed on **Apple M3 Max** (128GB RAM) with `make blas` (single run per row).
+### Optimization Notes (Apple M1 Pro, 8P+2E, `make blas`)
+
+Measured back-to-back on the same machine with the 1.7B model and default flags,
+best of three runs. "before" is the tree prior to the Q8 / threading / kernel
+work; that build defaulted to 10 threads, the new one to the 8 performance cores.
+
+| Audio | Phase | before | after (`q8`) | after (`q8-lm`) |
+|-------|-------|--------|--------------|-----------------|
+| 41s (Japanese) | encoder | 1672 ms | 635 ms | 635 ms |
+| | decoder prefill | 1665 ms | 1476 ms | 1472 ms |
+| | token generation | 7593 ms (44.9 ms/tok) | 4116 ms (24.4 ms/tok) | 3527 ms (20.9 ms/tok) |
+| | **total inference** | **11031 ms** (3.7x realtime) | **6206 ms** (6.6x) | **5737 ms** (7.1x) |
+| 89s (English) | **total inference** | **27203 ms** (3.3x realtime) | **15004 ms** (5.9x) | **14467 ms** (6.1x) |
+
+That is **1.8x** end-to-end on the default settings, or 1.9x with `q8-lm`. With
+`--weights bf16` — i.e. only the threading and kernel work, no quantization —
+the 41s clip runs in 8558 ms, so roughly 1.3x of the gain is independent of
+quantization.
+
+Where the time went, and what changed:
+
+- **Token generation is memory-bandwidth bound**, not compute bound. Every
+  decoder weight is read once per token: 3.44 GB for the 1.7B model in bf16.
+  A standalone microbenchmark of the Q8 matvec reaches 86.6 GB/s against
+  94.7 GB/s for a pure read of the same bytes, and decode throughput is flat
+  from 5 to 8 threads — the kernel sits at the memory wall, so the only
+  remaining lever is reading fewer bytes.
+- **The thread pool was the second bottleneck.** Each generated token issues
+  ~110 tiny parallel dispatches, and every one went through a mutex + condvar
+  round trip. A hybrid barrier (spin on an atomic generation counter, park only
+  if the spin runs out) plus work-stealing chunks instead of a fixed row split
+  was worth ~1.5x on decode by itself.
+- **The default thread count included the efficiency cores.** With a
+  barrier-synchronised split that makes every dispatch wait for the slowest
+  core: 10 threads were 1.35x *slower* than 8 here, and it stays slower even
+  with work stealing, because the E-cluster has much less memory bandwidth. The
+  default is now the performance-core count, and workers are created at
+  `QOS_CLASS_USER_INTERACTIVE`.
+- **The encoder spent 57% of its time in `qwen_gelu`**, one scalar `tanhf` per
+  element. Rewriting it through the exact identity
+  `0.5 * (1 + tanh(z)) == sigmoid(2z)` turns it into a single vectorized `exp`
+  (vForce on Apple, an auto-vectorizable polynomial elsewhere), and it is now
+  threaded. The encoder went from 1672 ms to 635 ms.
+- **Attention was an online-softmax loop with a scalar `expf` per key**, and in
+  the encoder it was not threaded at all. It is now a two-pass kernel (scores,
+  vectorized softmax, weighted V sum) threaded over heads, and decoder prefill
+  routes attention through `sgemm`, which matters for long audio where it is
+  O(seq²).
+
+Decoder prefill is already close to the hardware ceiling: its `sgemm` calls run
+at ~1.4 TFLOPS, about what the M1 AMX blocks sustain.
+
+### Compared To Other Runtimes
+
+Worth being blunt about where this sits.
+
+| Runtime | Hardware | 1.7B single-stream | Notes |
+|---------|----------|--------------------|-------|
+| vLLM (bf16, CUDA graphs) | datacenter GPU | **~67x realtime** (RTF 0.0148) | from the [Qwen3-ASR technical report](https://arxiv.org/html/2601.21337v2), Table 2; ~2000x realtime at concurrency 128 |
+| this engine (`make blas`) | Apple M1 Pro laptop | **6.6–7.1x realtime** | Q8, single stream, no GPU |
+| this engine (wasm) | same laptop, in a tab | **3.2–3.5x realtime** | 2.2 GB model fetched into the page |
+| llama.cpp + GGUF Q8_0 | Apple M3 Air 8 GB | ~2.1x realtime | [reported here](https://github.com/shershah1024/qwen3-asr-llamacpp): 3.1 s for 6.6 s clips |
+
+For the last row the closest thing this repo has is a 7.1 s clip, which runs in
+1.64 s here (4.3x realtime) — but that is a different machine, a different clip
+set, and their figure may include model load, so it is a rough marker rather
+than a head-to-head.
+
+So: **no, this is not faster than vLLM on a GPU** — it is roughly an order of
+magnitude slower per stream, and far more than that under batching. That gap is
+mostly physics rather than implementation quality. Token generation reads every
+decoder weight once per token, so it is bandwidth-bound; this machine gives ~95
+GB/s to the CPU and the Q8 kernel already reaches 87 of them, while an
+H100-class part has ~3.3 TB/s. A ~30x bandwidth advantage turning into a ~10x
+end-to-end advantage is about what you would predict.
+
+What this engine offers instead is the other axis: no GPU, no CUDA, no Python,
+~2 GB of RAM, a single binary (or a browser tab), fully offline, and audio that
+never leaves the machine — at a speed that is still comfortably faster than
+real time on a laptop.
+
+### WebGPU Backend
+
+`wasm/demo/webgpu-decoder.js` runs **the whole decoder on the GPU** — prefill and
+token generation — leaving only mel and the audio encoder in wasm. Pick it with
+the *decoder* dropdown in the demo. Design notes are in
+[wasm/README.md](wasm/README.md).
+
+Each half is there for a different reason, and the split follows measurement
+rather than intuition. `wasm/demo/webgpu-probe.html` reports, on this M1 Pro:
+
+| | measured |
+|---|---|
+| WebGPU compute shader, coalesced reads | **122 GB/s** |
+| CPU (Q8 matvec, 8 threads) | 87 GB/s |
+| `maxStorageBufferBindingSize` | 4.29 GB — the 1.72 GB of quants binds in one piece |
+| `dot4I8Packed` | **emulated** on Apple GPUs, 24 GMAC/s |
+
+Generation reads every decoder weight once per token, so it is bandwidth-bound
+and the GPU's wider path to memory is what helps. Prefill is a batched GEMM and
+compute-bound, where the GPU's arithmetic throughput is what helps. An int8 dot
+product is the wrong tool for either — Apple GPUs have no DP4a equivalent, and
+24 GMAC/s is well under the 1.72 GMAC each token needs, so the shaders unpack
+int8 to f32 with `unpack4x8snorm` and use ordinary FMA.
+
+Results, 1.7B, in a throttled background tab (floors, useful as ratios).
+**Output is identical to the wasm decoder on every sample tried**, English and
+Japanese, at contexts from 145 to 1170 tokens:
+
+| clip | all wasm | wasm encoder + GPU decoder | speedup |
+|------|----------|----------------------------|---------|
+| 10s English | 3.14 s (3.2x realtime) | **2.14 s (4.7x)** | 1.47x |
+| 11s English | 3.47 s (3.2x) | **2.39 s (4.6x)** | 1.45x |
+| 41s Japanese | 14.7 s (2.8x) | **11.4 s (3.6x)** | 1.29x |
+| 89s English | 36.7 s (2.4x) | **26.0 s (3.4x)** | 1.41x |
+
+GPU prefill alone is 2.2–3.1x faster than the wasm prefill (7.03 s → 2.44 s on
+the 41s clip), and generation lands at 22–27 ms/token roughly independent of
+context length. What is left is the audio encoder: on the 41s clip the split is
+now mel+encoder 3.9 s in wasm, GPU prefill 2.5 s, GPU generation 3.4 s. Moving
+the encoder over is the obvious next piece — it needs its own shaders (LayerNorm
+with bias, GELU FFN, windowed bidirectional attention, the conv2d stem) rather
+than reusing the decoder's.
+
+### Portable Build (no BLAS)
+
+The non-BLAS path matters for wasm/browser targets, where neither Accelerate nor
+OpenBLAS is available. It used to fall back to naive triple loops; it now uses a
+blocked, threaded GEMM, and the Q8 kernels auto-vectorize well enough that the
+portable Q8 matvec is within 1.22x of the hand-written NEON one.
+
+```bash
+make noblas
+```
+
+| Build | 41s Japanese clip, 1.7B |
+|-------|--------------------------|
+| `make blas` (Accelerate) | 6.2 s |
+| `make noblas` (portable kernels) | 9.7 s |
+| `make noblas`, before this work | 20.0 s — and that was for an 11s clip |
+
+Transcripts are byte-identical across all three.
+
+### Earlier Benchmarks (Apple M3 Max)
+
+These predate the optimization work above and were measured on **Apple M3 Max** (128GB RAM) with `make blas` (single run per row).
 `Inference`/`Audio` are from program summary. `wall` includes model-load and process overhead.
 
 ### Offline Mode (Full + Segmented)

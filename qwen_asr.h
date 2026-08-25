@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <pthread.h>
 
+#include "qwen_asr_kernels.h"
+
 /* ========================================================================
  * Constants
  * ======================================================================== */
@@ -74,13 +76,13 @@ typedef struct {
 
 typedef struct {
     /* Self-attention (ALL have biases) - pre-converted to f32 */
-    float *wq_weight;          /* [d_model, d_model] */
+    qwen_wmat_t wq_weight;          /* [d_model, d_model] */
     float *wq_bias;            /* [d_model] */
-    float *wk_weight;          /* [d_model, d_model] */
+    qwen_wmat_t wk_weight;          /* [d_model, d_model] */
     float *wk_bias;            /* [d_model] */
-    float *wv_weight;          /* [d_model, d_model] */
+    qwen_wmat_t wv_weight;          /* [d_model, d_model] */
     float *wv_bias;            /* [d_model] */
-    float *wo_weight;          /* [d_model, d_model] */
+    qwen_wmat_t wo_weight;          /* [d_model, d_model] */
     float *wo_bias;            /* [d_model] */
 
     /* Pre-attention LayerNorm (with bias) */
@@ -88,9 +90,9 @@ typedef struct {
     float *attn_norm_bias;     /* [d_model] */
 
     /* FFN: GELU(fc1(x)) -> fc2 (ALL have biases) - pre-converted to f32 */
-    float *fc1_weight;         /* [ffn_dim, d_model] */
+    qwen_wmat_t fc1_weight;         /* [ffn_dim, d_model] */
     float *fc1_bias;           /* [ffn_dim] */
-    float *fc2_weight;         /* [d_model, ffn_dim] */
+    qwen_wmat_t fc2_weight;         /* [d_model, ffn_dim] */
     float *fc2_bias;           /* [d_model] */
 
     /* Pre-FFN LayerNorm (with bias) */
@@ -108,7 +110,7 @@ typedef struct {
     float *conv3_bias;         /* [480] */
 
     /* Conv output projection - pre-converted to f32 */
-    float *conv_out_weight;    /* [d_model, 7680] */
+    qwen_wmat_t conv_out_weight;    /* [d_model, 7680] */
 
     /* Transformer layers */
     qwen_enc_layer_t layers[QWEN_MAX_ENC_LAYERS];
@@ -118,9 +120,9 @@ typedef struct {
     float *ln_post_bias;       /* [d_model] */
 
     /* Projection layers - pre-converted to f32 */
-    float *proj1_weight;       /* [d_model, d_model] */
+    qwen_wmat_t proj1_weight;       /* [d_model, d_model] */
     float *proj1_bias;         /* [d_model] */
-    float *proj2_weight;       /* [output_dim, d_model] */
+    qwen_wmat_t proj2_weight;       /* [output_dim, d_model] */
     float *proj2_bias;         /* [output_dim] */
 } qwen_encoder_t;
 
@@ -150,11 +152,23 @@ typedef struct {
 
     /* Fused gate+up weight for single-token matvec [2*intermediate, hidden] */
     uint16_t *gate_up_fused_bf16;
+
+    /* Q8 block-quantized mirrors, used when the decoder runs quantized.
+     * Only one of the bf16 / q8 sets is populated. */
+    qwen_q8_mat_t wq_q8, wk_q8, wv_q8, wo_q8;
+    qwen_q8_mat_t gate_up_q8, down_q8;
 } qwen_dec_layer_t;
 
 typedef struct {
     /* Token embeddings (tied with lm_head) */
     uint16_t *tok_embeddings_bf16; /* [vocab_size, hidden] */
+    qwen_q8_mat_t tok_embeddings_q8;
+
+    /* Non-zero when the decoder layer weights are stored as Q8 blocks. */
+    int quantized;
+    /* Non-zero when the tied embedding / LM head is also Q8. Tracked
+     * separately because it feeds the input representation directly. */
+    int embed_quantized;
 
     /* Transformer layers */
     qwen_dec_layer_t layers[QWEN_MAX_DEC_LAYERS];
@@ -162,6 +176,23 @@ typedef struct {
     /* Final RMSNorm */
     float *norm;               /* [hidden] */
 } qwen_decoder_t;
+
+/* Weight storage for the decoder. Set before qwen_load(); the
+ * QWEN_WEIGHTS=bf16|q8|q8-lm environment variable overrides it.
+ *
+ *   QWEN_WEIGHTS_BF16   everything straight out of the bf16 mmap
+ *   QWEN_WEIGHTS_Q8     transformer layers Q8, tied embedding / LM head bf16
+ *   QWEN_WEIGHTS_Q8_LM  the LM head is Q8 as well
+ *
+ * The default is q8-lm. It is output-identical to bf16 on the 1.7B model across
+ * the whole regression suite, which is the model this engine is tuned for. On
+ * the 0.6B model it measurably degrades quality — logit margins there are small
+ * enough that block-int8 LM head weights flip token decisions — so `q8` exists
+ * for that case. */
+#define QWEN_WEIGHTS_BF16  0
+#define QWEN_WEIGHTS_Q8    1
+#define QWEN_WEIGHTS_Q8_LM 2
+extern int qwen_weight_quant;
 
 /* ========================================================================
  * Token Callback (streaming output)
@@ -262,8 +293,19 @@ typedef struct {
  * API Functions
  * ======================================================================== */
 
+/* Write a pre-quantized single-file model image (see qwen_asr_pack.c).
+ * Returns 0 on success. */
+int qwen_pack_q8(const char *model_dir, const char *out_path);
+
 /* Load model from directory */
 qwen_ctx_t *qwen_load(const char *model_dir);
+
+/* Load a model whose weights are already in memory (the wasm build fetches the
+ * packed image instead of mmapping it). `model_data` must stay alive for the
+ * lifetime of the context and is not freed by qwen_free(). `aux_dir` is the
+ * directory holding vocab.json / merges.txt. */
+qwen_ctx_t *qwen_load_memory(void *model_data, size_t model_size,
+                             const char *aux_dir);
 
 /* Free all resources */
 void qwen_free(qwen_ctx_t *ctx);
@@ -301,6 +343,21 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
  * The streaming loop waits for new data instead of terminating at EOF.
  * Tokens are emitted via the token callback as they become "fixed". */
 char *qwen_transcribe_stream_live(qwen_ctx_t *ctx, qwen_live_audio_t *live);
+
+/* ========================================================================
+ * Alternative decoder backends
+ *
+ * Everything up to the decoder (mel, encoder, prompt/audio embedding assembly)
+ * is backend independent. A different decoder implementation — the WebGPU one
+ * under wasm/webgpu/ — consumes the embeddings this produces and drives its own
+ * prefill + generation loop.
+ * ======================================================================== */
+
+/* Build the decoder input embeddings for one utterance.
+ * Returns a malloc'd [*out_seq_len, dec_hidden] f32 buffer; caller frees.
+ * Also fills mel/encoder timings when the pointers are non-NULL. */
+float *qwen_build_embeds(qwen_ctx_t *ctx, const float *samples, int n_samples,
+                         int *out_seq_len, double *out_mel_ms, double *out_enc_ms);
 
 /* ========================================================================
  * Internal Functions

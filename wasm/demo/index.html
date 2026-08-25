@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Qwen3-ASR — WebAssembly demo</title>
+<style>
+  :root {
+    --bg: #12141a; --panel: #1b1e26; --line: #2c3040;
+    --fg: #e6e8ef; --dim: #9aa1b4; --accent: #6ea8fe; --ok: #5cd6a0; --warn: #f0a35e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--dim); margin-bottom: 20px; }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px;
+  }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  button {
+    background: var(--accent); color: #101218; border: 0; border-radius: 7px;
+    padding: 9px 16px; font-weight: 600; font-size: 14px; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+  button:disabled { opacity: .45; cursor: default; }
+  label { color: var(--dim); }
+  select, input[type=number] {
+    background: #14171f; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 8px;
+  }
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; }
+  .tabs button { background: transparent; border: 1px solid var(--line); color: var(--dim); }
+  .tabs button.on { background: var(--panel); color: var(--fg); border-color: var(--accent); }
+  #out {
+    white-space: pre-wrap; word-break: break-word; min-height: 120px;
+    background: #0e1015; border: 1px solid var(--line); border-radius: 8px;
+    padding: 14px; font-size: 15px;
+  }
+  .stat { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .stat b { color: var(--fg); font-weight: 600; }
+  #bar { height: 6px; background: #0e1015; border-radius: 3px; overflow: hidden; margin-top: 10px; }
+  #barfill { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .log { color: var(--dim); font-size: 12px; max-height: 120px; overflow: auto; margin-top: 10px; }
+  .err { color: var(--warn); }
+  .lvl { height: 6px; background: #0e1015; border-radius: 3px; overflow: hidden; flex: 1; min-width: 120px; }
+  .lvl > div { height: 100%; width: 0; background: var(--ok); }
+  .hide { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Qwen3-ASR 1.7B — WebAssembly</h1>
+  <div class="sub">Pure C inference engine compiled to wasm. Runs entirely in this tab; no audio leaves the machine.</div>
+
+  <div class="panel">
+    <div class="row">
+      <button id="load">Load model</button>
+      <label>threads <input id="threads" type="number" min="1" max="12" value="8" style="width:64px"></label>
+      <label>decoder
+        <select id="backend">
+          <option value="cpu">CPU (wasm)</option>
+          <option value="gpu">GPU (WebGPU)</option>
+        </select>
+      </label>
+      <label>language
+        <select id="lang">
+          <option value="">auto</option>
+          <option value="Japanese" selected>Japanese</option>
+          <option value="English">English</option>
+        </select>
+      </label>
+      <span id="status" class="stat">idle</span>
+    </div>
+    <div id="bar"><div id="barfill"></div></div>
+    <div id="log" class="log"></div>
+  </div>
+
+  <div class="tabs">
+    <button id="tab-batch" class="on">Batch (audio file)</button>
+    <button id="tab-live">Streaming (microphone)</button>
+  </div>
+
+  <div class="panel" id="pane-batch">
+    <div class="row">
+      <input id="file" type="file" accept="audio/*" disabled>
+      <button id="sample-ja" class="ghost" disabled>sample: 日本語 41s</button>
+      <button id="sample-en" class="ghost" disabled>sample: JFK 11s</button>
+      <label>segment <input id="seg" type="number" min="0" max="60" step="5" value="0" style="width:64px"> s</label>
+      <span class="stat">(0 = decode the whole file in one pass)</span>
+    </div>
+  </div>
+
+  <div class="panel hide" id="pane-live">
+    <div class="row">
+      <button id="mic" disabled>Start microphone</button>
+      <button id="micstop" class="ghost hide">Stop</button>
+      <button id="simstream" class="ghost" disabled>Stream sample file (no mic)</button>
+      <label>chunk <input id="chunk" type="number" min="1" max="8" step="0.5" value="2" style="width:64px"> s</label>
+      <label>enc window <input id="encwin" type="number" min="1" max="8" step="1" value="8" style="width:64px"> s</label>
+      <div class="lvl"><div id="lvlfill"></div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div id="out"></div>
+    <div class="row" style="margin-top:10px">
+      <span id="perf" class="stat"></span>
+    </div>
+  </div>
+</div>
+
+<script src="qwen_asr.js"></script>
+<script src="app.js" type="module"></script>
+</body>
+</html>

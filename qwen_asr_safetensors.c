@@ -64,6 +64,7 @@ static safetensor_dtype_t parse_dtype(const char *s) {
     if (strcmp(s, "I32") == 0) return DTYPE_I32;
     if (strcmp(s, "I64") == 0) return DTYPE_I64;
     if (strcmp(s, "BOOL") == 0) return DTYPE_BOOL;
+    if (strcmp(s, "I8") == 0) return DTYPE_I8;
     return DTYPE_UNKNOWN;
 }
 
@@ -191,6 +192,42 @@ static int parse_header(safetensors_file_t *sf) {
  * Single file operations
  * ======================================================================== */
 
+/* Shared tail of both open paths: parse the 8-byte length prefix + JSON header. */
+static safetensors_file_t *safetensors_from_buffer(void *data, size_t file_size,
+                                                   const char *path, int owns_data) {
+    if (file_size < 8) return NULL;
+
+    uint64_t header_size = 0;
+    memcpy(&header_size, data, 8);
+    if (header_size > file_size - 8) return NULL;
+
+    safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
+    if (!sf) return NULL;
+
+    sf->path = path ? strdup(path) : NULL;
+    sf->data = data;
+    sf->owns_data = owns_data;
+    sf->file_size = file_size;
+    sf->header_size = (size_t)header_size;
+
+    sf->header_json = malloc(header_size + 1);
+    if (!sf->header_json) { free(sf->path); free(sf); return NULL; }
+    memcpy(sf->header_json, (char *)data + 8, header_size);
+    sf->header_json[header_size] = '\0';
+
+    if (parse_header(sf) != 0) {
+        free(sf->header_json);
+        free(sf->path);
+        free(sf);
+        return NULL;
+    }
+    return sf;
+}
+
+safetensors_file_t *safetensors_open_memory(void *data, size_t size) {
+    return safetensors_from_buffer(data, size, NULL, 1);
+}
+
 safetensors_file_t *safetensors_open(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
@@ -205,31 +242,14 @@ safetensors_file_t *safetensors_open(const char *path) {
     close(fd);
     if (data == MAP_FAILED) return NULL;
 
-    uint64_t header_size = 0;
-    memcpy(&header_size, data, 8);
-    if (header_size > file_size - 8) { munmap(data, file_size); return NULL; }
-
-    safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
-    if (!sf) { munmap(data, file_size); return NULL; }
-
-    sf->path = strdup(path);
-    sf->data = data;
-    sf->file_size = file_size;
-    sf->header_size = (size_t)header_size;
-
-    sf->header_json = malloc(header_size + 1);
-    if (!sf->header_json) { safetensors_close(sf); return NULL; }
-    memcpy(sf->header_json, (char *)data + 8, header_size);
-    sf->header_json[header_size] = '\0';
-
-    if (parse_header(sf) != 0) { safetensors_close(sf); return NULL; }
-
+    safetensors_file_t *sf = safetensors_from_buffer(data, file_size, path, 0);
+    if (!sf) munmap(data, file_size);
     return sf;
 }
 
 void safetensors_close(safetensors_file_t *sf) {
     if (!sf) return;
-    if (sf->data) munmap(sf->data, sf->file_size);
+    if (sf->data && !sf->owns_data) munmap(sf->data, sf->file_size);
     free(sf->path);
     free(sf->header_json);
     free(sf);
@@ -311,6 +331,16 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
     if (!ms) return NULL;
 
     char path[4096];
+
+    /* A packed Q8 image, if present, replaces the original weights entirely.
+     * Named so the shard scan below cannot also pick it up. */
+    snprintf(path, sizeof(path), "%s/" QWEN_PACKED_MODEL_NAME, model_dir);
+    safetensors_file_t *packed = safetensors_open(path);
+    if (packed) {
+        ms->shards[0] = packed;
+        ms->num_shards = 1;
+        return ms;
+    }
 
     /* Try single file first */
     snprintf(path, sizeof(path), "%s/model.safetensors", model_dir);

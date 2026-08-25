@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WebGPU headroom probe</title>
+<style>
+  body { background:#12141a; color:#e6e8ef; font:14px/1.6 -apple-system,sans-serif; padding:24px; }
+  pre { background:#0e1015; border:1px solid #2c3040; border-radius:8px; padding:14px; white-space:pre-wrap; }
+  button { background:#6ea8fe; color:#101218; border:0; border-radius:7px; padding:9px 16px; font-weight:600; cursor:pointer; }
+</style>
+</head>
+<body>
+<h2>WebGPU headroom probe</h2>
+<p>Decoding a token streams every decoder weight once, so the ceiling is memory
+bandwidth, not arithmetic. This measures what a WebGPU compute shader can
+actually pull from a storage buffer on this machine, and how fast an int8 dot
+product runs, so the projected gain over the wasm/CPU path is a measurement
+rather than a guess.</p>
+<button id="run">Run</button>
+<pre id="out">idle</pre>
+<script>
+const out = document.getElementById("out");
+const say = (s) => { out.textContent += s + "\n"; };
+
+async function main() {
+  out.textContent = "";
+  if (!navigator.gpu) { say("WebGPU not available"); return; }
+
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) { say("no adapter"); return; }
+
+  const info = adapter.info || {};
+  say(`adapter: ${info.vendor || "?"} ${info.architecture || ""} ${info.description || ""}`);
+  const feats = [...adapter.features];
+  say(`features: ${feats.join(", ") || "(none)"}`);
+  const lim = adapter.limits;
+  say(`maxBufferSize            ${(lim.maxBufferSize / 1e9).toFixed(2)} GB`);
+  say(`maxStorageBufferBinding  ${(lim.maxStorageBufferBindingSize / 1e9).toFixed(2)} GB`);
+  say(`maxComputeWorkgroupSizeX ${lim.maxComputeInvocationsPerWorkgroup}`);
+
+  const wantDot = feats.includes("shader-f16");
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxBufferSize: lim.maxBufferSize,
+      maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
+    },
+    requiredFeatures: wantDot ? ["shader-f16"] : [],
+  });
+  device.onuncapturederror = (e) => say("gpu error: " + e.error.message);
+
+  // ---- streaming read bandwidth ----
+  const SIZE = Math.min(512 << 20, lim.maxStorageBufferBindingSize); // bytes
+  const words = SIZE / 4;
+  say(`\nallocating a ${(SIZE / 1e6).toFixed(0)} MB storage buffer...`);
+  const buf = device.createBuffer({ size: SIZE, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const dst = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const read = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+
+  // Two access patterns: coalesced (adjacent lanes read adjacent words, which
+  // is what a GEMV kernel does) and strided (each lane walks its own slice).
+  const mkPipe = (coalesced) => {
+    const code = `
+@group(0) @binding(0) var<storage, read> src : array<u32>;
+@group(0) @binding(1) var<storage, read_write> sink : array<u32>;
+
+const WG : u32 = 256u;
+const TOTAL : u32 = ${words}u;
+const LANES : u32 = ${256 * 1024}u;
+const PER : u32 = ${Math.floor(words / (256 * 1024))}u;
+
+@compute @workgroup_size(WG)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  var acc : u32 = 0u;
+  ${coalesced ? `
+  var i : u32 = gid.x;
+  loop {
+    if (i >= TOTAL) { break; }
+    acc = acc + src[i];
+    i = i + LANES;
+  }` : `
+  let base = gid.x * PER;
+  for (var i : u32 = 0u; i < PER; i = i + 1u) {
+    acc = acc + src[base + i];
+  }`}
+  if (acc == 0xdeadbeefu) { sink[0] = acc; }
+}`;
+    const mod = device.createShaderModule({ code });
+    return device.createComputePipeline({ layout: "auto", compute: { module: mod, entryPoint: "main" } });
+  };
+
+  let pipe = null, bind = null;
+  const dispatch = async () => {
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipe);
+    pass.setBindGroup(0, bind);
+    pass.dispatchWorkgroups(1024);
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+  };
+
+  const REPS = 8;
+  for (const [name, coalesced] of [["coalesced", true], ["per-lane strided", false]]) {
+    pipe = mkPipe(coalesced);
+    bind = device.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: buf } }, { binding: 1, resource: { buffer: dst } }],
+    });
+    await dispatch(); // warm up / compile
+    const t0 = performance.now();
+    for (let i = 0; i < REPS; i++) await dispatch();
+    const ms = (performance.now() - t0) / REPS;
+    say(`read bandwidth (${name}): ${((SIZE / 1e9) / (ms / 1e3)).toFixed(1)} GB/s  (${ms.toFixed(2)} ms per pass)`);
+  }
+
+  // ---- int8 dot product throughput ----
+  const hasDot = feats.includes("packed-4x8-integer-dot-product") ||
+                 feats.includes("chromium-experimental-dp4a");
+  say(`\npacked int8 dot product (dot4I8Packed): ${hasDot ? "native" : "emulated by the compiler"}`);
+
+  const N = 1 << 26; // 64M int8 pairs
+  const bytes = N;
+  const a = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE });
+  const b = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE });
+  const dotCode = `
+@group(0) @binding(0) var<storage, read> a : array<u32>;
+@group(0) @binding(1) var<storage, read> b : array<u32>;
+@group(0) @binding(2) var<storage, read_write> sink : array<i32>;
+const WG : u32 = 256u;
+const PER : u32 = ${Math.floor(N / 4 / (256 * 1024))}u;
+@compute @workgroup_size(WG)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  var acc : i32 = 0;
+  let base = gid.x * PER;
+  for (var i : u32 = 0u; i < PER; i = i + 1u) {
+    acc = acc + dot4I8Packed(a[base + i], b[base + i]);
+  }
+  if (acc == 0x7fffffff) { sink[0] = acc; }
+}`;
+  try {
+    const dmod = device.createShaderModule({ code: dotCode });
+    const dpipe = device.createComputePipeline({ layout: "auto", compute: { module: dmod, entryPoint: "main" } });
+    const dbind = device.createBindGroup({
+      layout: dpipe.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: a } }, { binding: 1, resource: { buffer: b } },
+                { binding: 2, resource: { buffer: dst } }],
+    });
+    const ddispatch = async () => {
+      const enc = device.createCommandEncoder();
+      const p = enc.beginComputePass();
+      p.setPipeline(dpipe);
+      p.setBindGroup(0, dbind);
+      p.dispatchWorkgroups(1024);
+      p.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+    };
+    await ddispatch();
+    const t1 = performance.now();
+    for (let i = 0; i < REPS; i++) await ddispatch();
+    const dms = (performance.now() - t1) / REPS;
+    say(`int8 MACs: ${(N / dms / 1e6).toFixed(0)} GMAC/s  (${dms.toFixed(2)} ms for ${(N / 1e6).toFixed(0)}M pairs)`);
+  } catch (e) {
+    say("dot4I8Packed unavailable: " + e.message);
+  }
+
+  say(`\nvisibility during run: ${document.visibilityState} ` +
+      `(hidden tabs are throttled; numbers are only meaningful when visible)`);
+}
+
+document.getElementById("run").onclick = () => main().catch((e) => say("error: " + e.message));
+</script>
+</body>
+</html>

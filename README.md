@@ -221,10 +221,10 @@ Measured on M1 Pro, 1.7B Q8, a 246s Japanese recording at `-S 30`:
 
 | `--batch` | wall | realtime | peak RSS |
 |-----------|------|----------|----------|
-| 1 | 33.8 s | 7.3x | 2.6 GB |
-| 4 (default) | 20.3 s | 12.1x | 3.3 GB |
-| 8 | 18.3 s | 13.5x | 4.1 GB |
-| 12 | 17.3 s | 14.2x | — |
+| 1 | 32.6 s | 7.5x | 2.7 GB |
+| 4 (default) | 19.5 s | 12.6x | 3.4 GB |
+| 8 | 17.9 s | 13.8x | 4.0 GB |
+| 12 | 16.9 s | 14.6x | 4.1 GB |
 
 Each stream keeps its own KV cache, which is where the extra memory goes;
 raise `--batch` if you have the headroom. The trade-off is emission
@@ -521,7 +521,7 @@ second route.
   below that. A kernel that reads each weight row once and accumulates against
   every activation row moves 1.06 bytes per weight instead. Crossover measured
   near 500 rows; the default threshold is 256. Streaming, which re-prefills a
-  few dozen rows per chunk, went from 18.6 s to 12.4 s on a 45s clip.
+  few dozen rows per chunk, went from 18.6 s to 11.0 s on a 45s clip.
 
   The kernel is instantiated for a compile-time row count. With a runtime count
   the accumulator array is indexed dynamically, so it lives on the stack rather

@@ -504,12 +504,26 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
  *   a = seqPad, n = seq, rows/cols = W shape, pos = 1 to accumulate
  */
 const PRE_MATMUL_WGSL = HEADER + `
-const TR : u32 = 64u;
+const TR : u32 = 128u;
 const TS : u32 = 64u;
 const TK : u32 = 16u;
 
-var<workgroup> ws : array<f32, 1024>;   // TR x TK
+var<workgroup> ws : array<f32, 2048>;   // TR x TK
 var<workgroup> xs : array<f32, 1024>;   // TK x TS
+
+fn store_one(row : u32, sq : u32, val : f32) {
+  if (sq >= P.n) { return; }
+  let o = P.yOff + row * P.a + sq;
+  if (P.pos == 1u) { act[o] = act[o] + val; } else { act[o] = val; }
+}
+
+fn store_row(row : u32, sq0 : u32, v : vec4<f32>) {
+  if (row >= P.rows) { return; }
+  store_one(row, sq0, v.x);
+  store_one(row, sq0 + 1u, v.y);
+  store_one(row, sq0 + 2u, v.z);
+  store_one(row, sq0 + 3u, v.w);
+}
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(workgroup_id) wid : vec3<u32>,
@@ -519,25 +533,34 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
   let tid = lid.y * 16u + lid.x;
   let nwords = P.cols / 4u;
   let nblocks = P.cols / 64u;
+  let wb = lid.y * 8u;     // 8 rows per thread
+  let xb = lid.x * 4u;     // 4 sequence positions per thread
 
-  var acc : array<f32, 16>;
-  for (var i = 0u; i < 16u; i = i + 1u) { acc[i] = 0.0; }
+  /* Eight vec4 accumulators, never indexed dynamically. A local array<f32, N>
+   * reads the same but lands in thread memory rather than registers — an 8x8
+   * tile written that way measured 8x slower. Widening the row tile to 128 is
+   * what halves the activation re-reads: the activation tile is re-fetched once
+   * per row tile, so its traffic scales with rows/TR. */
+  var a0 = vec4<f32>(0.0); var a1 = vec4<f32>(0.0);
+  var a2 = vec4<f32>(0.0); var a3 = vec4<f32>(0.0);
+  var a4 = vec4<f32>(0.0); var a5 = vec4<f32>(0.0);
+  var a6 = vec4<f32>(0.0); var a7 = vec4<f32>(0.0);
 
   var kb : u32 = 0u;
   loop {
     if (kb >= P.cols) { break; }
 
-    // Weight tile: 256 threads, one u32 (4 columns) each.
-    {
-      let rr = tid / 4u;
-      let wq = tid % 4u;
+    // Weight tile: TR*TK values as TR*TK/4 u32, two per thread.
+    for (var t = 0u; t < 2u; t = t + 1u) {
+      let idx = tid + t * 256u;      // 0..511
+      let rr = idx / 4u;             // 0..127
+      let wq = idx % 4u;
       let row = r0 + rr;
       let col0 = kb + wq * 4u;
       var v = vec4<f32>(0.0);
       if (row < P.rows) {
         let word = quants[P.wordBase + row * nwords + col0 / 4u];
-        let sc = scales[P.scaleBase + row * nblocks + col0 / 64u];
-        v = vec4<f32>(i8x4(word)) * sc;
+        v = vec4<f32>(i8x4(word)) * scales[P.scaleBase + row * nblocks + col0 / 64u];
       }
       let base = rr * TK + wq * 4u;
       ws[base] = v.x;
@@ -560,33 +583,32 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
     workgroupBarrier();
 
     for (var k = 0u; k < TK; k = k + 1u) {
-      let xb = k * TS + lid.x * 4u;
-      let x0 = xs[xb];
-      let x1 = xs[xb + 1u];
-      let x2 = xs[xb + 2u];
-      let x3 = xs[xb + 3u];
-      for (var i = 0u; i < 4u; i = i + 1u) {
-        let w = ws[(lid.y * 4u + i) * TK + k];
-        acc[i * 4u] = acc[i * 4u] + w * x0;
-        acc[i * 4u + 1u] = acc[i * 4u + 1u] + w * x1;
-        acc[i * 4u + 2u] = acc[i * 4u + 2u] + w * x2;
-        acc[i * 4u + 3u] = acc[i * 4u + 3u] + w * x3;
-      }
+      let xo = k * TS + xb;
+      let x4 = vec4<f32>(xs[xo], xs[xo + 1u], xs[xo + 2u], xs[xo + 3u]);
+      let wo = wb * TK + k;
+      a0 = a0 + ws[wo] * x4;
+      a1 = a1 + ws[wo + TK] * x4;
+      a2 = a2 + ws[wo + 2u * TK] * x4;
+      a3 = a3 + ws[wo + 3u * TK] * x4;
+      a4 = a4 + ws[wo + 4u * TK] * x4;
+      a5 = a5 + ws[wo + 5u * TK] * x4;
+      a6 = a6 + ws[wo + 6u * TK] * x4;
+      a7 = a7 + ws[wo + 7u * TK] * x4;
     }
     workgroupBarrier();
     kb = kb + TK;
   }
 
-  for (var i = 0u; i < 4u; i = i + 1u) {
-    let row = r0 + lid.y * 4u + i;
-    if (row >= P.rows) { continue; }
-    for (var j = 0u; j < 4u; j = j + 1u) {
-      let sq = s0 + lid.x * 4u + j;
-      if (sq >= P.n) { continue; }
-      let o = P.yOff + row * P.a + sq;
-      if (P.pos == 1u) { act[o] = act[o] + acc[i * 4u + j]; } else { act[o] = acc[i * 4u + j]; }
-    }
-  }
+  let sq0 = s0 + xb;
+  let row0 = r0 + wb;
+  store_row(row0, sq0, a0);
+  store_row(row0 + 1u, sq0, a1);
+  store_row(row0 + 2u, sq0, a2);
+  store_row(row0 + 3u, sq0, a3);
+  store_row(row0 + 4u, sq0, a4);
+  store_row(row0 + 5u, sq0, a5);
+  store_row(row0 + 6u, sq0, a6);
+  store_row(row0 + 7u, sq0, a7);
 }
 `;
 
@@ -1410,7 +1432,7 @@ export class WebGPUDecoder {
       const L = this.off.pre.layer[l];
       use(pipe.preRms, L.rms1); pass.dispatchWorkgroups(sBlocks);
       use(pipe.preMatmul, L.qkv);
-      pass.dispatchWorkgroups(sBlocks, up(cfg.qDim + 2 * cfg.kvDim, 64));
+      pass.dispatchWorkgroups(sBlocks, up(cfg.qDim + 2 * cfg.kvDim, 128));
       use(pipe.preQkRope, L.qkrope);
       pass.dispatchWorkgroups(sBlocks, cfg.heads + cfg.kvHeads);
       use(pipe.preKvStore, L.kvstore); pass.dispatchWorkgroups(up(cfg.kvDim, 64));
@@ -1418,11 +1440,11 @@ export class WebGPUDecoder {
       use(pipe.preSoftmax, L.softmax); pass.dispatchWorkgroups(seq, cfg.heads);
       use(pipe.preApply, L.apply);
       pass.dispatchWorkgroups(up(cfg.headDim, 64), seq, cfg.heads);
-      use(pipe.preMatmul, L.o); pass.dispatchWorkgroups(sBlocks, up(cfg.hidden, 64));
+      use(pipe.preMatmul, L.o); pass.dispatchWorkgroups(sBlocks, up(cfg.hidden, 128));
       use(pipe.preRms, L.rms2); pass.dispatchWorkgroups(sBlocks);
-      use(pipe.preMatmul, L.gu); pass.dispatchWorkgroups(sBlocks, up(2 * cfg.inter, 64));
+      use(pipe.preMatmul, L.gu); pass.dispatchWorkgroups(sBlocks, up(2 * cfg.inter, 128));
       use(pipe.preSwiglu, L.swiglu); pass.dispatchWorkgroups(sBlocks, cfg.inter);
-      use(pipe.preMatmul, L.down); pass.dispatchWorkgroups(sBlocks, up(cfg.hidden, 64));
+      use(pipe.preMatmul, L.down); pass.dispatchWorkgroups(sBlocks, up(cfg.hidden, 128));
     }
 
     use(pipe.preExtract, this.off.pre.extract);

@@ -276,6 +276,94 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 }
 `;
 
+/* Subgroup variant: one workgroup of 32 lanes per (query, head), lanes
+ * striding the key axis, which is the axis K and V are contiguous in. The
+ * portable kernel above runs one *thread* per (query, head) - scores, softmax
+ * and the V sum all serial in that thread - which is 8k threads for a 41 s
+ * clip and profiled at 26% of the tower. Scores and the V sum fold with
+ * subgroupAdd; the probability row lives in workgroup memory.
+ *
+ * Assumes the workgroup is exactly one subgroup (Apple: size 32, always).
+ * The caller checks that and the window bound, and keeps the portable kernel
+ * otherwise. */
+const ATTN_SG_MAXWIN = 1024;
+const ATTN_SG_WGSL = "enable subgroups;\n" + HEADER + `
+var<workgroup> pw : array<f32, 1024u>;
+
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>,
+        @builtin(subgroup_size) sgsz : u32) {
+  let q = wid.x;
+  let h = wid.y;
+  if (q >= P.n) { return; }
+
+  let hd = P.rows;
+  let win = P.p0;
+  let w0 = (q / win) * win;
+  var w1 = w0 + win;
+  if (w1 > P.n) { w1 = P.n; }
+  let nk = w1 - w0;
+
+  let headOff = h * hd * P.stride;
+  let qBase = P.xOff + headOff;
+  let kBase = P.yOff + headOff;
+  let vBase = P.vecA + headOff;
+  let oBase = P.vecB + headOff;
+
+  /* Scores: each lane owns keys w0+lid.x, w0+lid.x+32, ...
+   * (The q vector is re-read per key on purpose: it is a warp-wide broadcast
+   * out of L1, and staging it in workgroup memory measured *slower* -
+   * 104 -> 158 ms - the barrier and shared traffic cost more than the reads.) */
+  var m : f32 = -3.0e38;
+  var kk : u32 = lid.x;
+  loop {
+    if (kk >= nk) { break; }
+    var dot : f32 = 0.0;
+    for (var d = 0u; d < hd; d = d + 1u) {
+      dot = dot + act[qBase + d * P.stride + q] * act[kBase + d * P.stride + w0 + kk];
+    }
+    let sc = dot * P.fa;
+    pw[kk] = sc;
+    m = max(m, sc);
+    kk = kk + sgsz;
+  }
+  let mx = subgroupMax(m);
+
+  var sum : f32 = 0.0;
+  kk = lid.x;
+  loop {
+    if (kk >= nk) { break; }
+    let e = exp(pw[kk] - mx);
+    pw[kk] = e;
+    sum = sum + e;
+    kk = kk + sgsz;
+  }
+  let inv = 1.0 / subgroupAdd(sum);
+  kk = lid.x;
+  loop {
+    if (kk >= nk) { break; }
+    pw[kk] = pw[kk] * inv;
+    kk = kk + sgsz;
+  }
+  workgroupBarrier();
+
+  /* V sum: lanes on the key axis, one subgroup add per output dim. */
+  for (var d = 0u; d < hd; d = d + 1u) {
+    var acc : f32 = 0.0;
+    let rb = vBase + d * P.stride + w0;
+    kk = lid.x;
+    loop {
+      if (kk >= nk) { break; }
+      acc = acc + pw[kk] * act[rb + kk];
+      kk = kk + sgsz;
+    }
+    let total = subgroupAdd(acc);
+    if (lid.x == 0u) { act[oBase + d * P.stride + q] = total; }
+  }
+}
+`;
+
 export { HEADER, LN_WGSL, MATMUL_WGSL, ATTN_WGSL, CONV_WGSL, RESHAPE_WGSL, ADD_WGSL,
          E_CONV1, E_CONV1_B, E_CONV2, E_CONV2_B, E_CONV3, E_CONV3_B, E_CONV_OUT,
          E_ATTN_NORM_W, E_ATTN_NORM_B, E_Q, E_Q_B, E_K, E_K_B, E_V, E_V_B,
@@ -509,9 +597,16 @@ export class WebGPUEncoder {
     const cap = (typeof window !== "undefined" && window.__gpuBindingCap) ||
                 lim.maxStorageBufferBindingSize;
     const want = Math.min(cap, lim.maxStorageBufferBindingSize, 1 << 30);
+    const wantFeatures = ["timestamp-query", "subgroups"]
+      .filter((f) => adapter.features.has(f));
     this.device = await adapter.requestDevice({
+      requiredFeatures: wantFeatures,
       requiredLimits: { maxBufferSize: want, maxStorageBufferBindingSize: want },
     });
+    this.hasTimestamps = this.device.features.has("timestamp-query");
+    /* The subgroup attention kernel assumes workgroup == one subgroup. */
+    this.sgExact32 = this.device.features.has("subgroups") &&
+      (adapter.info?.subgroupMinSize === 32) && (adapter.info?.subgroupMaxSize === 32);
     /* See the note in webgpu-decoder.js: a lost device has to be observable,
      * not discovered through a wrong answer. */
     this.device.lost.then((info) => {
@@ -641,13 +736,16 @@ export class WebGPUEncoder {
       const info = await mod.getCompilationInfo?.();
       const errs = (info?.messages || []).filter((m) => m.type === "error");
       if (errs.length) throw new Error(`${label}: ${errs.map((m) => `${m.lineNum}: ${m.message}`).join("; ")}`);
-      return this.device.createComputePipeline({
+      const pipe = this.device.createComputePipeline({
         layout, compute: { module: mod, entryPoint: "main" },
       });
+      pipe.label = label;
+      return pipe;
     };
     this.pipeLN = await mk(LN_WGSL, "layernorm");
     this.pipeMatmul = await mk(MATMUL_WGSL, "matmul");
     this.pipeAttn = await mk(ATTN_WGSL, "attention");
+    this.pipeAttnSg = this.sgExact32 ? await mk(ATTN_SG_WGSL, "attention_sg") : null;
     this.pipeConv = await mk(CONV_WGSL, "conv2d");
     this.pipeReshape = await mk(RESHAPE_WGSL, "reshape");
     this.pipeAdd = await mk(ADD_WGSL, "add");
@@ -806,8 +904,12 @@ export class WebGPUEncoder {
         p0: this.window, p1: this.heads,
         fa: 1.0 / Math.sqrt(this.headDim),
       });
-      plan.push({ pipe: this.pipeAttn, slot,
-                  x: ceilDiv(this.tokens * this.heads, 64), y: 1 });
+      if (this.pipeAttnSg && this.window <= ATTN_SG_MAXWIN) {
+        plan.push({ pipe: this.pipeAttnSg, slot, x: this.tokens, y: this.heads });
+      } else {
+        plan.push({ pipe: this.pipeAttn, slot,
+                    x: ceilDiv(this.tokens * this.heads, 64), y: 1 });
+      }
       slot++;
 
       matmul(E_O, E_O_B, l, this.oATT, this.oX, F_RESIDUAL);
@@ -1002,6 +1104,51 @@ export class WebGPUEncoder {
     this.device.queue.writeBuffer(this.bufParams, 0, this.host, 0, r.slot * PARAM_STRIDE);
     this.plan = r.plan;
     return this.submit();
+  }
+
+  /* Per-kernel GPU time over the recorded plan; same timestamp mechanism and
+   * caveats as webgpu-decoder.js profileStep(). Call after a run so this.plan
+   * holds a full tower. */
+  async profileRun() {
+    if (!this.hasTimestamps) throw new Error("timestamp-query not available");
+    const { device } = this;
+    const MAXQ = Math.min(4096, (this.plan.length + 1) * 2);
+    const qs = device.createQuerySet({ type: "timestamp", count: MAXQ });
+    const qbuf = device.createBuffer({
+      size: MAXQ * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+    const rbuf = device.createBuffer({
+      size: MAXQ * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = device.createCommandEncoder();
+    const spans = [];
+    let qi = 0;
+    for (const step of this.plan) {
+      if (qi + 2 > MAXQ) throw new Error("profile: query set too small");
+      const pass = enc.beginComputePass({ timestampWrites: {
+        querySet: qs, beginningOfPassWriteIndex: qi, endOfPassWriteIndex: qi + 1 } });
+      pass.setPipeline(step.pipe);
+      pass.setBindGroup(0, this.bindGroup(this.slotShard[step.slot] | 0),
+                        [step.slot * PARAM_STRIDE]);
+      pass.dispatchWorkgroups(step.x, step.y);
+      pass.end();
+      spans.push([step.pipe.label || "?", qi]);
+      qi += 2;
+    }
+    enc.resolveQuerySet(qs, 0, qi, qbuf, 0);
+    enc.copyBufferToBuffer(qbuf, 0, rbuf, 0, qi * 8);
+    device.queue.submit([enc.finish()]);
+    await rbuf.mapAsync(GPUMapMode.READ, 0, qi * 8);
+    const t = new BigUint64Array(rbuf.getMappedRange(0, qi * 8).slice(0));
+    rbuf.unmap();
+    qs.destroy(); qbuf.destroy(); rbuf.destroy();
+    const totals = new Map();
+    for (const [label, i] of spans)
+      totals.set(label, (totals.get(label) || 0) + Number(t[i + 1] - t[i]));
+    const rows = [...totals.entries()].map(([label, ns]) => [label, ns / 1e6])
+      .sort((a, b) => b[1] - a[1]);
+    const total = rows.reduce((a, [, ms]) => a + ms, 0);
+    return { tokens: this.tokens, totalMs: total,
+             rows: rows.map(([label, ms]) =>
+               ({ label, ms: +ms.toFixed(2), pct: +(100 * ms / total).toFixed(1) })) };
   }
 
   async submit() {

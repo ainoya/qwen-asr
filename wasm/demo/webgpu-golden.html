@@ -132,6 +132,7 @@ document.getElementById("load").onclick = async () => {
     await reload();
     say(`GPU decoder ready (${(gpu.weightBytes / 1e9).toFixed(2)} GB resident)`);
     encoder = new WebGPUEncoder(M);
+  window.__enc = encoder;
     await encoder.init(() => {});
     say(`GPU audio tower ready (${(encoder.weightBytes / 1e6).toFixed(0)} MB)`);
     document.getElementById("run").disabled = false;

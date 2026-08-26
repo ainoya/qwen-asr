@@ -119,6 +119,7 @@ var<workgroup> red : array<f32, WG>;
 @compute @workgroup_size(WG)
 fn main(@builtin(workgroup_id) wid : vec3<u32>,
         @builtin(local_invocation_id) lid : vec3<u32>) {
+  /* Rows are this shard's slice of the vocabulary; P.c is where it starts. */
   let row = wid.x + wid.y * P.d;
   if (row >= P.rows) { return; }
   let nwords = P.cols / 4u;
@@ -158,7 +159,7 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
     workgroupBarrier();
     s = s / 2u;
   }
-  if (lid.x == 0u) { scratch[row] = red[0]; }
+  if (lid.x == 0u) { scratch[P.c + row] = red[0]; }
 }
 `;
 
@@ -435,7 +436,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let w = gid.x;
   let nwords = P.cols / 4u;
   if (w >= nwords) { return; }
-  let row = tok[0];
+  /* The token id lives on the GPU, so the shard holding its row cannot be
+   * picked on the CPU. Every shard is dispatched and only the one whose range
+   * contains the row does anything. */
+  let tid = tok[0];
+  if (tid < P.b || tid >= P.b + P.c) { return; }
+  let row = tid - P.b;
   let sc = scales[P.scaleBase + row * (P.cols / 64u) + (w / 16u)] * 127.0;
   let q = unpack4x8snorm(quants[P.wordBase + row * nwords + w]) * sc;
   let o = P.yOff + w * 4u;
@@ -879,27 +885,91 @@ export class WebGPUDecoder {
     const fd = new Uint32Array(M.HEAPU8.buffer, dPtr, nF * 4).slice();
     M._qwen_wasm_release(dPtr);
 
-    let quantBytes = 0, scaleFloats = 0;
+    /* Weights are packed into shards rather than one buffer.
+     *
+     * All of them in one binding is 1.72 GB, and WebGPU only guarantees
+     * maxStorageBufferBindingSize of 128 MiB. Chromium exposes tiers above
+     * that - roughly 1 GiB, 2 GiB, 4 GiB - so a single binding of 1.72 GB
+     * needs the 2 GiB tier and simply cannot be created below it, whatever the
+     * GPU is worth. Sharding drops the largest binding to SHARD_BUDGET and
+     * brings the 1 GiB tier into range, which is where most desktop GPUs sit.
+     *
+     * 128 MiB is not a useful target for this model: the KV cache alone is
+     * 224 KiB per token, so a 1600-token context needs a 360 MB binding no
+     * amount of weight sharding can avoid.
+     *
+     * A matrix is never split across shards, so the matmul kernels are
+     * unchanged and only need the right shard bound. The tied embedding is the
+     * exception - 311 MB on its own - and is split by row range, which the
+     * logits and embedding kernels handle explicitly. */
+    const SHARD_BUDGET = 256 << 20;
+
+    let scaleFloats = 0, quantBytes = 0;
     const wmap = new Map();
+    const shards = [{ bytes: 0 }];
+    const openShard = (need) => {
+      let sh = shards[shards.length - 1];
+      if (sh.bytes > 0 && sh.bytes + need > SHARD_BUDGET) {
+        shards.push({ bytes: 0 });
+        sh = shards[shards.length - 1];
+      }
+      return sh;
+    };
+
     for (let i = 0; i < nQ; i++) {
       const [kind, layer, rows, cols, qptr, sptr] = qd.subarray(i * 6, i * 6 + 6);
       const nq = rows * cols;
-      wmap.set(`${kind}:${layer}`, {
-        rows, cols, qptr, sptr, nq,
-        wordBase: quantBytes / 4, scaleBase: scaleFloats,
-      });
+      const scaleBase = scaleFloats;
+
+      if (nq > SHARD_BUDGET) {
+        /* Only the embedding gets here. Split by whole rows so each piece is
+         * still a contiguous [rows][cols] matrix. */
+        const rowsPer = Math.floor(SHARD_BUDGET / cols);
+        const pieces = [];
+        for (let r0 = 0; r0 < rows; r0 += rowsPer) {
+          const n = Math.min(rowsPer, rows - r0);
+          const sh = openShard(n * cols);
+          pieces.push({
+            shard: shards.length - 1,
+            wordBase: sh.bytes / 4,
+            rowBase: r0, rowCount: n,
+            scaleBase: scaleBase + (r0 * cols) / 64,
+            qptr: qptr + r0 * cols, nq: n * cols,
+          });
+          sh.bytes += n * cols;
+        }
+        wmap.set(`${kind}:${layer}`, { rows, cols, scaleBase, sptr, nq, pieces });
+      } else {
+        const sh = openShard(nq);
+        wmap.set(`${kind}:${layer}`, {
+          rows, cols, qptr, sptr, nq, scaleBase,
+          shard: shards.length - 1, wordBase: sh.bytes / 4,
+        });
+        sh.bytes += nq;
+      }
       quantBytes += nq;
       scaleFloats += nq / 64;
     }
-    if (quantBytes > lim.maxStorageBufferBindingSize) {
-      throw new Error(`weights need ${(quantBytes / 1e9).toFixed(2)} GB, adapter caps ` +
-                      `storage bindings at ${(lim.maxStorageBufferBindingSize / 1e9).toFixed(2)} GB`);
+
+    const biggestShard = Math.max(...shards.map((s) => s.bytes));
+    /* Ask only for what the largest single binding actually needs. The KV
+     * cache is allocated later and can be the biggest of them at long
+     * contexts, so leave room for it rather than sizing to the shards alone. */
+    /* Simulate a lesser device: window.__gpuBindingCap caps what we ask for,
+     * which is how the 1 GiB tier gets tested on a machine that offers 4. */
+    const cap = (typeof window !== "undefined" && window.__gpuBindingCap) ||
+                lim.maxStorageBufferBindingSize;
+    const wantBinding = Math.min(cap, lim.maxStorageBufferBindingSize,
+                                 Math.max(biggestShard, scaleFloats * 4, 1 << 30));
+    if (biggestShard > lim.maxStorageBufferBindingSize) {
+      throw new Error(`a weight shard needs ${(biggestShard / 1e6).toFixed(0)} MB, adapter caps ` +
+                      `storage bindings at ${(lim.maxStorageBufferBindingSize / 1e6).toFixed(0)} MB`);
     }
 
     const device = await adapter.requestDevice({
       requiredLimits: {
-        maxBufferSize: Math.max(quantBytes, 1 << 28),
-        maxStorageBufferBindingSize: Math.max(quantBytes, 1 << 28),
+        maxBufferSize: wantBinding,
+        maxStorageBufferBindingSize: wantBinding,
       },
     });
     this.device = device;
@@ -914,17 +984,28 @@ export class WebGPUDecoder {
     };
 
     /* ---- upload ---- */
-    report(`allocating ${(quantBytes / 1e9).toFixed(2)} GB on the GPU...`);
-    this.bufQuant = device.createBuffer({ size: quantBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    report(`allocating ${(quantBytes / 1e9).toFixed(2)} GB on the GPU in ` +
+           `${shards.length} shard${shards.length === 1 ? "" : "s"} of up to ` +
+           `${(biggestShard / 1e6).toFixed(0)} MB...`);
+    this.bufQuants = shards.map((sh) =>
+      device.createBuffer({ size: sh.bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }));
     this.bufScale = device.createBuffer({ size: scaleFloats * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.shardCount = shards.length;
 
     const CH = 64 << 20;
     let done = 0, lastReport = 0;
-    for (const w of wmap.values()) {
-      for (let off = 0; off < w.nq; off += CH) {
-        const n = Math.min(CH, w.nq - off);
-        device.queue.writeBuffer(this.bufQuant, w.wordBase * 4 + off, M.HEAPU8, w.qptr + off, n);
+    const putQuant = (shard, wordBase, qptr, nq) => {
+      for (let off = 0; off < nq; off += CH) {
+        const n = Math.min(CH, nq - off);
+        device.queue.writeBuffer(this.bufQuants[shard], wordBase * 4 + off, M.HEAPU8, qptr + off, n);
         done += n;
+      }
+    };
+    for (const w of wmap.values()) {
+      if (w.pieces) {
+        for (const p of w.pieces) putQuant(p.shard, p.wordBase, p.qptr, p.nq);
+      } else {
+        putQuant(w.shard, w.wordBase, w.qptr, w.nq);
       }
       device.queue.writeBuffer(this.bufScale, w.scaleBase * 4, M.HEAPU8, w.sptr, (w.nq / 64) * 4);
       if (done - lastReport > (256 << 20)) {
@@ -1228,13 +1309,16 @@ export class WebGPUDecoder {
     this.buildParams();
   }
 
-  bindGroup() {
-    if (this._bind) return this._bind;
-    this._bind = this.device.createBindGroup({
+  /* One bind group per weight shard; everything else is shared. A dispatch
+   * binds the shard holding the matrix it reads. */
+  bindGroup(shard = 0) {
+    if (!this._bind) this._bind = [];
+    if (this._bind[shard]) return this._bind[shard];
+    this._bind[shard] = this.device.createBindGroup({
       layout: this._bgl,
       entries: [
         { binding: 0, resource: { buffer: this.bufParams, size: PARAM_FIELDS * 4 } },
-        { binding: 1, resource: { buffer: this.bufQuant } },
+        { binding: 1, resource: { buffer: this.bufQuants[shard] } },
         { binding: 2, resource: { buffer: this.bufScale } },
         { binding: 3, resource: { buffer: this.bufNorm } },
         { binding: 4, resource: { buffer: this.bufAct } },
@@ -1243,7 +1327,13 @@ export class WebGPUDecoder {
         { binding: 7, resource: { buffer: this.bufScratch } },
       ],
     });
-    return this._bind;
+    return this._bind[shard];
+  }
+
+  /* Rows a slot's dispatch covers, read back from the params it was built
+   * with, so the vocabulary pieces do not need a second bookkeeping array. */
+  slotRows(slot) {
+    return this.hu[(slot * PARAM_STRIDE) / 4 + 2];
   }
 
   buildParams() {
@@ -1252,11 +1342,31 @@ export class WebGPUDecoder {
     const nb = (k, l) => this.nmap.get(`${k}:${l}`).base;
 
     const slots = [];
-    const push = (o) => { slots.push(o); return slots.length - 1; };
+    /* Which weight shard each slot reads, so a dispatch can bind it without
+     * every call site having to know. */
+    const slotShard = [];
+    const push = (o) => {
+      const { shard = 0, ...rest } = o;
+      slots.push(rest);
+      slotShard.push(shard);
+      return slots.length - 1;
+    };
+    this.slotShard = slotShard;
 
     const emb = w(W_EMBED, 0);
+    /* The tied embedding is 311 MB, too big for one shard, so it is split by
+     * row range. Both kernels that walk the vocabulary get one dispatch per
+     * piece: the embedding lookup because the row it wants is a token id that
+     * lives on the GPU and only one piece holds it, and the logits pass
+     * because every piece contributes its own rows. */
+    const embPieces = emb.pieces ||
+      [{ shard: emb.shard, wordBase: emb.wordBase, scaleBase: emb.scaleBase,
+         rowBase: 0, rowCount: emb.rows }];
     const off = {};
-    off.embed = push({ wordBase: emb.wordBase, scaleBase: emb.scaleBase, cols: cfg.hidden, yOff: A.x });
+    off.embed = embPieces.map((p) => push({
+      shard: p.shard, wordBase: p.wordBase, scaleBase: p.scaleBase,
+      cols: cfg.hidden, yOff: A.x, b: p.rowBase, c: p.rowCount,
+    }));
     off.layer = [];
     for (let l = 0; l < cfg.layers; l++) {
       const L = {};
@@ -1266,7 +1376,7 @@ export class WebGPUDecoder {
       const qkvRows = cfg.qDim + 2 * cfg.kvDim;
       L.qxn = push({ n: cfg.hidden, xOff: A.xn, a: this.Q.xn, b: A.sxn });
       L.qkv = push({
-        wordBase: wqkv.wordBase, scaleBase: wqkv.scaleBase, rows: qkvRows,
+        shard: wqkv.shard, wordBase: wqkv.wordBase, scaleBase: wqkv.scaleBase, rows: qkvRows,
         cols: wqkv.cols, a: this.Q.xn, b: A.sxn, xOff: A.xn, yOff: A.q, d: grid(qkvRows),
       });
       L.qkrope = push({});
@@ -1276,23 +1386,25 @@ export class WebGPUDecoder {
       L.merge = push({});
       const wo = w(W_O, l);
       L.qattn = push({ n: cfg.qDim, xOff: A.attn, a: this.Q.attn, b: A.sattn });
-      L.o = push({ wordBase: wo.wordBase, scaleBase: wo.scaleBase, rows: wo.rows, cols: wo.cols, a: this.Q.attn, b: A.sattn, xOff: A.attn, yOff: A.x, pos: 1, d: grid(wo.rows) });
+      L.o = push({ shard: wo.shard, wordBase: wo.wordBase, scaleBase: wo.scaleBase, rows: wo.rows, cols: wo.cols, a: this.Q.attn, b: A.sattn, xOff: A.attn, yOff: A.x, pos: 1, d: grid(wo.rows) });
       L.rms2 = push({ n: cfg.hidden, xOff: A.x, yOff: A.xn, a: nb(N_POST_ATTN, l), fa: this.eps });
       const wgu = w(W_GATE_UP, l);
       L.qxn2 = push({ n: cfg.hidden, xOff: A.xn, a: this.Q.xn, b: A.sxn });
-      L.gu = push({ wordBase: wgu.wordBase, scaleBase: wgu.scaleBase, rows: wgu.rows, cols: wgu.cols, a: this.Q.xn, b: A.sxn, xOff: A.xn, yOff: A.gu, d: grid(wgu.rows) });
+      L.gu = push({ shard: wgu.shard, wordBase: wgu.wordBase, scaleBase: wgu.scaleBase, rows: wgu.rows, cols: wgu.cols, a: this.Q.xn, b: A.sxn, xOff: A.xn, yOff: A.gu, d: grid(wgu.rows) });
       L.swiglu = push({ n: cfg.inter, xOff: A.gu, yOff: A.g });
       const wd = w(W_DOWN, l);
       L.qg = push({ n: cfg.inter, xOff: A.g, a: this.Q.g, b: A.sg });
-      L.down = push({ wordBase: wd.wordBase, scaleBase: wd.scaleBase, rows: wd.rows, cols: wd.cols, a: this.Q.g, b: A.sg, xOff: A.g, yOff: A.x, pos: 1, d: grid(wd.rows) });
+      L.down = push({ shard: wd.shard, wordBase: wd.wordBase, scaleBase: wd.scaleBase, rows: wd.rows, cols: wd.cols, a: this.Q.g, b: A.sg, xOff: A.g, yOff: A.x, pos: 1, d: grid(wd.rows) });
       off.layer.push(L);
     }
     off.rmsFinal = push({ n: cfg.hidden, xOff: A.x, yOff: A.xn, a: nb(N_FINAL, 0), fa: this.eps });
     off.qfinal = push({ n: cfg.hidden, xOff: A.xn, a: this.Q.xn, b: A.sxn });
-    off.logits = push({
-      wordBase: emb.wordBase, scaleBase: emb.scaleBase, rows: cfg.vocab, cols: cfg.hidden,
-      a: this.Q.xn, b: A.sxn, xOff: A.xn, d: Math.min(cfg.vocab, this.maxDim),
-    });
+    off.logits = embPieces.map((p) => push({
+      shard: p.shard, wordBase: p.wordBase, scaleBase: p.scaleBase,
+      rows: p.rowCount, cols: cfg.hidden,
+      a: this.Q.xn, b: A.sxn, xOff: A.xn, c: p.rowBase,
+      d: Math.min(p.rowCount, this.maxDim),
+    }));
     off.argmax = push({ n: cfg.vocab });
 
     /* ---- prefill slots (only when the GPU is doing the prefill) ---- */
@@ -1309,7 +1421,7 @@ export class WebGPUDecoder {
         L.rms1 = push({ n: cfg.hidden, a: sp, b: seq, c: nb(N_INPUT, l),
                         xOff: PT.x, yOff: PT.xn, fa: eps });
         const wqkv = w(W_Q, l);
-        L.qkv = push({ wordBase: wqkv.wordBase, scaleBase: wqkv.scaleBase,
+        L.qkv = push({ shard: wqkv.shard, wordBase: wqkv.wordBase, scaleBase: wqkv.scaleBase,
                        rows: cfg.qDim + 2 * cfg.kvDim, cols: cfg.hidden,
                        a: sp, n: seq, xOff: PT.xn, yOff: PT.qkv });
         L.qkrope = push({
@@ -1334,16 +1446,16 @@ export class WebGPUDecoder {
           rows: cfg.headsPerKv, yOff: this.PTR.attn, scaleBase: 0, n: sp,
         });
         const wo = w(W_O, l);
-        L.o = push({ wordBase: wo.wordBase, scaleBase: wo.scaleBase, rows: wo.rows,
+        L.o = push({ shard: wo.shard, wordBase: wo.wordBase, scaleBase: wo.scaleBase, rows: wo.rows,
                      cols: wo.cols, a: sp, n: seq, xOff: PT.attn, yOff: PT.x, pos: 1 });
         L.rms2 = push({ n: cfg.hidden, a: sp, b: seq, c: nb(N_POST_ATTN, l),
                         xOff: PT.x, yOff: PT.xn, fa: eps });
         const wgu = w(W_GATE_UP, l);
-        L.gu = push({ wordBase: wgu.wordBase, scaleBase: wgu.scaleBase, rows: wgu.rows,
+        L.gu = push({ shard: wgu.shard, wordBase: wgu.wordBase, scaleBase: wgu.scaleBase, rows: wgu.rows,
                       cols: wgu.cols, a: sp, n: seq, xOff: PT.xn, yOff: PT.gu });
         L.swiglu = push({ a: sp, b: seq, n: cfg.inter, xOff: PT.gu, yOff: PT.g });
         const wd = w(W_DOWN, l);
-        L.down = push({ wordBase: wd.wordBase, scaleBase: wd.scaleBase, rows: wd.rows,
+        L.down = push({ shard: wd.shard, wordBase: wd.wordBase, scaleBase: wd.scaleBase, rows: wd.rows,
                         cols: wd.cols, a: sp, n: seq, xOff: PT.g, yOff: PT.x, pos: 1 });
         off.pre.layer.push(L);
       }
@@ -1422,8 +1534,10 @@ export class WebGPUDecoder {
    * final hidden state of the last position in the generation slot. */
   encodePrefill(pass) {
     const { cfg, pipe } = this;
-    const bg = this.bindGroup();
-    const use = (p, slot) => { pass.setPipeline(p); pass.setBindGroup(0, bg, [slot * PARAM_STRIDE]); };
+    const use = (p, slot) => {
+      pass.setPipeline(p);
+      pass.setBindGroup(0, this.bindGroup(this.slotShard[slot] | 0), [slot * PARAM_STRIDE]);
+    };
     const up = (a, b) => Math.ceil(a / b);
     const seq = this.preSeq, sp = this.seqPad;
     const sBlocks = up(sp, 64);
@@ -1456,19 +1570,28 @@ export class WebGPUDecoder {
       use(pipe.quantAct, this.off.qfinal); pass.dispatchWorkgroups(cfg.hidden / 64);
     }
     const rowGrid = (rows) => rows <= this.maxDim ? [rows, 1] : [this.maxDim, up(rows, this.maxDim)];
-    use(pipe.logits, this.off.logits); pass.dispatchWorkgroups(...rowGrid(cfg.vocab));
+    for (const slot of this.off.logits) {
+      use(pipe.logits, slot);
+      pass.dispatchWorkgroups(...rowGrid(this.slotRows(slot)));
+    }
     use(pipe.argmax, this.off.argmax); pass.dispatchWorkgroups(1);
   }
 
   encodeStep(pass) {
     const { cfg, pipe, maxDim } = this;
-    const bg = this.bindGroup();
-    const use = (p, slot) => { pass.setPipeline(p); pass.setBindGroup(0, bg, [slot * PARAM_STRIDE]); };
+    const use = (p, slot) => {
+      pass.setPipeline(p);
+      pass.setBindGroup(0, this.bindGroup(this.slotShard[slot] | 0), [slot * PARAM_STRIDE]);
+    };
     const up = (a, b) => Math.ceil(a / b);
     const rowGrid = (rows) => rows <= maxDim ? [rows, 1] : [maxDim, up(rows, maxDim)];
 
-    use(pipe.embed, this.off.embed);
-    pass.dispatchWorkgroups(up(cfg.hidden / 4, 64));
+    /* Every embedding shard is dispatched; only the one holding the token's
+     * row writes anything. */
+    for (const slot of this.off.embed) {
+      use(pipe.embed, slot);
+      pass.dispatchWorkgroups(up(cfg.hidden / 4, 64));
+    }
 
     for (let l = 0; l < cfg.layers; l++) {
       const L = this.off.layer[l];
@@ -1494,7 +1617,10 @@ export class WebGPUDecoder {
 
     use(pipe.rmsnorm, this.off.rmsFinal); pass.dispatchWorkgroups(1);
     if (this.quantizeActivations) { use(pipe.quantAct, this.off.qfinal); pass.dispatchWorkgroups(cfg.hidden / 64); }
-    use(pipe.logits, this.off.logits); pass.dispatchWorkgroups(...rowGrid(cfg.vocab));
+    for (const slot of this.off.logits) {
+      use(pipe.logits, slot);
+      pass.dispatchWorkgroups(...rowGrid(this.slotRows(slot)));
+    }
     use(pipe.argmax, this.off.argmax); pass.dispatchWorkgroups(1);
   }
 

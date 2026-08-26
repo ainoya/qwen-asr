@@ -142,6 +142,41 @@ split is mel+encoder 3.9 s (wasm), GPU prefill 2.5 s, GPU generation 3.4 s.
   is only 2048 threads and dominated the step at long contexts: 42 ms/token at a
   1170-token context against 26.5 after splitting into 8 slices plus a merge.
 
+### Weights are sharded, not one binding
+
+Both weight sets are split into shards of at most 256 MB rather than living in
+one buffer. The decoder's 1.72 GB in a single binding needed Chromium's ~2 GiB
+limit tier and simply could not be created below it, whatever the GPU was
+worth. Sharding moves the constraint elsewhere:
+
+| | largest single binding |
+|---|---|
+| before | 1.72 GB (all weights) |
+| after | 360 MB (the KV cache at a 1600-token context) |
+
+The KV cache is what dominates now - 224 KiB per token - and no amount of
+weight sharding touches it. That is why 128 MiB, WebGPU's guaranteed floor, is
+not a reachable target for this model.
+
+A matrix never straddles a shard, so the matmul kernels are unchanged and a
+dispatch just binds the shard it reads; `slotShard[]` maps parameter slots to
+shards so the call sites do not have to know. The tied embedding is the one
+exception at 311 MB on its own, and is split by row range. That makes the two
+kernels that walk the vocabulary special:
+
+- **logits** has each shard cover its own rows and write at a global offset.
+  argmax is associative, so the existing merge needs no change.
+- **the embedding lookup** cannot pick a shard on the CPU: the row it wants is
+  a token id that deliberately stays in a GPU buffer to avoid a readback per
+  token. Every shard is dispatched and only the one whose range contains the
+  row writes anything.
+
+Verified by capping the requested limit to 1 GiB on a machine that offers 4.29
+(`window.__gpuBindingCap`): golden check 23/23 with the aggregate character
+error unchanged at 0.0062 against the CPU's 0.0024, and 18/23 still
+byte-identical — the same numbers as before sharding. Speed is unchanged too
+(tower 810 ms against 837, prefill 2.35 s against 2.57).
+
 ### Will this machine run it?
 
 `wasm/demo/webgpu-report.html` answers that in a few seconds **without

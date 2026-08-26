@@ -1,0 +1,7 @@
+case_id	category	text
+daily	daily	今日は朝から雲が多く、午後には弱い雨が降る見込みです。外出するときは折り畳み傘を持っていきます。
+schedule	numbers	次の会議は二千二十六年八月二十六日、水曜日の午後三時十五分から、第二会議室で始まります。
+figures	numbers	今月の利用料金は一万二千四百八十円で、先月より三点五パーセント増えました。確認した項目は全部で四十二件です。
+names	proper_nouns	佐藤綾子さんは、新横浜駅から鎌倉を経由して、神奈川県藤沢市の研究所へ向かいました。
+technical	code_switch	WebGPUでQwen3 ASRを動かし、C言語版とWASM版の速度を比較します。Apple M1 Proでは、十六キロヘルツの音声を使います。
+context	homophones	川に架かる橋の端を歩いたあと、箸で豆をつまみました。庭の柿を二つ取り、夏季の予定を確認しました。

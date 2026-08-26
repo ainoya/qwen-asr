@@ -36,6 +36,12 @@ const SHAPE = {
   decInter: 6144, vocab: 151936,
   encLayers: 24, encDim: 1024, encFfn: 4096, encOut: 2048, convProj: 7680,
 };
+/* Weights are sharded, so the binding that has to fit is a shard, not the
+ * whole 1.72 GB. The KV cache is the other claimant and scales with context:
+ * 224 KiB per token means a 1600-token utterance needs a 360 MB binding no
+ * amount of weight sharding avoids. That is why 128 MiB - WebGPU's guaranteed
+ * floor - is not a reachable target for this model, and 1 GiB is. */
+const SHARD_BUDGET = 256 << 20;
 function requirements() {
   const s = SHAPE;
   const qdim = s.decHeads * s.decHeadDim, kvdim = s.decKvHeads * s.decHeadDim;
@@ -44,10 +50,15 @@ function requirements() {
   const decQuant = s.decLayers * perLayer + s.vocab * s.decHidden;   /* int8 bytes */
   const encQuant = s.encLayers * (4 * s.encDim * s.encDim + 2 * s.encDim * s.encFfn) +
                    s.encDim * s.convProj + s.encDim * s.encDim + s.encOut * s.encDim;
+  const kvPerToken = 2 * s.decLayers * s.decKvHeads * s.decHeadDim * 4;
   return {
-    decoderBinding: decQuant,                 /* the largest single binding */
+    decQuant, encQuant,
+    shardBudget: SHARD_BUDGET,
     decoderScales: (decQuant / 64) * 4,
-    towerBinding: encQuant,
+    kvPerToken,
+    kv1600: kvPerToken * 1600,
+    /* What actually has to fit in one binding. */
+    largestBinding: Math.max(SHARD_BUDGET, (decQuant / 64) * 4, kvPerToken * 1600),
     total: decQuant + (decQuant / 64) * 4 + encQuant,
   };
 }
@@ -85,10 +96,12 @@ async function main() {
   say();
 
   /* The decision this build makes today. */
-  say(`this build needs one storage binding of ${GB(req.decoderBinding)} for the decoder`);
-  say(`                    plus ${MB(req.decoderScales)} of scales and ${MB(req.towerBinding)} for the audio tower`);
-  const fitsDec = req.decoderBinding <= lim.maxStorageBufferBindingSize;
-  const fitsTower = req.towerBinding <= lim.maxStorageBufferBindingSize;
+  say(`weights: ${GB(req.decQuant)} decoder + ${MB(req.encQuant)} tower, sharded at ${MB(req.shardBudget)}`);
+  say(`scales : ${MB(req.decoderScales)} in one binding`);
+  say(`KV     : ${(req.kvPerToken / 1024).toFixed(0)} KiB per token, ${MB(req.kv1600)} at a 1600-token context`);
+  say(`=> largest single binding needed: ${MB(req.largestBinding)}`);
+  const fitsDec = req.largestBinding <= lim.maxStorageBufferBindingSize;
+  const fitsTower = req.shardBudget <= lim.maxStorageBufferBindingSize;
   r.decoderFits = fitsDec;
   r.towerFits = fitsTower;
   say(`GPU decoder    : ${fitsDec ? "would start" : "WOULD NOT START — binding limit too small"}`);
@@ -100,9 +113,9 @@ async function main() {
   try {
     device = await adapter.requestDevice({
       requiredLimits: {
-        maxBufferSize: Math.min(lim.maxBufferSize, Math.max(req.decoderBinding, 1 << 28)),
+        maxBufferSize: Math.min(lim.maxBufferSize, Math.max(req.largestBinding, 1 << 28)),
         maxStorageBufferBindingSize:
-          Math.min(lim.maxStorageBufferBindingSize, Math.max(req.decoderBinding, 1 << 28)),
+          Math.min(lim.maxStorageBufferBindingSize, Math.max(req.largestBinding, 1 << 28)),
       },
       requiredFeatures: adapter.features.has("shader-f16") ? ["shader-f16"] : [],
     });
@@ -114,9 +127,9 @@ async function main() {
   device.onuncapturederror = (e) => say(`gpu error: ${e.error.message}`);
 
   if (fitsDec) {
-    say(`allocating the ${GB(req.decoderBinding)} binding for real...`);
+    say(`allocating the ${MB(req.largestBinding)} binding for real...`);
     try {
-      const b = device.createBuffer({ size: req.decoderBinding, usage: GPUBufferUsage.STORAGE });
+      const b = device.createBuffer({ size: req.largestBinding, usage: GPUBufferUsage.STORAGE });
       await device.queue.onSubmittedWorkDone();
       b.destroy();
       say("  allocation OK");
@@ -167,7 +180,7 @@ fn main(@builtin(global_invocation_id) g : vec3<u32>) {
   say(`coalesced read bandwidth: ${bw.toFixed(1)} GB/s`);
 
   /* One token of decode reads the whole decoder once, so this is the floor. */
-  const perToken = req.decoderBinding + req.decoderScales;
+  const perToken = req.decQuant + req.decoderScales;
   r.projectedMsPerToken = Number(((perToken / 1e9) / bw * 1000).toFixed(1));
   say(`=> a decode step reads ${GB(perToken)}, so ~${r.projectedMsPerToken} ms/token at that rate`);
   say(`   (a floor: it ignores attention, the KV cache and dispatch overhead)`);

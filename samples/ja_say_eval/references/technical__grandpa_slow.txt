@@ -1,0 +1,1 @@
+WebGPUでQwen3 ASRを動かし、C言語版とWASM版の速度を比較します。Apple M1 Proでは、十六キロヘルツの音声を使います。

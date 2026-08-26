@@ -502,11 +502,15 @@ export class WebGPUEncoder {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) throw new Error("no WebGPU adapter");
     const lim = adapter.limits;
+    /* Ask for what the shards actually need rather than the adapter's maximum,
+     * so this reports honestly on a device that offers less. The activation
+     * arena is the other claimant and is sized per utterance, so leave the
+     * usual headroom for it. */
+    const cap = (typeof window !== "undefined" && window.__gpuBindingCap) ||
+                lim.maxStorageBufferBindingSize;
+    const want = Math.min(cap, lim.maxStorageBufferBindingSize, 1 << 30);
     this.device = await adapter.requestDevice({
-      requiredLimits: {
-        maxBufferSize: lim.maxBufferSize,
-        maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
-      },
+      requiredLimits: { maxBufferSize: want, maxStorageBufferBindingSize: want },
     });
     this.device.onuncapturederror = (e) => {
       console.error("gpu error:", e.error.message);
@@ -529,6 +533,12 @@ export class WebGPUEncoder {
     const d = new Uint32Array(M.HEAPU8.buffer, dPtr, n * 8).slice();
     M._qwen_wasm_release(dPtr);
 
+    /* Same shard budget as the decoder, and for the same reason: one binding
+     * holding all 313 MB needs a limit tier that not every device offers. No
+     * encoder matrix is larger than 4 MB, so nothing has to be split. */
+    const SHARD_BUDGET = 256 << 20;
+    const shards = [{ bytes: 0 }];
+
     let qBytes = 0, sFloats = 0, vFloats = 0;
     const entries = [];
     /* The conv-out projection has no bias, but the GEMM always adds one, so
@@ -539,9 +549,17 @@ export class WebGPUEncoder {
                     qPtr: e[4], sPtr: e[5], fPtr: e[6], count: e[7] };
       if (rec.qPtr) {
         if (rec.cols % 64 !== 0) throw new Error(`kind ${rec.kind}: cols ${rec.cols} not a multiple of 64`);
-        rec.wordBase = qBytes / 4;
+        const nq = rec.rows * rec.cols;
+        let sh = shards[shards.length - 1];
+        if (sh.bytes > 0 && sh.bytes + nq > SHARD_BUDGET) {
+          shards.push({ bytes: 0 });
+          sh = shards[shards.length - 1];
+        }
+        rec.shard = shards.length - 1;
+        rec.wordBase = sh.bytes / 4;
         rec.scaleBase = sFloats;
-        qBytes += rec.rows * rec.cols;
+        sh.bytes += nq;
+        qBytes += nq;
         sFloats += rec.rows * (rec.cols / 64);
       } else if (rec.fPtr && rec.count) {
         rec.vecBase = vFloats;
@@ -557,7 +575,9 @@ export class WebGPUEncoder {
 
     report(`allocating ${((qBytes + sFloats * 4 + vFloats * 4) / 1e9).toFixed(2)} GB on the GPU...`);
     const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
-    this.bufQuants = this.device.createBuffer({ size: Math.max(4, qBytes), usage });
+    this.bufQuants = shards.map((sh) =>
+      this.device.createBuffer({ size: Math.max(4, sh.bytes), usage }));
+    this.shardCount = shards.length;
     this.bufScales = this.device.createBuffer({ size: Math.max(4, sFloats * 4), usage });
     this.bufVecs = this.device.createBuffer({ size: Math.max(4, vFloats * 4), usage });
     this.weightBytes = qBytes + sFloats * 4 + vFloats * 4;
@@ -565,7 +585,7 @@ export class WebGPUEncoder {
     for (const rec of entries) {
       if (rec.qPtr) {
         const qn = rec.rows * rec.cols;
-        this.device.queue.writeBuffer(this.bufQuants, rec.wordBase * 4,
+        this.device.queue.writeBuffer(this.bufQuants[rec.shard], rec.wordBase * 4,
           M.HEAPU8.buffer, rec.qPtr, qn);
         const sn = rec.rows * (rec.cols / 64);
         this.device.queue.writeBuffer(this.bufScales, rec.scaleBase * 4,
@@ -699,26 +719,27 @@ export class WebGPUEncoder {
     this.bindCache = new Map();
   }
 
-  bindGroup(pipe) {
-    let bg = this.bindCache.get("shared");
+  bindGroup(shard = 0) {
+    let bg = this.bindCache.get(shard);
     if (bg) return bg;
     bg = this.device.createBindGroup({
       layout: this._bgl,
       entries: [
         { binding: 0, resource: { buffer: this.bufParams, size: PARAM_STRIDE } },
-        { binding: 1, resource: { buffer: this.bufQuants } },
+        { binding: 1, resource: { buffer: this.bufQuants[shard] } },
         { binding: 2, resource: { buffer: this.bufScales } },
         { binding: 3, resource: { buffer: this.bufVecs } },
         { binding: 4, resource: { buffer: this.bufAct } },
         { binding: 5, resource: { buffer: this.bufScratch } },
       ],
     });
-    this.bindCache.set("shared", bg);
+    this.bindCache.set(shard, bg);
     return bg;
   }
 
   /* Fill one uniform slot. Fields match the Params struct. */
   setSlot(i, f) {
+    (this.slotShard || (this.slotShard = []))[i] = f.shard || 0;
     const u = (i * PARAM_STRIDE) / 4;
     this.hostU[u + 0] = f.wordBase || 0;
     this.hostU[u + 1] = f.scaleBase || 0;
@@ -748,6 +769,7 @@ export class WebGPUEncoder {
       const w = this.find(mat, layer);
       const b = this.find(biasKind, layer);
       this.setSlot(slot, {
+        shard: w.shard,
         wordBase: w.wordBase, scaleBase: w.scaleBase,
         rows: w.rows, cols: w.cols, xOff, yOff,
         vecA: b.vecBase, flags,
@@ -803,6 +825,7 @@ export class WebGPUEncoder {
     const w = this.find(E_CONV_OUT);
     let slot = ref.v++;
     this.setSlot(slot, {
+      shard: w.shard,
       wordBase: w.wordBase, scaleBase: w.scaleBase,
       rows: w.rows, cols: w.cols,
       xOff: this.oCX, yOff: this.oX,
@@ -978,7 +1001,8 @@ export class WebGPUEncoder {
     const pass = enc.beginComputePass();
     for (const step of this.plan) {
       pass.setPipeline(step.pipe);
-      pass.setBindGroup(0, this.bindGroup(step.pipe), [step.slot * PARAM_STRIDE]);
+      pass.setBindGroup(0, this.bindGroup(this.slotShard[step.slot] | 0),
+                        [step.slot * PARAM_STRIDE]);
       pass.dispatchWorkgroups(step.x, step.y);
     }
     pass.end();

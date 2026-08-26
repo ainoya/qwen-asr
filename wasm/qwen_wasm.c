@@ -849,12 +849,14 @@ const char *qwen_wasm_token_text(int id) {
 static qwen_live_audio_t *g_live = NULL;
 static pthread_t g_stream_thread;
 static int g_stream_running = 0;
+static volatile int g_stream_done = 0;
 static char *g_stream_result = NULL;
 
 
 static void *stream_main(void *arg) {
     (void)arg;
     g_stream_result = qwen_transcribe_stream_live(g_ctx, g_live);
+    __atomic_store_n(&g_stream_done, 1, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -874,6 +876,7 @@ int qwen_wasm_stream_start(void) {
 
     /* The engine's stream loop blocks waiting for audio, so it gets its own
      * thread; this worker stays free to accept pushes from the page. */
+    __atomic_store_n(&g_stream_done, 0, __ATOMIC_RELEASE);
     if (pthread_create(&g_stream_thread, NULL, stream_main, NULL) != 0) {
         qwen_live_audio_free(g_live);
         g_live = NULL;
@@ -886,6 +889,23 @@ int qwen_wasm_stream_start(void) {
 EMSCRIPTEN_KEEPALIVE
 void qwen_wasm_stream_push(const float *samples, int n_samples) {
     if (g_stream_running && g_live) qwen_live_audio_push(g_live, samples, n_samples);
+}
+
+/* Split finish: signal end of audio without blocking, poll for the drain,
+ * then collect. The one-call qwen_wasm_stream_finish() joins the stream
+ * thread, and on the main browser thread that join is a deadlock trap: the
+ * stream thread may be waiting on a GPU hook that only the main thread can
+ * service. Measured, not theoretical - the final chunk's decode sat blocked
+ * for its whole 30 s timeout while finish() held the main thread. */
+EMSCRIPTEN_KEEPALIVE
+void qwen_wasm_stream_eof(void) {
+    if (g_stream_running && g_live) qwen_live_audio_set_eof(g_live);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int qwen_wasm_stream_drained(void) {
+    if (!g_stream_running) return 1;
+    return __atomic_load_n(&g_stream_done, __ATOMIC_ACQUIRE);
 }
 
 /* Signals end of audio, waits for the decoder to drain, returns the final
@@ -906,4 +926,66 @@ char *qwen_wasm_stream_finish(void) {
     char *r = g_stream_result;
     g_stream_result = NULL;
     return r;
+}
+
+/* ---- Streaming decoder on the GPU ----
+ *
+ * Same proxy pattern as the encoder hook above: the streaming loop runs on a
+ * worker, the GPU only exists on the main thread, so the request crosses with
+ * MAIN_THREAD_ASYNC_EM_ASM and the worker spins until the reply lands. The
+ * budget is larger because one call covers a suffix prefill plus the whole
+ * token loop.
+ */
+#define QWEN_DEC_HOOK_TIMEOUT_MS 30000
+
+static volatile int g_dec_hook_state = 0;   /* 0 idle, 1 pending, 2 done, 3 failed */
+static int *g_dec_hook_dst = NULL;
+static int g_dec_hook_cap = 0;
+static int g_dec_hook_n = -1;
+
+/* Called on the main thread when the GPU decode finishes. `ids` stays owned
+ * by the caller; it is copied out before this returns. */
+EMSCRIPTEN_KEEPALIVE
+void qwen_wasm_dec_hook_done(const int *ids, int n) {
+    if (ids && n >= 0 && n <= g_dec_hook_cap) {
+        memcpy(g_dec_hook_dst, ids, (size_t)n * sizeof(int));
+        g_dec_hook_n = n;
+        __atomic_store_n(&g_dec_hook_state, 2, __ATOMIC_RELEASE);
+    } else {
+        g_dec_hook_n = -1;
+        __atomic_store_n(&g_dec_hook_state, 3, __ATOMIC_RELEASE);
+    }
+}
+
+static int gpu_decoder_hook(void *ud, const float *embeds, int total_seq,
+                            int reuse_len, int max_new, int *out_tokens) {
+    (void)ud;
+    g_dec_hook_dst = out_tokens;
+    g_dec_hook_cap = max_new;
+    g_dec_hook_n = -1;
+    __atomic_store_n(&g_dec_hook_state, 1, __ATOMIC_RELEASE);
+
+    MAIN_THREAD_ASYNC_EM_ASM({
+        if (Module.__gpuDecode) Module.__gpuDecode($0, $1, $2, $3);
+        else _qwen_wasm_dec_hook_done(0, -1);
+    }, (int)(uintptr_t)embeds, total_seq, reuse_len, max_new);
+
+    double t0 = emscripten_get_now();
+    for (;;) {
+        int st = __atomic_load_n(&g_dec_hook_state, __ATOMIC_ACQUIRE);
+        if (st >= 2) break;
+        if (emscripten_get_now() - t0 > QWEN_DEC_HOOK_TIMEOUT_MS) {
+            __atomic_store_n(&g_dec_hook_state, 3, __ATOMIC_RELEASE);
+            return -1;
+        }
+        emscripten_thread_sleep(1);
+    }
+    return __atomic_load_n(&g_dec_hook_state, __ATOMIC_ACQUIRE) == 2 ? g_dec_hook_n : -1;
+}
+
+/* Route the streaming decoder through Module.__gpuDecode (1) or back (0). */
+EMSCRIPTEN_KEEPALIVE
+void qwen_wasm_set_gpu_decoder(int on) {
+    if (!g_ctx) return;
+    qwen_set_decoder_hook(g_ctx, on ? gpu_decoder_hook : NULL, NULL);
 }

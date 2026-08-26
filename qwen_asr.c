@@ -38,6 +38,12 @@ void qwen_set_encoder_hook(qwen_ctx_t *ctx, qwen_encoder_hook fn, void *userdata
     ctx->encoder_hook_userdata = userdata;
 }
 
+void qwen_set_decoder_hook(qwen_ctx_t *ctx, qwen_decoder_hook fn, void *userdata) {
+    if (!ctx) return;
+    ctx->decoder_hook = fn;
+    ctx->decoder_hook_userdata = userdata;
+}
+
 static const char *QWEN_SUPPORTED_LANGUAGES[] = {
     "Chinese", "English", "Cantonese", "Arabic", "German", "French",
     "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
@@ -2273,20 +2279,44 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 reused_prefill++;
             }
         }
-        /* Decoder KV reuse:
-         * keep the longest unchanged prefill prefix and only prefill delta tokens. */
-        ctx->kv_cache_len = reused_prefill;
-        int delta_prefill = prefill_len - reused_prefill;
-        if (delta_prefill > 0) {
-            qwen_decoder_prefill(ctx,
-                                 input_embeds + (size_t)reused_prefill * dim,
-                                 delta_prefill);
+        /* A decoder hook (the GPU decoder, in the browser) owns its own
+         * persistent state and does the suffix prefill and the whole token
+         * loop in one call. On failure it retains nothing trustworthy, so the
+         * fallback rebuilds the built-in cache from scratch. */
+        int hook_n = -1;
+        int *hook_ids = NULL;
+        int token = 0;
+        if (ctx->decoder_hook) {
+            hook_ids = (int *)malloc((size_t)max_new_tokens * sizeof(int));
+            if (hook_ids) {
+                hook_n = ctx->decoder_hook(ctx->decoder_hook_userdata,
+                                           input_embeds, total_seq,
+                                           reused_prefill, max_new_tokens,
+                                           hook_ids);
+                if (hook_n > max_new_tokens) hook_n = max_new_tokens;
+            }
+            if (hook_n < 0) {
+                free(hook_ids);
+                hook_ids = NULL;
+                reused_prefill = 0;
+            }
+        }
+
+        if (hook_n < 0) {
+            /* Decoder KV reuse: keep the longest unchanged prefill prefix and
+             * only prefill delta tokens. */
+            ctx->kv_cache_len = reused_prefill;
+            int delta_prefill = prefill_len - reused_prefill;
+            if (delta_prefill > 0) {
+                qwen_decoder_prefill(ctx,
+                                     input_embeds + (size_t)reused_prefill * dim,
+                                     delta_prefill);
+            }
+            float *last_embed = input_embeds + (size_t)prefill_len * dim;
+            token = qwen_decoder_forward(ctx, last_embed);
         }
         prefill_total_tokens += prefill_len;
         prefill_reused_tokens += reused_prefill;
-
-        float *last_embed = input_embeds + (size_t)prefill_len * dim;
-        int token = qwen_decoder_forward(ctx, last_embed);
 
         if (prefill_len > prev_prefill_cap) {
             int new_cap = prev_prefill_cap > 0 ? prev_prefill_cap : 64;
@@ -2326,13 +2356,23 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         /* Collect ALL generated tokens (including language, <asr_text>, etc.) */
         int *chunk_tokens = (int *)malloc((size_t)max_new_tokens * sizeof(int));
         if (!chunk_tokens) {
+            free(hook_ids);
             ctx->perf_total_ms += get_time_ms() - chunk_t0;
             chunk_idx++;
             continue;
         }
         int n_chunk_tokens = 0;
 
-        while (n_generated < max_new_tokens) {
+        if (hook_n >= 0) {
+            for (int i = 0; i < hook_n; i++) {
+                n_generated++;
+                token = hook_ids[i];
+                if (token == QWEN_TOKEN_ENDOFTEXT || token == QWEN_TOKEN_IM_END) break;
+                chunk_tokens[n_chunk_tokens++] = token;
+            }
+            free(hook_ids);
+            hook_ids = NULL;
+        } else while (n_generated < max_new_tokens) {
             n_generated++;
             if (token == QWEN_TOKEN_ENDOFTEXT || token == QWEN_TOKEN_IM_END) break;
 

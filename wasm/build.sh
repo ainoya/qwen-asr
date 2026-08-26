@@ -40,6 +40,8 @@ EXPORTS='["_qwen_wasm_alloc","_qwen_wasm_release","_qwen_wasm_init","_qwen_wasm_
 "_qwen_wasm_mel_ptr","_qwen_wasm_mel_ms","_qwen_wasm_embeds_from_enc",
 "_qwen_wasm_take_partial","_qwen_wasm_set_past_text",
 "_qwen_wasm_set_gpu_encoder","_qwen_wasm_enc_hook_done",
+"_qwen_wasm_set_gpu_decoder","_qwen_wasm_dec_hook_done",
+"_qwen_wasm_stream_eof","_qwen_wasm_stream_drained",
 "_qwen_wasm_enc_tap_ptr","_qwen_wasm_enc_tap_out","_qwen_wasm_enc_tap_tokens",
 "_qwen_wasm_enc_tap_mel","_qwen_wasm_enc_tap_frames",
 "_qwen_wasm_stream_start","_qwen_wasm_stream_push","_qwen_wasm_stream_finish",

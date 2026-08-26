@@ -229,6 +229,19 @@ typedef void (*qwen_partial_cb)(const char *text, void *userdata);
 typedef float *(*qwen_encoder_hook)(void *userdata, const float *mel,
                                     int mel_frames, int *out_seq_len);
 
+/* Substitute decoder for the streaming loop (a GPU one, in the browser).
+ *
+ * The hook owns a decoder state that persists across calls: it must prefill
+ * embeds[reuse_len .. total_seq-1] against that state - rows before reuse_len
+ * are unchanged since the previous call, which is the caller's guarantee -
+ * then generate up to max_new tokens greedily and write their ids to
+ * out_tokens, including the terminating im_end/endoftext when one is
+ * produced. Returns the id count, or -1 to make the caller fall back to the
+ * built-in decoder with nothing reused. */
+typedef int (*qwen_decoder_hook)(void *userdata, const float *embeds,
+                                 int total_seq, int reuse_len, int max_new,
+                                 int *out_tokens);
+
 /* ========================================================================
  * Main Context
  * ======================================================================== */
@@ -273,6 +286,8 @@ typedef struct {
     void *partial_cb_userdata;
     qwen_encoder_hook encoder_hook;
     void *encoder_hook_userdata;
+    qwen_decoder_hook decoder_hook;
+    void *decoder_hook_userdata;
 
     /* Segmentation settings */
     float segment_sec;             /* 0 = no splitting, default full-audio decode */
@@ -358,6 +373,9 @@ void qwen_set_partial_callback(qwen_ctx_t *ctx, qwen_partial_cb cb, void *userda
 
 /* See qwen_encoder_hook. Applies to every path that runs the audio tower. */
 void qwen_set_encoder_hook(qwen_ctx_t *ctx, qwen_encoder_hook fn, void *userdata);
+
+/* See qwen_decoder_hook. Used by the interactive streaming loop only. */
+void qwen_set_decoder_hook(qwen_ctx_t *ctx, qwen_decoder_hook fn, void *userdata);
 
 /* Set optional system prompt text (UTF-8). Pass NULL or "" to clear.
  * Returns 0 on success, -1 on allocation/encoding errors. */

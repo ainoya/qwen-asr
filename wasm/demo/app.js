@@ -110,12 +110,12 @@ function sendSettings() {
   Module._qwen_wasm_release(lp);
   Module._qwen_wasm_set_segment_sec(Number($("seg").value) || 0);
   Module._qwen_wasm_set_batch_size(Number($("batch").value) || 1);
-  /* Streaming re-encodes its window every chunk, which is the bulk of the
-   * per-chunk cost, so route it to the GPU whenever there is one. This is not
-   * tied to the decoder dropdown: streaming always decodes in wasm, because
-   * the GPU decoder prefills from an empty cache and cannot take the loop's
-   * incremental prefix. */
+  /* Streaming re-encodes its window every chunk and re-prefills the changed
+   * suffix, which is the bulk of the per-chunk cost, so route both to the GPU
+   * whenever there is one. Not tied to the decoder dropdown: a GPU that is
+   * present serves the stream regardless of how batch jobs are decoded. */
   Module._qwen_wasm_set_gpu_encoder(encoder ? 1 : 0);
+  Module._qwen_wasm_set_gpu_decoder(gpu ? 1 : 0);
   Module._qwen_wasm_set_past_text(1);
   Module._qwen_wasm_set_stream_params(Number($("chunk").value) || 0, 32,
                                       Number($("encwin").value) || 0);
@@ -273,6 +273,9 @@ $("load").onclick = async () => {
            * reported as a failure so the loop falls back to the wasm encoder
            * rather than stalling. */
           Module.__gpuEncode = async (melPtr, frames) => {
+            const hs = window.__hookStats || (window.__hookStats = {dec: 0, decMs: 0, decArrive: 0, enc: 0, encMs: 0});
+            const et0 = performance.now();
+            hs.enc++;
             try {
               encoder.hookCalls = (encoder.hookCalls || 0) + 1;
               const out = await encoder.runFromMel(melPtr, frames);
@@ -280,6 +283,9 @@ $("load").onclick = async () => {
               if (!p) throw new Error("out of wasm memory for the encoder output");
               Module.HEAPF32.set(out, f32idx(p));
               Module._qwen_wasm_enc_hook_done(p, encoder.tokens);
+              hs.encMs += performance.now() - et0;
+              (hs.encProfiles || (hs.encProfiles = [])).push(
+                {runMs: Math.round(encoder.runMs), wallMs: Math.round(performance.now() - et0)});
             } catch (err) {
               encoder.hookFails = (encoder.hookFails || 0) + 1;
               if (encoder.hookFails <= 2)
@@ -290,6 +296,42 @@ $("load").onclick = async () => {
         } catch (err) {
           log(`GPU audio tower unavailable (${err.message}); mel and the encoder stay on the cpu`, "err");
         }
+
+        /* Streaming decode: one call covers the suffix prefill against the
+         * KV the GPU already holds from the previous chunk, plus the whole
+         * token loop. reuseLen rows are unchanged - the C loop guarantees it -
+         * and a failure report makes the loop fall back to the wasm decoder. */
+        Module.__gpuDecode = async (embedsPtr, totalSeq, reuseLen, maxNew) => {
+          const hs = window.__hookStats || (window.__hookStats = {dec: 0, decMs: 0, decArrive: 0, enc: 0, encMs: 0});
+          const t0 = performance.now();
+          hs.dec++;
+          try {
+            if (!gpu) throw new Error("no GPU decoder");
+            /* The pointer crosses EM_ASM as a signed int and the packed model
+             * puts the heap well past 2 GB, so restore the unsigned value. */
+            embedsPtr = embedsPtr >>> 0;
+            const r = reuseLen > 0
+              ? await gpu.prefillSuffixAndGenerate(embedsPtr, totalSeq, reuseLen, maxNew - 1, null)
+              : await gpu.prefillAndGenerate(embedsPtr, totalSeq, maxNew - 1, null);
+            const ids = (r.ids || []).slice(0, maxNew);
+            const p = P(Module._qwen_wasm_alloc(Math.max(ids.length, 1) * 4));
+            if (!p) throw new Error("out of wasm memory for the token ids");
+            /* HEAP32 is not exported by this build; any heap view's buffer
+             * is the same SharedArrayBuffer. */
+            new Int32Array(Module.HEAPU8.buffer, p, ids.length).set(ids);
+            Module._qwen_wasm_dec_hook_done(p, ids.length);
+            Module._qwen_wasm_release(p);
+            hs.decMs += performance.now() - t0;
+            (hs.decProfiles || (hs.decProfiles = [])).push(gpu.lastProfile ||
+              {prefillMs: Math.round(gpu.prefillMs)});
+          } catch (err) {
+            console.error("gpu decode hook:", err);
+            gpu && (gpu.hookFails = (gpu.hookFails || 0) + 1);
+            if (!gpu || gpu.hookFails <= 2)
+              log(`GPU decode failed mid-stream (${err && err.message}); falling back`, "err");
+            Module._qwen_wasm_dec_hook_done(0, -1);
+          }
+        };
       }
     }
 
@@ -403,7 +445,9 @@ async function runBatch(bytes, label) {
         log(`GPU unavailable (${gpu?.lost || encoder?.lost}); retrying on the cpu`, "err");
         gpu = null; encoder = null;
         Module.__gpuEncode = null;
+        Module.__gpuDecode = null;
         Module._qwen_wasm_set_gpu_encoder(0);
+        Module._qwen_wasm_set_gpu_decoder(0);
         $("backend").value = "cpu";
         busy = false;
         return runBatch(bytes, label);
@@ -465,8 +509,7 @@ let audioCtx = null, micStream = null, micNode = null, streamedSamples = 0;
 
 $("mic").onclick = async () => {
   if (!ready || busy) return;
-  if ($("backend").value === "gpu")
-    log("streaming uses the wasm decoder; the GPU backend handles batch only", "err");
+
   busy = true;
   streamedSamples = 0;
   $("out").textContent = "";
@@ -521,6 +564,14 @@ $("micstop").onclick = async () => {
   micNode = micStream = audioCtx = null;
   $("lvlfill").style.width = "0";
 
+await (async () => {
+    /* stream_finish() joins the stream thread; done naively that join blocks
+     * the main thread, which is also the only thread that can service the GPU
+     * hooks the stream thread may be waiting on. Signal end-of-audio first and
+     * poll for the drain so the hooks keep flowing. */
+    Module._qwen_wasm_stream_eof();
+    while (!Module._qwen_wasm_stream_drained()) await sleep(30);
+  })();
   const rp = P(Module._qwen_wasm_stream_finish());
   if (poller) { clearInterval(poller); poller = null; }
   drainText();
@@ -568,6 +619,8 @@ $("simstream").onclick = async () => {
     }
 
     setStatus("draining...");
+    Module._qwen_wasm_stream_eof();
+    while (!Module._qwen_wasm_stream_drained()) await sleep(30);
     const rp = P(Module._qwen_wasm_stream_finish());
     if (poller) { clearInterval(poller); poller = null; }
     drainText();

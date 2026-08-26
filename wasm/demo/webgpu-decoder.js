@@ -2253,15 +2253,17 @@ export class WebGPUDecoder {
     const t0 = performance.now();
     this.prepareContext(seq, maxNew, { prefillSeq: seq });
 
-    /* Upload transposed: the prefill kernels want [dim][seqPad]. */
+    /* Upload transposed: the prefill kernels want [dim][seqPad]. One staging
+     * array and one writeBuffer - issuing a call per dim measured seconds of
+     * pure overhead against a busy tab. */
     const sp = this.seqPad;
     const src = new Float32Array(M.HEAPF32.buffer, embedsPtr, seq * cfg.hidden);
-    const col = new Float32Array(sp);
-    for (let d = 0; d < cfg.hidden; d++) {
-      for (let s2 = 0; s2 < seq; s2++) col[s2] = src[s2 * cfg.hidden + d];
-      if (seq < sp) col.fill(0, seq);
-      device.queue.writeBuffer(this.bufAct, (this.PT.x + d * sp) * 4, col);
+    const stage = new Float32Array(cfg.hidden * sp);
+    for (let s2 = 0; s2 < seq; s2++) {
+      const row = s2 * cfg.hidden;
+      for (let d = 0; d < cfg.hidden; d++) stage[d * sp + s2] = src[row + d];
     }
+    device.queue.writeBuffer(this.bufAct, this.PT.x * 4, stage);
 
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass();
@@ -2288,19 +2290,25 @@ export class WebGPUDecoder {
     if (p0 <= 0) return this.prefillAndGenerate(embedsPtr, seq, maxNew, onPiece);
     const { device, cfg, M } = this;
     const t0 = performance.now();
+    const mark = (o, k, t) => { o[k] = +(performance.now() - t).toFixed(1); };
+    const lp = this.lastProfile = {};
     const nNew = seq - p0;
     if (nNew < 1) throw new Error("suffix prefill needs at least one new row");
+    let tp = performance.now();
     this.prepareContext(seq, maxNew, { prefillSeq: nNew, prefillBase: p0 });
+    mark(lp, "prepareMs", tp);
 
     const sp = this.seqPad;
     const src = new Float32Array(M.HEAPF32.buffer, embedsPtr, seq * cfg.hidden);
-    const col = new Float32Array(sp);
-    for (let d = 0; d < cfg.hidden; d++) {
-      for (let s2 = 0; s2 < nNew; s2++) col[s2] = src[(p0 + s2) * cfg.hidden + d];
-      if (nNew < sp) col.fill(0, nNew);
-      device.queue.writeBuffer(this.bufAct, (this.PT.x + d * sp) * 4, col);
+    const stage = new Float32Array(cfg.hidden * sp);
+    for (let s2 = 0; s2 < nNew; s2++) {
+      const row = (p0 + s2) * cfg.hidden;
+      for (let d = 0; d < cfg.hidden; d++) stage[d * sp + s2] = src[row + d];
     }
+    device.queue.writeBuffer(this.bufAct, this.PT.x * 4, stage);
+    mark(lp, "uploadMs", tp);
 
+    tp = performance.now();
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass();
     this.encodePrefill(pass);
@@ -2310,9 +2318,14 @@ export class WebGPUDecoder {
     await this.bufTokRead.mapAsync(GPUMapMode.READ, 0, 4);
     const first = new Uint32Array(this.bufTokRead.getMappedRange(0, 4).slice(0))[0];
     this.bufTokRead.unmap();
+    mark(lp, "gpuPrefillMs", tp);
     this.prefillMs = performance.now() - t0;
 
-    return this.generate(first, seq, maxNew, onPiece, { keepContext: true });
+    tp = performance.now();
+    const r = await this.generate(first, seq, maxNew, onPiece, { keepContext: true });
+    mark(lp, "generateMs", tp);
+    lp.nNew = nNew; lp.seq = seq;
+    return r;
   }
 
   /* Generate from `firstToken` (produced by the CPU prefill). */

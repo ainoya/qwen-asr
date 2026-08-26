@@ -270,6 +270,17 @@ re-litigate these.
 - **Alpha is sharply peaked and 0.25 is the optimum.** Measured Japanese CER:
   0.15 -> 0.187, 0.25 -> 0.169, 0.40 -> 0.236. Going past the optimum is worse
   than not rescaling at all.
+- **Four bits buys nothing once segment batching is on, which settles it.**
+  Generation is only weight-bound at batch 1, and there four bits does deliver:
+  on 25 minutes of real speech at `-S 30 --batch 1`, generation is 42.0 s
+  against Q8's 55.5 s (1.32x). Turn batching on and that disappears - at
+  `--batch 4` it is 28.2 s against 27.8 s, i.e. nothing. Batching already took
+  generation from 55.5 s to 27.8 s (2.0x), and the two do not compose: batched
+  decode is bound by per-stream attention, not by the weight read, so halving
+  the bytes per weight has nothing left to save. Whole-run totals, same audio:
+  Q8 batch 4 is 94.0 s, and every four-bit configuration is slower (99.4 s at
+  `-S 30`, 103.7 s at `-S 15`, 92.1 s at `-S 60` with two collapsed segments).
+  Prefill is worse at four bits in all of them.
 - **Four bits collapses on real long-form audio, even with AWQ.** This is the
   finding that decides it. On 25 minutes of real Japanese speech at `-S 30`, the
   4-bit+AWQ image emitted 6933 text tokens where Q8 emitted 2716, and 52% of its
@@ -279,6 +290,10 @@ re-litigate these.
   batching bug - `--batch 1` collapses identically (6933 vs 6896 tokens). Short
   clean clips hide this completely: on the 18-sample Japanese set four bits looks
   like a 1.29x win at 0.005 CER. Always check a long real recording.
+  Since the loop guard landed the cost is bounded rather than catastrophic (2 of
+  50 segments truncated, 99.4 s instead of 247.5 s), but the segments are still
+  wrong. Cutting shorter does avoid it - `-S 15` collapsed 0 of 100 segments on
+  the same audio - at the price of more prefill and encoder work.
 - **AWQ does not rescue the two English samples that break at four bits.**
   `15s_there_are_two_of_them_out_there` and `21s_hey_thats_us_were_doing_all_right`
   fail the suite at normalized error 0.245 and 0.437 without AWQ, and 0.265 and

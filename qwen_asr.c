@@ -764,6 +764,79 @@ static float *build_input_embeds(qwen_ctx_t *ctx, const float *samples, int n_sa
     return embeds;
 }
 
+/* ========================================================================
+ * Degenerate-generation guard
+ *
+ * Greedy decoding cannot escape a repetition loop on its own, so a segment that
+ * enters one keeps emitting until it hits its token limit. A flat limit makes
+ * that expensive: at four bits, two of fifty segments of real Japanese speech
+ * looped and each burned the full 2048 tokens - 95 s between them - where the
+ * median segment needs 65. Both halves of the fix are here: a budget tied to
+ * the audio length, and a detector that stops the loop and rolls the text back
+ * to before it started.
+ * ======================================================================== */
+
+/* Speech has a bounded token rate. The largest observed over real Japanese and
+ * English material is ~3.4 text tokens per second; 12/s leaves a wide margin
+ * for dense material while still cutting a runaway segment off early. */
+static int segment_token_budget(int n_samples) {
+    long secs = (long)n_samples / QWEN_SAMPLE_RATE;
+    long budget = 96 + secs * 12;
+    return budget > 2048 ? 2048 : (int)budget;
+}
+
+/* Enough history to see a long phrase repeat several times. */
+#define QWEN_LOOP_HISTORY 128
+#define QWEN_LOOP_MAX_PERIOD 16
+
+typedef struct {
+    int ids[QWEN_LOOP_HISTORY];
+    size_t text_len[QWEN_LOOP_HISTORY];  /* emitted text length before each id */
+    int n;                                /* total pushed, may exceed history */
+    size_t rollback;                      /* text length to truncate to */
+    int period;                           /* detected cycle length */
+} loop_guard_t;
+
+/* How many times a cycle must repeat before it counts as degenerate. Short
+ * cycles occur legitimately in speech - a filler word said three times over -
+ * so they need far more evidence than a long phrase does. */
+static int loop_min_repeats(int period) {
+    if (period == 1) return 12;
+    if (period <= 3) return 8;
+    return 4;
+}
+
+/* Record one generated token. Returns non-zero once the tail is a short cycle
+ * repeated past its threshold, with g->rollback set to the text length from
+ * before the first repetition. */
+static int loop_guard_push(loop_guard_t *g, int token, size_t text_len) {
+    int slot = g->n % QWEN_LOOP_HISTORY;
+    g->ids[slot] = token;
+    g->text_len[slot] = text_len;
+    g->n++;
+
+    int have = g->n < QWEN_LOOP_HISTORY ? g->n : QWEN_LOOP_HISTORY;
+    for (int p = 1; p <= QWEN_LOOP_MAX_PERIOD; p++) {
+        int need = loop_min_repeats(p);
+        if (have < p * need) continue;
+        int ok = 1;
+        for (int k = 1; k < need && ok; k++)
+            for (int j = 0; j < p; j++) {
+                int a = (g->n - 1 - j + QWEN_LOOP_HISTORY * 2) % QWEN_LOOP_HISTORY;
+                int b = (g->n - 1 - j - k * p + QWEN_LOOP_HISTORY * 2) % QWEN_LOOP_HISTORY;
+                if (g->ids[a] != g->ids[b]) { ok = 0; break; }
+            }
+        if (!ok) continue;
+        /* Keep one instance of the cycle: it is probably real text, and only
+         * the copies after it are the loop. */
+        int back = (g->n - (need - 1) * p + QWEN_LOOP_HISTORY * 2) % QWEN_LOOP_HISTORY;
+        g->rollback = g->text_len[back];
+        g->period = p;
+        return 1;
+    }
+    return 0;
+}
+
 static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
                                 int n_samples, qwen_tokenizer_t *tokenizer,
                                 const int *past_tokens, int n_past_tokens,
@@ -801,8 +874,9 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
 
     /* ---- Autoregressive decode ---- */
     t0 = get_time_ms();
-    int max_tokens = 2048;
+    int max_tokens = segment_token_budget(n_samples);
     int n_generated = 0;
+    loop_guard_t guard = {{0}, {0}, 0, 0, 0};
     /* If language is forced, <asr_text> is already part of prompt suffix. */
     int past_asr_text = (ctx->n_force_prompt_tokens > 0 || n_past_tokens > 0) ? 1 : 0;
 
@@ -836,6 +910,20 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
             /* Stream token via callback */
             if (ctx->token_cb)
                 ctx->token_cb(piece, ctx->token_cb_userdata);
+
+            /* A degenerate loop cannot be escaped by generating more, so stop
+             * and drop the repetitions. A token callback has already emitted
+             * them; committed text is never retracted, so what it sent stands
+             * and only the returned text is trimmed. */
+            if (loop_guard_push(&guard, token, text_len - piece_len)) {
+                if (qwen_verbose >= 1)
+                    fprintf(stderr, "  Segment collapsed into a %d-token loop "
+                                    "after %d tokens; truncating\n",
+                            guard.period, n_text_tokens);
+                text_len = guard.rollback;
+                text[text_len] = '\0';
+                break;
+            }
         }
 
         /* Embed and generate next token */
@@ -968,6 +1056,7 @@ typedef struct {
     int n_generated;
     int n_text_tokens;
     int done;
+    loop_guard_t guard;
 } slot_t;
 
 /* Decode n segments together. Each slot's transcript is returned in texts[];
@@ -1040,7 +1129,11 @@ static int decode_segment_group(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer,
 
     /* ---- Lockstep autoregressive decode ---- */
     t0 = get_time_ms();
-    const int max_tokens = 2048;
+    int max_tokens = 0;
+    for (int i = 0; i < n; i++) {
+        int b = segment_token_budget(seg_n[i]);
+        if (b > max_tokens) max_tokens = b;
+    }
     int n_steps = 0;
     for (;;) {
         int n_active = 0;
@@ -1071,8 +1164,21 @@ static int decode_segment_group(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer,
                 sl->past_asr_text = 1;
             } else if (sl->past_asr_text) {
                 const char *piece = qwen_tokenizer_decode(tokenizer, token);
+                size_t before = sl->text.len;
                 if (tb_append(&sl->text, piece, strlen(piece)) != 0) goto done;
                 sl->n_text_tokens++;
+                /* Output here is buffered per segment, so the repetitions can
+                 * be dropped cleanly. */
+                if (loop_guard_push(&sl->guard, token, before)) {
+                    if (qwen_verbose >= 1)
+                        fprintf(stderr, "  Segment collapsed into a %d-token "
+                                        "loop after %d tokens; truncating\n",
+                                sl->guard.period, sl->n_text_tokens);
+                    sl->text.len = sl->guard.rollback;
+                    if (sl->text.buf) sl->text.buf[sl->text.len] = '\0';
+                    sl->done = 1;
+                    continue;
+                }
             }
             sl->token = token;
         }

@@ -153,19 +153,29 @@ Japanese speech, then evaluated on the Japanese set:
 gives 0.187 and 0.40 gives 0.236, worse than not rescaling at all. `--awq-search`
 reports what each value buys in weighted error, and picked the same 0.25.
 
-It does not make four bits safe. **On long real-world recordings four bits
-collapses into repetition loops, with or without rescaling, and that makes it
-slower than Q8 as well as wrong.** On 25 minutes of real Japanese speech at
-`-S 30` it emitted 6933 text tokens where Q8 emitted 2716; 52% of its output was
-repeated 12-grams, with one block repeating 250 times. The whole file took 247 s
-against Q8's 142 s. `--batch 1` behaves the same, so it is not a batching
-artifact. The two English regression samples that fail at four bits fail just as
-hard with rescaling (normalized error 0.245 and 0.437 without, 0.265 and 0.437
-with).
+**Those numbers are short clips, and they do not carry over.** The table above
+is 18 clips of a few seconds each, decoded one at a time in full context. Two
+things go wrong on real long-form audio.
 
-Short clips hide all of this - the table above is 18 clips of a few seconds
-each. If you turn `q4` on, check it against a long recording of your own before
-trusting it.
+Four bits collapses into repetition loops on some segments. On 25 minutes of
+real Japanese speech at `-S 30`, two of fifty segments looped; before the loop
+guard existed they ran to the token limit and turned a 142 s job into 247 s.
+Rescaling does not prevent it, and neither do the two English regression samples
+it fails (normalized error 0.245 and 0.437 without rescaling, 0.265 and 0.437
+with). Cutting shorter avoids it — `-S 15` collapsed none of 100 segments on the
+same audio — at the price of more prefill work.
+
+And once segment batching is on, four bits stops being faster at all.
+Generation is only weight-bound at batch 1, where it is a real 1.32x (42.0 s
+against Q8's 55.5 s on that 25-minute file). `--batch 4` takes Q8's generation
+from 55.5 s to 27.8 s on its own, and four bits then measures 28.2 s — nothing,
+because batched decode is bound by per-stream attention rather than by the
+weight read. Whole-run totals on that file: **Q8 at `--batch 4` is 94.0 s and
+every four-bit configuration is slower.**
+
+So `q4` is worth trying only for single-stream decode, or where the download
+size matters more than the time. Check it against a long recording of your own
+first.
 
 To avoid carrying the statistics around at run time, bake them into a model
 image instead:
@@ -185,6 +195,28 @@ Quantization happens at load time from the mmap'd bf16 tensors, so no separate
 model file is needed; it adds a few hundred milliseconds to startup.
 `QWEN_WEIGHTS=bf16|q8|q8-lm` overrides the flag, which is handy when driving the
 binary from a script or test harness.
+
+### Runaway Segments
+
+A greedy decoder that enters a repetition loop cannot leave it, so a segment
+that starts looping keeps emitting until it runs out of budget. Two things bound
+that. The per-segment token budget is tied to the audio rather than being a flat
+limit — speech tops out near 3.4 text tokens per second, so 12/s plus a floor
+leaves wide margin while still cutting a runaway off. And a detector watches the
+generated ids for a short cycle repeating past a threshold that scales with the
+cycle length (a single token repeated needs far more evidence than an eight-token
+phrase), then stops and drops the repetitions from the text.
+
+Without `--silent` a truncated segment reports itself:
+
+```text
+  Segment collapsed into a 4-token loop after 55 tokens; truncating
+```
+
+This never fires on the regression suite or on 25 minutes of real speech at Q8,
+and Q8 output is byte-identical with and without it. It exists because four-bit
+weights do trip it, and because a flat 2048-token limit on a 30-second segment
+was a latent hazard regardless of precision.
 
 ### Which Mode To Use (By File Length)
 

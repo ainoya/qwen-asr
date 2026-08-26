@@ -1696,8 +1696,11 @@ export class WebGPUDecoder {
      * stream is not re-laying the cache out every chunk. */
     let maxSeq = kvLen + maxNew + 8;
     if (suffix) {
-      maxSeq = Math.ceil(maxSeq / 768) * 768;
+      /* Keep the current layout whenever it actually fits; the 768-step
+       * rounding is only for sizing a fresh one, and comparing against the
+       * rounded figure would re-lay out a cache that was already big enough. */
       if (this.bufKV && this.maxSeq >= maxSeq) maxSeq = this.maxSeq;
+      else maxSeq = Math.ceil(maxSeq / 768) * 768;
     }
     const seqPad = opts.prefillSeq ? Math.ceil(opts.prefillSeq / 64) * 64 : 0;
     this.seqPad = seqPad;
@@ -2281,12 +2284,42 @@ export class WebGPUDecoder {
   }
 
   /* Prefill on the GPU from wasm-built embeddings, then generate.
-   * `embedsPtr` points at [seq, hidden] f32 in wasm memory. */
+   * `embedsPtr` points at [seq, hidden] f32 in wasm memory.
+   *
+   * Long prompts prefill in chained chunks through the suffix path rather
+   * than one shot. The one-shot path's score scratch is heads x seq x seq -
+   * quadratic, 164 MB at a 1600-token prompt and growing - while a chunk's is
+   * heads x 512 x seq. The chunks compute identical attention (the suffix
+   * kernels read the same cache the one-shot pass would have written; the
+   * split harness verified transcripts byte-identical on all 23 goldens), so
+   * this trades nothing but a few extra dispatches. */
   async prefillAndGenerate(embedsPtr, seq, maxNew, onPiece) {
+    const CHUNK = 512;
+    /* One-shot up to 1024 positions (67 MB of score scratch); chunk past it,
+     * where the quadratic scratch would keep growing. */
+    if (seq > 1024) {
+      const t0 = performance.now();
+      let p0 = 0;
+      while (seq - p0 > CHUNK + 128) {
+        const end = p0 + CHUNK;
+        /* Reserving the final context up front keeps the cache layout stable
+         * across chunks, so the suffix calls never re-lay it out. */
+        if (p0 === 0) await this.prefillOneShot(embedsPtr, end, 0, null, seq + maxNew);
+        else await this.prefillSuffixAndGenerate(embedsPtr, end, p0, 0, null);
+        p0 = end;
+      }
+      const r = await this.prefillSuffixAndGenerate(embedsPtr, seq, p0, maxNew, onPiece);
+      this.prefillMs = performance.now() - t0 - (this.lastProfile?.generateMs || 0);
+      return r;
+    }
+    return this.prefillOneShot(embedsPtr, seq, maxNew, onPiece);
+  }
+
+  async prefillOneShot(embedsPtr, seq, maxNew, onPiece, reserve) {
     if (this.lost) throw new Error(`GPU device lost (${this.lost})`);
     const { device, cfg, M } = this;
     const t0 = performance.now();
-    this.prepareContext(seq, maxNew, { prefillSeq: seq });
+    this.prepareContext(reserve || seq, maxNew, { prefillSeq: seq });
 
     /* Upload transposed: the prefill kernels want [dim][seqPad]. One staging
      * array and one writeBuffer - issuing a call per dim measured seconds of

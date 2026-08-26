@@ -33,6 +33,11 @@ void qwen_set_partial_callback(qwen_ctx_t *ctx, qwen_partial_cb cb, void *userda
     ctx->partial_cb_userdata = userdata;
 }
 
+void qwen_set_encoder_hook(qwen_ctx_t *ctx, qwen_encoder_hook fn, void *userdata) {
+    ctx->encoder_hook = fn;
+    ctx->encoder_hook_userdata = userdata;
+}
+
 static const char *QWEN_SUPPORTED_LANGUAGES[] = {
     "Chinese", "English", "Cantonese", "Arabic", "German", "French",
     "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
@@ -2513,6 +2518,23 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                         plen += n;
                         ptext[plen] = '\0';
                     }
+                }
+                /* The tail is a cut through a token sequence, and byte-level
+                 * BPE means a token can be part of a character - a Japanese
+                 * glyph spans two or three. Dropping a trailing incomplete
+                 * sequence keeps the guess from ending in replacement
+                 * characters; the next chunk brings the rest. */
+                while (plen > 0) {
+                    size_t lead = plen - 1;
+                    while (lead > 0 && (ptext[lead] & 0xC0) == 0x80) lead--;
+                    unsigned char c = (unsigned char)ptext[lead];
+                    size_t need = (c < 0x80) ? 1 :
+                                  ((c & 0xE0) == 0xC0) ? 2 :
+                                  ((c & 0xF0) == 0xE0) ? 3 :
+                                  ((c & 0xF8) == 0xF0) ? 4 : 1;
+                    if (lead + need <= plen) break;
+                    plen = lead;
+                    ptext[plen] = '\0';
                 }
                 ctx->partial_cb(ptext, ctx->partial_cb_userdata);
                 free(ptext);

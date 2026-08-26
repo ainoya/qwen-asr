@@ -212,6 +212,19 @@ typedef void (*qwen_token_cb)(const char *piece, void *userdata);
  * or disappear. An empty string means there is nothing provisional. */
 typedef void (*qwen_partial_cb)(const char *text, void *userdata);
 
+/* Run the audio tower somewhere else.
+ *
+ * Streaming re-encodes its tail window every chunk, which measurement puts at
+ * the bulk of the per-chunk cost - halving the window took a 41s clip from
+ * 139 s to 69 s. Moving that work to a GPU is worth more than any tuning of
+ * the window, but the streaming loop is C and WebGPU is asynchronous, so the
+ * loop asks through this hook rather than calling the encoder directly.
+ *
+ * Returns a malloc'd [*out_seq_len][enc_output_dim] the caller frees, or NULL
+ * to fall back to the built-in encoder. */
+typedef float *(*qwen_encoder_hook)(void *userdata, const float *mel,
+                                    int mel_frames, int *out_seq_len);
+
 /* ========================================================================
  * Main Context
  * ======================================================================== */
@@ -254,6 +267,8 @@ typedef struct {
     void *token_cb_userdata;
     qwen_partial_cb partial_cb;
     void *partial_cb_userdata;
+    qwen_encoder_hook encoder_hook;
+    void *encoder_hook_userdata;
 
     /* Segmentation settings */
     float segment_sec;             /* 0 = no splitting, default full-audio decode */
@@ -329,6 +344,9 @@ void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata);
 
 /* Streaming only. See qwen_partial_cb. */
 void qwen_set_partial_callback(qwen_ctx_t *ctx, qwen_partial_cb cb, void *userdata);
+
+/* See qwen_encoder_hook. Applies to every path that runs the audio tower. */
+void qwen_set_encoder_hook(qwen_ctx_t *ctx, qwen_encoder_hook fn, void *userdata);
 
 /* Set optional system prompt text (UTF-8). Pass NULL or "" to clear.
  * Returns 0 on success, -1 on allocation/encoding errors. */

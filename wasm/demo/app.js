@@ -21,6 +21,8 @@ let sampleBuf = 0;
 let sampleCap = 0;
 let poller = null;
 let gpu = null, encoder = null;
+/* Exposed so the harness can read hook counters without a rebuild. */
+if (typeof window !== "undefined") window.__asr = () => ({ gpu, encoder, Module });
 
 function log(msg, cls) {
   const d = document.createElement("div");
@@ -108,6 +110,13 @@ function sendSettings() {
   Module._qwen_wasm_release(lp);
   Module._qwen_wasm_set_segment_sec(Number($("seg").value) || 0);
   Module._qwen_wasm_set_batch_size(Number($("batch").value) || 1);
+  /* Streaming re-encodes its window every chunk, which is the bulk of the
+   * per-chunk cost, so route it to the GPU whenever there is one. This is not
+   * tied to the decoder dropdown: streaming always decodes in wasm, because
+   * the GPU decoder prefills from an empty cache and cannot take the loop's
+   * incremental prefix. */
+  Module._qwen_wasm_set_gpu_encoder(encoder ? 1 : 0);
+  Module._qwen_wasm_set_past_text(1);
   Module._qwen_wasm_set_stream_params(Number($("chunk").value) || 0, 32,
                                       Number($("encwin").value) || 0);
 }
@@ -194,6 +203,26 @@ $("load").onclick = async () => {
           await e.init(() => {});
           encoder = e;
           log(`GPU audio tower ready (${(e.weightBytes / 1e6).toFixed(0)} MB)`);
+
+          /* The streaming loop runs on a worker and asks for the tower through
+           * this, because WebGPU is main-thread and asynchronous. Errors are
+           * reported as a failure so the loop falls back to the wasm encoder
+           * rather than stalling. */
+          Module.__gpuEncode = async (melPtr, frames) => {
+            try {
+              encoder.hookCalls = (encoder.hookCalls || 0) + 1;
+              const out = await encoder.runFromMel(melPtr, frames);
+              const p = P(Module._qwen_wasm_alloc(out.byteLength));
+              if (!p) throw new Error("out of wasm memory for the encoder output");
+              Module.HEAPF32.set(out, f32idx(p));
+              Module._qwen_wasm_enc_hook_done(p, encoder.tokens);
+            } catch (err) {
+              encoder.hookFails = (encoder.hookFails || 0) + 1;
+              if (encoder.hookFails <= 2)
+                log(`GPU tower failed mid-stream (${err.message}); falling back`, "err");
+              Module._qwen_wasm_enc_hook_done(0, 0);
+            }
+          };
         } catch (err) {
           log(`GPU audio tower unavailable (${err.message}); mel and the encoder stay on the cpu`, "err");
         }

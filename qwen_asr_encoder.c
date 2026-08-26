@@ -224,6 +224,21 @@ static void enc_tap_store(float **dst, const float *src, size_t n) {
 float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
                              int *out_seq_len) {
     double enc_t0 = enc_now_ms();
+
+    /* An external tower, if one is installed. Returning NULL means it could
+     * not run, so fall through and encode here. */
+    if (ctx->encoder_hook) {
+        int seq = 0;
+        float *out = ctx->encoder_hook(ctx->encoder_hook_userdata, mel, mel_frames, &seq);
+        if (out && seq > 0) {
+            qwen_enc_conv_ms = 0;
+            qwen_enc_layers_ms = enc_now_ms() - enc_t0;
+            *out_seq_len = seq;
+            return out;
+        }
+        free(out);
+    }
+
     const qwen_config_t *cfg = &ctx->config;
     qwen_encoder_t *enc = &ctx->encoder;
 

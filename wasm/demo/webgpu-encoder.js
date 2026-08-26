@@ -818,8 +818,20 @@ export class WebGPUEncoder {
     return { slot: ref.v, plan };
   }
 
-  /* mel in, [tokens][output_dim] out - the whole audio tower. */
+  /* mel in, [tokens][output_dim] out - the whole audio tower.
+   *
+   * Serialized: the streaming loop asks for this from a worker through a
+   * main-thread hop, and two overlapping requests would share one readback
+   * buffer and one set of activation regions. Queueing is what keeps a slow
+   * chunk from corrupting the next one. */
   async runFromMel(melPtr, melFrames) {
+    const mine = this._queue = Promise.resolve(this._queue).then(
+      () => this.runFromMelInner(melPtr, melFrames), () => this.runFromMelInner(melPtr, melFrames));
+    return mine;
+  }
+
+  async runFromMelInner(melPtr, melFrames) {
+    this.calls = (this.calls || 0) + 1;
     const cp = this.convPlan(melFrames);
     this.prepare(cp.tokens);
     this.uploadPE(cp);
@@ -976,9 +988,16 @@ export class WebGPUEncoder {
     await this.device.queue.onSubmittedWorkDone();
     this.runMs = performance.now() - t0;
 
+    /* Unmap even if the copy out throws: a buffer left mapped makes every
+     * later mapAsync fail with "already has an outstanding map pending", so
+     * one bad call would poison the encoder for the rest of the session. */
+    let flat;
     await this.readBuf.mapAsync(GPUMapMode.READ);
-    const flat = new Float32Array(this.readBuf.getMappedRange().slice(0));
-    this.readBuf.unmap();
+    try {
+      flat = new Float32Array(this.readBuf.getMappedRange().slice(0));
+    } finally {
+      this.readBuf.unmap();
+    }
 
     /* Back to [tokens][output_dim] for comparison with the C encoder. */
     const tokens = this.tokens;

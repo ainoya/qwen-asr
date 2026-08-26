@@ -23,6 +23,7 @@
 #include "../qwen_asr_kernels.h"
 
 #include <emscripten.h>
+#include <emscripten/threading.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -604,6 +605,68 @@ EMSCRIPTEN_KEEPALIVE float *qwen_wasm_enc_tap_ptr(void) { return qwen_enc_tap_co
 EMSCRIPTEN_KEEPALIVE float *qwen_wasm_enc_tap_out(void) { return qwen_enc_tap_out; }
 EMSCRIPTEN_KEEPALIVE int qwen_wasm_enc_tap_tokens(void) { return qwen_enc_tap_tokens; }
 
+
+
+/* ---- Audio tower on the GPU, called from the streaming thread ----
+ *
+ * The streaming loop runs on a pthread and WebGPU lives on the main thread and
+ * is asynchronous, so the two cannot simply call each other. The worker posts
+ * the request, then sleeps until the main thread's async continuation has
+ * written the result back and flipped a flag. Sleeping rather than spinning
+ * matters: the thread pool already spins hard, and a spinning stream thread on
+ * top of it starves the very workers the GPU path is trying to leave idle.
+ *
+ * If the main thread never answers - no tower installed, a GPU error, a page
+ * that stopped scheduling work - the wait gives up and the caller falls back
+ * to encoding on the CPU rather than hanging the stream.
+ */
+#define QWEN_ENC_HOOK_TIMEOUT_MS 20000
+
+static volatile int g_enc_hook_state = 0;   /* 0 idle, 1 pending, 2 done, 3 failed */
+static float *g_enc_hook_out = NULL;
+static int g_enc_hook_seq = 0;
+
+/* Called on the main thread when the GPU is finished. Takes ownership of buf. */
+EMSCRIPTEN_KEEPALIVE
+void qwen_wasm_enc_hook_done(float *buf, int seq_len) {
+    g_enc_hook_out = buf;
+    g_enc_hook_seq = seq_len;
+    __atomic_store_n(&g_enc_hook_state, (buf && seq_len > 0) ? 2 : 3, __ATOMIC_RELEASE);
+}
+
+static float *gpu_encoder_hook(void *ud, const float *mel, int mel_frames, int *out_seq_len) {
+    (void)ud;
+    g_enc_hook_out = NULL;
+    g_enc_hook_seq = 0;
+    __atomic_store_n(&g_enc_hook_state, 1, __ATOMIC_RELEASE);
+
+    MAIN_THREAD_ASYNC_EM_ASM({
+        if (Module.__gpuEncode) Module.__gpuEncode($0, $1);
+        else _qwen_wasm_enc_hook_done(0, 0);
+    }, (int)(uintptr_t)mel, mel_frames);
+
+    double t0 = emscripten_get_now();
+    for (;;) {
+        int st = __atomic_load_n(&g_enc_hook_state, __ATOMIC_ACQUIRE);
+        if (st >= 2) break;
+        if (emscripten_get_now() - t0 > QWEN_ENC_HOOK_TIMEOUT_MS) {
+            __atomic_store_n(&g_enc_hook_state, 3, __ATOMIC_RELEASE);
+            return NULL;
+        }
+        emscripten_thread_sleep(1);
+    }
+
+    if (__atomic_load_n(&g_enc_hook_state, __ATOMIC_ACQUIRE) != 2) return NULL;
+    *out_seq_len = g_enc_hook_seq;
+    return g_enc_hook_out;
+}
+
+/* Route the audio tower through Module.__gpuEncode (1) or back to wasm (0). */
+EMSCRIPTEN_KEEPALIVE
+void qwen_wasm_set_gpu_encoder(int on) {
+    if (!g_ctx) return;
+    qwen_set_encoder_hook(g_ctx, on ? gpu_encoder_hook : NULL, NULL);
+}
 
 /* ---- Audio tower on the GPU: mel here, encoder there, assembly back here ----
  *

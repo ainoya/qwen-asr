@@ -52,7 +52,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="../../qwen_asr")
     parser.add_argument("--model-dir", default="../../qwen3-asr-1.7b")
-    parser.add_argument("--weights", choices=("q8", "q8-lm", "bf16"), default="q8-lm")
+    parser.add_argument("--weights", choices=("q4", "q8", "q8-lm", "bf16"), default="q8-lm")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--profile", help="Only run one profile, such as kyoko_normal")
     parser.add_argument("--baseline", help="JSON result whose predictions are the differential reference")

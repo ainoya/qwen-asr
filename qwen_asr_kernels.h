@@ -78,13 +78,29 @@ void qwen_set_q8_batch_max(int n);
 #define QWEN_Q8_GROUP 16
 
 
+/* Block-quantized weights, 8 or 4 bits per value.
+ *
+ * At 4 bits a block of QWEN_Q8_BLOCK values is 32 bytes plus its f32 scale:
+ * 0.5625 B/weight against Q8's 1.0625. Token generation reads every decoder
+ * weight once, so that is close to a direct cut in decode time - which is why
+ * it is worth the accuracy cost, and why the tied LM head is left at 8 bits
+ * where it decides the token.
+ *
+ * Nibbles are packed so one 16-byte load yields two SIMD vectors: within a
+ * block, byte j holds value j in its low nibble and value j+32 in its high
+ * nibble. Values are stored biased by 8, so a raw nibble of 0..15 means
+ * -8..7 and the dot product needs no correction term. */
 typedef struct {
-    int8_t *q;        /* [rows * cols], row-major                */
+    int8_t *q;        /* [rows * cols] int8, or [rows * cols / 2] nibbles */
     float  *scales;   /* [rows * cols / QWEN_Q8_BLOCK]           */
     int rows;
     int cols;         /* must be a multiple of QWEN_Q8_BLOCK     */
     int owns;         /* 0 when q/scales point into a mapped model file */
+    int bits;         /* 4, or anything else for 8               */
 } qwen_q8_mat_t;
+
+/* True when the matrix is stored as nibbles. */
+#define QWEN_IS_Q4(m) ((m)->bits == 4)
 
 /* Point a matrix at pre-quantized data owned by someone else (a packed model
  * file). qwen_q8_free() will not release it. */
@@ -117,6 +133,19 @@ int qwen_q8_from_bf16_interleave2(qwen_q8_mat_t *m, const uint16_t *A,
                                   const uint16_t *B, int rows_each, int cols);
 
 void qwen_q8_free(qwen_q8_mat_t *m);
+
+/* Re-quantize an 8-bit matrix down to 4 bits, in place of `src`. The caller
+ * keeps `src` (it may point into a mapped file); `dst` owns its buffers.
+ * Requantizing from Q8 rather than the original bf16 costs almost nothing: the
+ * block scale is already right and only the 16-level grid matters. */
+int qwen_q4_from_q8(qwen_q8_mat_t *dst, const qwen_q8_mat_t *src);
+
+/* Quantize a row-major bf16 weight matrix to 4 bits. */
+int qwen_q4_from_bf16(qwen_q8_mat_t *m, const uint16_t *W_bf16, int rows, int cols);
+
+/* Same, fusing two matrices by interleaving rows (see the Q8 version). */
+int qwen_q4_from_bf16_interleave2(qwen_q8_mat_t *m, const uint16_t *A,
+                                  const uint16_t *B, int rows_each, int cols);
 
 /* Total bytes held by a quantized matrix (for reporting). */
 size_t qwen_q8_bytes(const qwen_q8_mat_t *m);

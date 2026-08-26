@@ -183,6 +183,7 @@ typedef struct {
  *   QWEN_WEIGHTS_BF16   everything straight out of the bf16 mmap
  *   QWEN_WEIGHTS_Q8     transformer layers Q8, tied embedding / LM head bf16
  *   QWEN_WEIGHTS_Q8_LM  the LM head is Q8 as well
+ *   QWEN_WEIGHTS_Q4     transformer layers 4-bit, LM head Q8
  *
  * The default is q8-lm. It is output-identical to bf16 on the 1.7B model across
  * the whole regression suite, which is the model this engine is tuned for. On
@@ -192,6 +193,9 @@ typedef struct {
 #define QWEN_WEIGHTS_BF16  0
 #define QWEN_WEIGHTS_Q8    1
 #define QWEN_WEIGHTS_Q8_LM 2
+/* Transformer layers at 4 bits, tied embedding / LM head still Q8. The head
+ * decides the token and 4 bits there is where quality goes first. */
+#define QWEN_WEIGHTS_Q4    3
 extern int qwen_weight_quant;
 
 /* ========================================================================

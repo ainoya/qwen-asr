@@ -175,9 +175,11 @@ int main(int argc, char **argv) {
                 qwen_weight_quant = QWEN_WEIGHTS_Q8_LM;
             } else if (strcmp(w, "bf16") == 0) {
                 qwen_weight_quant = QWEN_WEIGHTS_BF16;
+            } else if (strcmp(w, "q4") == 0) {
+                qwen_weight_quant = QWEN_WEIGHTS_Q4;
             } else {
                 fprintf(stderr,
-                        "Error: --weights must be q8, q8-lm or bf16, got '%s'\n", w);
+                        "Error: --weights must be q4, q8, q8-lm or bf16, got '%s'\n", w);
                 return 1;
             }
         } else if (strcmp(argv[i], "--pack-q8") == 0 && i + 1 < argc) {

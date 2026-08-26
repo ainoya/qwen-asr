@@ -62,6 +62,18 @@ static uint16_t *load_bf16_direct(multi_safetensors_t *ms, const char *name) {
     return safetensors_get_bf16_direct(sf, t);
 }
 
+/* Narrow one already-quantized matrix to 4 bits. Requantizing from Q8 rather
+ * than from the original bf16 costs almost nothing at this width: the block
+ * scale is already correct and only the 16-level grid matters. Doing it this
+ * way means the packed-image and bf16 load paths share one conversion. */
+static int narrow_to_q4(qwen_q8_mat_t *m) {
+    qwen_q8_mat_t q4;
+    if (qwen_q4_from_q8(&q4, m) != 0) return -1;
+    if (m->owns) qwen_q8_free(m);   /* only free a copy we made ourselves */
+    *m = q4;
+    return 0;
+}
+
 int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
                        const qwen_config_t *cfg) {
     char name[512];
@@ -72,6 +84,7 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
         if (strcmp(wenv, "bf16") == 0) mode = QWEN_WEIGHTS_BF16;
         else if (strcmp(wenv, "q8") == 0) mode = QWEN_WEIGHTS_Q8;
         else if (strcmp(wenv, "q8-lm") == 0) mode = QWEN_WEIGHTS_Q8_LM;
+        else if (strcmp(wenv, "q4") == 0) mode = QWEN_WEIGHTS_Q4;
     }
     int use_q8 = (mode != QWEN_WEIGHTS_BF16);
     /* Q8 blocks require the contraction dimension to be a multiple of
@@ -93,7 +106,8 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
         }
     }
 
-    int use_q8_embed = use_q8 && mode == QWEN_WEIGHTS_Q8_LM;
+    int use_q8_embed = use_q8 && (mode == QWEN_WEIGHTS_Q8_LM || mode == QWEN_WEIGHTS_Q4);
+    int use_q4_layers = (mode == QWEN_WEIGHTS_Q4);
 
     dec->quantized = use_q8;
     dec->embed_quantized = use_q8_embed;
@@ -154,6 +168,10 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
                     fprintf(stderr, "decoder: packed model missing %s.q8\n", name);
                     return -1;
                 }
+                if (use_q4_layers && narrow_to_q4(q8[k].dst) != 0) {
+                    fprintf(stderr, "decoder: 4-bit conversion failed for %s\n", name);
+                    return -1;
+                }
                 q8_bytes += qwen_q8_bytes(q8[k].dst);
             }
             continue;
@@ -202,6 +220,16 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
                     qwen_q8_from_bf16(&l->down_q8, l->down_weight_bf16, hidden, inter) != 0) {
                     fprintf(stderr, "decoder: quantization failed at layer %d\n", i);
                     return -1;
+                }
+                if (use_q4_layers) {
+                    qwen_q8_mat_t *all[] = { &l->wq_q8, &l->wk_q8, &l->wv_q8,
+                                             &l->wo_q8, &l->gate_up_q8, &l->down_q8 };
+                    for (size_t k = 0; k < sizeof(all) / sizeof(all[0]); k++) {
+                        if (narrow_to_q4(all[k]) != 0) {
+                            fprintf(stderr, "decoder: 4-bit conversion failed at layer %d\n", i);
+                            return -1;
+                        }
+                    }
                 }
                 q8_bytes += qwen_q8_bytes(&l->wq_q8) + qwen_q8_bytes(&l->wk_q8) +
                             qwen_q8_bytes(&l->wv_q8) + qwen_q8_bytes(&l->wo_q8) +

@@ -883,6 +883,9 @@ static inline float q8_bf16_to_f32(uint16_t h) {
 }
 
 size_t qwen_q8_bytes(const qwen_q8_mat_t *m) {
+    if (QWEN_IS_Q4(m))
+        return (size_t)m->rows * m->cols / 2 +
+               (size_t)m->rows * (m->cols / QWEN_Q8_BLOCK) * sizeof(float);
     if (!m || !m->q) return 0;
     size_t n = (size_t)m->rows * m->cols;
     return n + (n / QWEN_Q8_BLOCK) * sizeof(float);
@@ -906,6 +909,7 @@ void qwen_q8_attach(qwen_q8_mat_t *m, int8_t *q, float *scales, int rows, int co
     m->rows = rows;
     m->cols = cols;
     m->owns = 0;
+    m->bits = 8;
 }
 
 void qwen_wmat_free(qwen_wmat_t *w) {
@@ -984,6 +988,7 @@ static int q8_alloc(qwen_q8_mat_t *m, int rows, int cols) {
     m->rows = rows;
     m->cols = cols;
     m->owns = 1;
+    m->bits = 8;
     return 0;
 }
 
@@ -1002,8 +1007,157 @@ int qwen_q8_from_bf16_interleave2(qwen_q8_mat_t *m, const uint16_t *A,
     return 0;
 }
 
+
+/* ---- 4-bit weights ----
+ *
+ * Same block size and scale layout as Q8; only the payload changes. Within a
+ * block, byte j carries value j in its low nibble and value j+32 in its high,
+ * biased by 8, so one 16-byte load unpacks straight into two SIMD vectors and
+ * the dot product needs no correction term. See qwen_asr_kernels.h. */
+
+#define Q4_HALF (QWEN_Q8_BLOCK / 2)
+
+static int q4_alloc(qwen_q8_mat_t *m, int rows, int cols) {
+    if (cols % QWEN_Q8_BLOCK) return -1;
+    size_t nq = (size_t)rows * cols / 2;
+    size_t ns = (size_t)rows * (cols / QWEN_Q8_BLOCK);
+    m->q = (int8_t *)malloc(nq);
+    m->scales = (float *)malloc(ns * sizeof(float));
+    m->rows = rows;
+    m->cols = cols;
+    m->owns = 1;
+    m->bits = 4;
+    if (!m->q || !m->scales) { qwen_q8_free(m); return -1; }
+    return 0;
+}
+
+/* Quantize one block of already-dequantized values. */
+static void q4_pack_block(int8_t *dst, float *scale_out, const float *w) {
+    float amax = 0.0f;
+    for (int i = 0; i < QWEN_Q8_BLOCK; i++) {
+        float a = fabsf(w[i]);
+        if (a > amax) amax = a;
+    }
+    /* amax/8 rather than amax/7: -8 is representable, so all 16 levels are
+     * used. One extra level is 12% more resolution, which is not nothing at
+     * four bits. */
+    float scale = amax / 8.0f;
+    float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+    *scale_out = scale;
+    for (int j = 0; j < Q4_HALF; j++) {
+        int lo = (int)lrintf(w[j] * inv);
+        int hi = (int)lrintf(w[j + Q4_HALF] * inv);
+        if (lo < -8) lo = -8; else if (lo > 7) lo = 7;
+        if (hi < -8) hi = -8; else if (hi > 7) hi = 7;
+        dst[j] = (int8_t)(((lo + 8) & 0x0F) | (((hi + 8) & 0x0F) << 4));
+    }
+}
+
+int qwen_q4_from_q8(qwen_q8_mat_t *dst, const qwen_q8_mat_t *src) {
+    if (!src->q || QWEN_IS_Q4(src)) return -1;
+    if (q4_alloc(dst, src->rows, src->cols) != 0) return -1;
+    int nb = src->cols / QWEN_Q8_BLOCK;
+    float blk[QWEN_Q8_BLOCK];
+    for (int r = 0; r < src->rows; r++) {
+        const int8_t *q = src->q + (size_t)r * src->cols;
+        const float *s = src->scales + (size_t)r * nb;
+        for (int b = 0; b < nb; b++) {
+            float sc = s[b];
+            const int8_t *qb = q + b * QWEN_Q8_BLOCK;
+            for (int i = 0; i < QWEN_Q8_BLOCK; i++) blk[i] = (float)qb[i] * sc;
+            q4_pack_block(dst->q + ((size_t)r * nb + b) * Q4_HALF,
+                          &dst->scales[(size_t)r * nb + b], blk);
+        }
+    }
+    return 0;
+}
+
+static float bf16_to_f32_(uint16_t h) {
+    uint32_t bits = ((uint32_t)h) << 16;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+int qwen_q4_from_bf16(qwen_q8_mat_t *m, const uint16_t *W_bf16, int rows, int cols) {
+    if (q4_alloc(m, rows, cols) != 0) return -1;
+    int nb = cols / QWEN_Q8_BLOCK;
+    float blk[QWEN_Q8_BLOCK];
+    for (int r = 0; r < rows; r++) {
+        const uint16_t *w = W_bf16 + (size_t)r * cols;
+        for (int b = 0; b < nb; b++) {
+            for (int i = 0; i < QWEN_Q8_BLOCK; i++)
+                blk[i] = bf16_to_f32_(w[b * QWEN_Q8_BLOCK + i]);
+            q4_pack_block(m->q + ((size_t)r * nb + b) * Q4_HALF,
+                          &m->scales[(size_t)r * nb + b], blk);
+        }
+    }
+    return 0;
+}
+
+int qwen_q4_from_bf16_interleave2(qwen_q8_mat_t *m, const uint16_t *A,
+                                  const uint16_t *B, int rows_each, int cols) {
+    if (q4_alloc(m, rows_each * 2, cols) != 0) return -1;
+    int nb = cols / QWEN_Q8_BLOCK;
+    float blk[QWEN_Q8_BLOCK];
+    for (int r = 0; r < rows_each; r++) {
+        for (int half = 0; half < 2; half++) {
+            const uint16_t *w = (half ? B : A) + (size_t)r * cols;
+            int dr = r * 2 + half;
+            for (int b = 0; b < nb; b++) {
+                for (int i = 0; i < QWEN_Q8_BLOCK; i++)
+                    blk[i] = bf16_to_f32_(w[b * QWEN_Q8_BLOCK + i]);
+                q4_pack_block(m->q + ((size_t)dr * nb + b) * Q4_HALF,
+                              &m->scales[(size_t)dr * nb + b], blk);
+            }
+        }
+    }
+    return 0;
+}
+
 void qwen_q8_row_to_f32(float *dst, const qwen_q8_mat_t *m, int row) {
     int nb = m->cols / QWEN_Q8_BLOCK;
+    if (QWEN_IS_Q4(m)) {
+        /* Every path that dequantizes a whole matrix - the prefill panel, the
+         * embedding lookup - comes through here, so 4-bit needs no separate
+         * plumbing anywhere else. */
+        const int8_t *q = m->q + (size_t)row * (m->cols / 2);
+        const float *s = m->scales + (size_t)row * nb;
+        for (int b = 0; b < nb; b++) {
+            float sc = s[b];
+            const uint8_t *qb = (const uint8_t *)q + b * Q4_HALF;
+            float *db = dst + b * QWEN_Q8_BLOCK;
+#if defined(__ARM_NEON)
+            /* This is the prefill path's only route to f32, so a scalar loop
+             * here shows up directly as slower prefill - measured at 29% on a
+             * 41s clip before this was vectorized. */
+            float32x4_t scv = vdupq_n_f32(sc);
+            const uint8x16_t mask = vdupq_n_u8(0x0F);
+            const int8x16_t bias = vdupq_n_s8(8);
+            for (int j = 0; j < Q4_HALF; j += 16) {
+                uint8x16_t raw = vld1q_u8(qb + j);
+                int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask)), bias);
+                int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), bias);
+                const int8x16_t parts[2] = { lo, hi };
+                for (int h = 0; h < 2; h++) {
+                    int16x8_t w0 = vmovl_s8(vget_low_s8(parts[h]));
+                    int16x8_t w1 = vmovl_s8(vget_high_s8(parts[h]));
+                    float *o = db + j + h * Q4_HALF;
+                    vst1q_f32(o,     vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))),  scv));
+                    vst1q_f32(o + 4, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))), scv));
+                    vst1q_f32(o + 8, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))),  scv));
+                    vst1q_f32(o + 12,vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1))), scv));
+                }
+            }
+#else
+            for (int j = 0; j < Q4_HALF; j++) {
+                db[j]           = (float)((qb[j] & 0x0F) - 8) * sc;
+                db[j + Q4_HALF] = (float)((qb[j] >> 4) - 8) * sc;
+            }
+#endif
+        }
+        return;
+    }
     const int8_t *q = m->q + (size_t)row * m->cols;
     const float *s = m->scales + (size_t)row * nb;
     for (int b = 0; b < nb; b++) {
@@ -1193,6 +1347,26 @@ static void q8_dequant_worker(int tid, int n_threads, void *arg) {
         qwen_q8_row_to_f32(t->dst + (size_t)r * t->W->cols, t->W, t->row0 + r);
 }
 
+static void q4_matvec_worker(int tid, int n_threads, void *arg) {
+    (void)tid;
+    q8_matvec_task_t *t = (q8_matvec_task_t *)arg;
+    const qwen_q8_mat_t *W = t->W;
+    int nb = W->cols / QWEN_Q8_BLOCK;
+    int chunk = qwen_chunk_size(W->rows, n_threads, 32);
+
+    for (int c = qwen_claim_chunk(); ; c = qwen_claim_chunk()) {
+        int start = c * chunk;
+        if (start >= W->rows) return;
+        int end = start + chunk;
+        if (end > W->rows) end = W->rows;
+
+        qwen_q4_matvec_impl(t->y + start, t->qx, t->sx,
+                            W->q + (size_t)start * (W->cols / 2),
+                            W->scales + (size_t)start * nb,
+                            W->cols, end - start);
+    }
+}
+
 static void q8_linear_prefill(float *y, const float *x, const qwen_q8_mat_t *W,
                               int seq_len) {
     int cols = W->cols;
@@ -1272,6 +1446,20 @@ void qwen_linear_nobias_q8(float *y, const float *x, const qwen_q8_mat_t *W,
      * batched matvec moves 1.06. Crossover measured near 500 rows on M1 Pro
      * (where sgemm on AMX finally outruns SDOT); the default is set well below
      * it so a full-audio prefill still takes the sgemm path. */
+    /* 4 bits: the single-row matvec is the whole point (generation reads every
+     * weight once per token). Longer sequences fall to the panel path, which
+     * dequantizes through qwen_q8_row_to_f32 and so needs no 4-bit variant. */
+    if (QWEN_IS_Q4(W)) {
+        if (seq_len == 1) {
+            if (q8_act_prepare(x, W->cols) != 0) return;
+            q8_matvec_task_t task = { y, q8_act_q, q8_act_s, W };
+            parallel_for(q4_matvec_worker, &task);
+            return;
+        }
+        q8_linear_prefill(y, x, W, seq_len);
+        return;
+    }
+
     if (seq_len > 1 && seq_len <= qwen_q8_batch_max()) {
         if (q8_act_prepare_m(x, W->cols, seq_len) != 0) return;
         q8_matvec_m_task_t task = { y, W->rows, q8_act_q, q8_act_s, seq_len, W };
@@ -1318,10 +1506,17 @@ static void q8_qkv_worker(int tid, int n_threads, void *arg) {
             if (hi > W->rows) hi = W->rows;
             if (lo < hi) {
                 int nb = W->cols / QWEN_Q8_BLOCK;
-                qwen_q8_matvec_impl(t->y[m] + lo, t->qx, t->sx,
-                                    W->q + (size_t)lo * W->cols,
-                                    W->scales + (size_t)lo * nb,
-                                    W->cols, hi - lo);
+                if (QWEN_IS_Q4(W)) {
+                    qwen_q4_matvec_impl(t->y[m] + lo, t->qx, t->sx,
+                                        W->q + (size_t)lo * (W->cols / 2),
+                                        W->scales + (size_t)lo * nb,
+                                        W->cols, hi - lo);
+                } else {
+                    qwen_q8_matvec_impl(t->y[m] + lo, t->qx, t->sx,
+                                        W->q + (size_t)lo * W->cols,
+                                        W->scales + (size_t)lo * nb,
+                                        W->cols, hi - lo);
+                }
             }
             base += W->rows;
         }

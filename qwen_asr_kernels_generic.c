@@ -188,3 +188,28 @@ void qwen_q8_matvec_m_generic(float *y, int ldy, const int8_t *qx, const float *
         off += take;
     }
 }
+
+/* 4-bit weights. Byte j of a block carries value j in its low nibble and
+ * value j+32 in its high, both biased by 8. */
+void qwen_q4_matvec_generic(float *y, const int8_t *qx, const float *sx,
+                            const int8_t *W, const float *ws,
+                            int in_dim, int rows) {
+    int nb = in_dim / Q8B;
+    int half = Q8B / 2;
+    for (int o = 0; o < rows; o++) {
+        const unsigned char *w = (const unsigned char *)W + (size_t)o * (in_dim / 2);
+        const float *s = ws + (size_t)o * nb;
+        float acc = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            const unsigned char *wb = w + (size_t)b * half;
+            const int8_t *xb = qx + (size_t)b * Q8B;
+            int32_t d = 0;
+            for (int j = 0; j < half; j++) {
+                d += ((int32_t)(wb[j] & 0x0F) - 8) * (int32_t)xb[j];
+                d += ((int32_t)(wb[j] >> 4) - 8) * (int32_t)xb[j + half];
+            }
+            acc += (float)d * s[b] * sx[b];
+        }
+        y[o] = acc;
+    }
+}

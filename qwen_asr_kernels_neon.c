@@ -476,3 +476,53 @@ void qwen_q8_matvec_m_neon(float *y, int ldy, const int8_t *qx, const float *sx,
 }
 
 #endif /* __ARM_NEON */
+
+/* 4-bit weights: one 16-byte load unpacks into two int8x16 vectors, so the
+ * weight traffic halves while the SDOT count stays the same. That is the whole
+ * point - generation reads every weight once per token and is bound by those
+ * bytes, not by the arithmetic. */
+void qwen_q4_matvec_neon(float *y, const int8_t *qx, const float *sx,
+                         const int8_t *W, const float *ws,
+                         int in_dim, int rows) {
+    int nb = in_dim / Q8B;
+    int half = Q8B / 2;
+#ifdef __ARM_FEATURE_DOTPROD
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    const int8x16_t bias = vdupq_n_s8(8);
+#endif
+    for (int o = 0; o < rows; o++) {
+        const int8_t *w = W + (size_t)o * (in_dim / 2);
+        const float *s = ws + (size_t)o * nb;
+#ifdef __ARM_FEATURE_DOTPROD
+        float32x4_t accf = vdupq_n_f32(0.0f);
+        for (int b = 0; b < nb; b++) {
+            const int8_t *wb = w + (size_t)b * half;
+            const int8_t *xb = qx + (size_t)b * Q8B;
+            int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+            for (int j = 0; j < half; j += 16) {
+                uint8x16_t raw = vld1q_u8((const uint8_t *)(wb + j));
+                int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask)), bias);
+                int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), bias);
+                a0 = vdotq_s32(a0, lo, vld1q_s8(xb + j));
+                a1 = vdotq_s32(a1, hi, vld1q_s8(xb + half + j));
+            }
+            float32x4_t f = vcvtq_f32_s32(vaddq_s32(a0, a1));
+            accf = vfmaq_n_f32(accf, f, s[b] * sx[b]);
+        }
+        y[o] = vaddvq_f32(accf);
+#else
+        float acc = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            const unsigned char *wb = (const unsigned char *)w + (size_t)b * half;
+            const int8_t *xb = qx + (size_t)b * Q8B;
+            int32_t d = 0;
+            for (int j = 0; j < half; j++) {
+                d += ((int32_t)(wb[j] & 0x0F) - 8) * (int32_t)xb[j];
+                d += ((int32_t)(wb[j] >> 4) - 8) * (int32_t)xb[j + half];
+            }
+            acc += (float)d * s[b] * sx[b];
+        }
+        y[o] = acc;
+#endif
+    }
+}

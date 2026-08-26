@@ -29,7 +29,7 @@ mkdir -p "$OUT"
 SRCS="qwen_asr.c qwen_asr_kernels.c qwen_asr_kernels_generic.c \
 qwen_asr_kernels_neon.c qwen_asr_kernels_avx.c qwen_asr_kernels_wasm.c qwen_asr_audio.c \
 qwen_asr_encoder.c qwen_asr_decoder.c qwen_asr_tokenizer.c \
-qwen_asr_safetensors.c qwen_asr_pack.c wasm/qwen_wasm.c"
+qwen_asr_safetensors.c qwen_asr_pack.c qwen_asr_calib.c wasm/qwen_wasm.c"
 
 EXPORTS='["_qwen_wasm_alloc","_qwen_wasm_release","_qwen_wasm_init","_qwen_wasm_ready","_qwen_wasm_threads","_qwen_wasm_pool_selftest","_qwen_wasm_pool_parts","_qwen_wasm_pool_ms","_qwen_wasm_shutdown","_qwen_wasm_selftest_start","_qwen_wasm_selftest_value",
 "_qwen_wasm_batch_start","_qwen_wasm_job_done","_qwen_wasm_job_take","_qwen_wasm_take_text","_qwen_wasm_set_language",

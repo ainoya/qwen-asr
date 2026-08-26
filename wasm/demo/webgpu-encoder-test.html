@@ -24,7 +24,8 @@ key against the weights already resident; <code>await runAll()</code> re-checks.
 
 <p>
   <button id="load">Load model + weights</button>
-  <button id="run" disabled>Check all samples</button>
+  <button id="run" disabled>Check transformer half</button>
+  <button id="runfull" disabled>Check whole tower (from mel)</button>
 </p>
 <pre id="out">idle</pre>
 
@@ -88,6 +89,7 @@ document.getElementById("load").onclick = async () => {
     say("wasm ready (weights attached; no inference will run here)");
     await reload();
     document.getElementById("run").disabled = false;
+    document.getElementById("runfull").disabled = false;
   } catch (e) {
     say("error: " + e.message);
     console.error(e);
@@ -108,6 +110,46 @@ function compare(got, want) {
 }
 
 let running = false;
+
+/* The whole tower: mel in, encoder output out, conv stem included. */
+async function runFull() {
+  if (running) throw new Error("a run is already in flight");
+  running = true;
+  try {
+    golden = await (await fetch(`./golden/index.json?v=${Date.now()}`)).json();
+    const samples = golden.samples.filter((s) => s.encTokens && s.melFrames);
+    say(`\ngolden set: ${samples.length} samples with mel taps`);
+    let pass = 0;
+    for (const s of samples) {
+      await until(() => true);
+      try {
+        const mel = new Float32Array(await (await fetch(`./golden/${s.name}.mel.f32`)).arrayBuffer());
+        const want = new Float32Array(await (await fetch(`./golden/${s.name}.encout.f32`)).arrayBuffer());
+        if (mel.length !== 128 * s.melFrames) throw new Error("mel size");
+        const ptr = P(M._qwen_wasm_alloc(mel.byteLength));
+        M.HEAPF32.set(mel, ptr / 4);
+        const got = await enc.runFromMel(ptr, s.melFrames);
+        M._qwen_wasm_release(ptr);
+        if (enc.tokens !== s.encTokens)
+          throw new Error(`token count ${enc.tokens}, expected ${s.encTokens}`);
+        const c = compare(got, want);
+        const ok = c.rel < 2e-3;
+        if (ok) pass++;
+        say(`[${ok ? " OK " : "FAIL"}] ${s.name}  mel=${s.melFrames} tokens=${enc.tokens} ` +
+            `${enc.runMs.toFixed(0)}ms  rel ${c.rel.toExponential(2)} worst ${c.worst.toExponential(2)}`);
+      } catch (e) {
+        say(`[ERR ] ${s.name}: ${e.message}`);
+      }
+    }
+    const line = `whole tower: ${pass}/${samples.length} within 2e-3 relative error`;
+    say("\n" + line);
+    return line;
+  } finally {
+    running = false;
+  }
+}
+window.runFull = runFull;
+
 async function runAll() {
   if (running) throw new Error("a run is already in flight");
   running = true;
@@ -155,6 +197,12 @@ document.getElementById("run").onclick = async () => {
   document.getElementById("run").disabled = true;
   await runAll().catch((e) => say("error: " + e.message));
   document.getElementById("run").disabled = false;
+};
+
+document.getElementById("runfull").onclick = async () => {
+  document.getElementById("runfull").disabled = true;
+  await runFull().catch((e) => say("error: " + e.message));
+  document.getElementById("runfull").disabled = false;
 };
 </script>
 </body>

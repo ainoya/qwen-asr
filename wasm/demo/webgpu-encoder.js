@@ -276,12 +276,187 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 }
 `;
 
-export { HEADER, LN_WGSL, MATMUL_WGSL, ATTN_WGSL,
+export { HEADER, LN_WGSL, MATMUL_WGSL, ATTN_WGSL, CONV_WGSL, RESHAPE_WGSL, ADD_WGSL,
          E_CONV1, E_CONV1_B, E_CONV2, E_CONV2_B, E_CONV3, E_CONV3_B, E_CONV_OUT,
          E_ATTN_NORM_W, E_ATTN_NORM_B, E_Q, E_Q_B, E_K, E_K_B, E_V, E_V_B,
          E_O, E_O_B, E_FFN_NORM_W, E_FFN_NORM_B, E_FC1, E_FC1_B, E_FC2, E_FC2_B,
          E_LN_POST_W, E_LN_POST_B, E_PROJ1, E_PROJ1_B, E_PROJ2, E_PROJ2_B,
          PARAM_STRIDE, PARAM_FIELDS, F_GELU, F_RESIDUAL };
+
+
+/* ---- Conv2D stem ----
+ *
+ * The three stem layers are 3x3, stride 2, pad 1, and the C encoder runs them
+ * as im2col plus a GEMM. Materializing the im2col matrix here would cost 55 MB
+ * per chunk group for the second layer, so instead this is the same tiled GEMM
+ * with the activation tile *gathered*: the tile loader turns a (K, column)
+ * pair into (in_channel, tap) and (batch, out_row, out_col) and reads the
+ * input pixel directly. Same arithmetic, no intermediate buffer.
+ *
+ * The kernels are f32, not Q8 - that is how the model stores them - so the
+ * weight tile comes from `vecs` rather than quants/scales.
+ *
+ * Layout for a stem stage is [channel][batch * h * w], with P.stride the
+ * padded column count.
+ *
+ *   wordBase  f32 weight base        scaleBase input row stride
+ *   rows      out channels           cols      in_channels * 9
+ *   p0        input h                p1        input w
+ *   vecA      bias base              flags     F_GELU
+ */
+const CONV_WGSL = HEADER + `
+const TR : u32 = 128u;
+const TS : u32 = 64u;
+const TK : u32 = 16u;
+
+var<workgroup> ws : array<f32, 2048>;
+var<workgroup> xs : array<f32, 1024>;
+
+fn store_one(row : u32, sq : u32, val : f32) {
+  if (sq >= P.n) { return; }
+  var v = val + vecs[P.vecA + row];
+  if ((P.flags & 1u) != 0u) { v = gelu(v); }
+  act[P.yOff + row * P.stride + sq] = v;
+}
+
+fn store_row(row : u32, sq0 : u32, v : vec4<f32>) {
+  if (row >= P.rows) { return; }
+  store_one(row, sq0, v.x);
+  store_one(row, sq0 + 1u, v.y);
+  store_one(row, sq0 + 2u, v.z);
+  store_one(row, sq0 + 3u, v.w);
+}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  let hIn = P.p0;
+  let wIn = P.p1;
+  let hOut = (hIn - 1u) / 2u + 1u;
+  let wOut = (wIn - 1u) / 2u + 1u;
+  let plane = hOut * wOut;
+
+  let r0 = wid.y * TR;
+  let s0 = wid.x * TS;
+  let tid = lid.y * 16u + lid.x;
+  let wb = lid.y * 8u;
+  let xb = lid.x * 4u;
+
+  var a0 = vec4<f32>(0.0); var a1 = vec4<f32>(0.0);
+  var a2 = vec4<f32>(0.0); var a3 = vec4<f32>(0.0);
+  var a4 = vec4<f32>(0.0); var a5 = vec4<f32>(0.0);
+  var a6 = vec4<f32>(0.0); var a7 = vec4<f32>(0.0);
+
+  var kb : u32 = 0u;
+  loop {
+    if (kb >= P.cols) { break; }
+
+    /* Weight tile, straight f32. */
+    for (var t = 0u; t < 8u; t = t + 1u) {
+      let idx = tid + t * 256u;      // 0..2047
+      let rr = idx / TK;
+      let kk = idx % TK;
+      let row = r0 + rr;
+      let col = kb + kk;
+      var v : f32 = 0.0;
+      if (row < P.rows && col < P.cols) { v = vecs[P.wordBase + row * P.cols + col]; }
+      ws[rr * TK + kk] = v;
+    }
+
+    /* Activation tile, gathered: this is the im2col that is never built. */
+    for (var t = 0u; t < 4u; t = t + 1u) {
+      let idx = tid + t * 256u;
+      let kk = idx / TS;
+      let ss = idx % TS;
+      let col = kb + kk;
+      let sq = s0 + ss;
+      var val : f32 = 0.0;
+      if (col < P.cols && sq < P.n) {
+        let ic = col / 9u;
+        let tap = col % 9u;
+        let b = sq / plane;
+        let rem = sq % plane;
+        let oh = rem / wOut;
+        let ow = rem % wOut;
+        let ih = i32(oh * 2u + tap / 3u) - 1;
+        let iw = i32(ow * 2u + tap % 3u) - 1;
+        if (ih >= 0 && ih < i32(hIn) && iw >= 0 && iw < i32(wIn)) {
+          let pix = b * hIn * wIn + u32(ih) * wIn + u32(iw);
+          val = act[P.xOff + ic * P.scaleBase + pix];
+        }
+      }
+      xs[kk * TS + ss] = val;
+    }
+    workgroupBarrier();
+
+    for (var k = 0u; k < TK; k = k + 1u) {
+      let xo = k * TS + xb;
+      let x4 = vec4<f32>(xs[xo], xs[xo + 1u], xs[xo + 2u], xs[xo + 3u]);
+      let wo = wb * TK + k;
+      a0 = a0 + ws[wo] * x4;
+      a1 = a1 + ws[wo + TK] * x4;
+      a2 = a2 + ws[wo + 2u * TK] * x4;
+      a3 = a3 + ws[wo + 3u * TK] * x4;
+      a4 = a4 + ws[wo + 4u * TK] * x4;
+      a5 = a5 + ws[wo + 5u * TK] * x4;
+      a6 = a6 + ws[wo + 6u * TK] * x4;
+      a7 = a7 + ws[wo + 7u * TK] * x4;
+    }
+    workgroupBarrier();
+    kb = kb + TK;
+  }
+
+  let row0 = r0 + wb;
+  let sq0 = s0 + xb;
+  store_row(row0, sq0, a0);
+  store_row(row0 + 1u, sq0, a1);
+  store_row(row0 + 2u, sq0, a2);
+  store_row(row0 + 3u, sq0, a3);
+  store_row(row0 + 4u, sq0, a4);
+  store_row(row0 + 5u, sq0, a5);
+  store_row(row0 + 6u, sq0, a6);
+  store_row(row0 + 7u, sq0, a7);
+}
+`;
+
+/* ---- [channel][batch*h*w] -> [channel*h][token], the stem's reshape ----
+ *
+ * The C encoder flattens conv3's [480, h3, w3] per chunk into [w3, 480*h3] and
+ * projects that. Written straight into the transposed layout the projection
+ * GEMM wants, it is a gather: row (ch*h3 + f), column (chunk*w3 + t).
+ *
+ *   rows h3   p0 w3   p1 tokenBase   scaleBase input row stride
+ */
+const RESHAPE_WGSL = HEADER + `
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let tok = gid.x;
+  if (tok >= P.n) { return; }
+  let row = gid.y;                 // ch * h3 + f
+  let h3 = P.rows;
+  let w3 = P.p0;
+  let ch = row / h3;
+  let f = row % h3;
+  let b = tok / w3;
+  let t = tok % w3;
+  let src = P.xOff + ch * P.scaleBase + b * h3 * w3 + f * w3 + t;
+  act[P.yOff + row * P.stride + P.p1 + tok] = act[src];
+}
+`;
+
+/* ---- Add the per-chunk sinusoidal position embeddings ----
+ * Uploaded already transposed, [d_model][n], so this is a straight add.
+ */
+const ADD_WGSL = HEADER + `
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let sq = gid.x;
+  if (sq >= P.n) { return; }
+  let row = gid.y;
+  act[P.yOff + row * P.stride + sq] =
+      act[P.yOff + row * P.stride + sq] + act[P.xOff + row * P.stride + sq];
+}
+`;
 
 /* ------------------------------------------------------------------ driver */
 
@@ -318,6 +493,12 @@ export class WebGPUEncoder {
     this.tokensPerChunk = down(down(down(this.chunkSize)));
     this.window = this.tokensPerChunk * Math.floor(this.nWindowInfer / this.chunkSize);
 
+    /* Chunks convolved together. Set here rather than in prepare() because
+     * convPlan() runs first and reads it - with it undefined the planner fell
+     * back to one chunk per group, which silently overran the uniform buffer
+     * on the first call only. */
+    this.convGroup = 8;
+
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) throw new Error("no WebGPU adapter");
     const lim = adapter.limits;
@@ -350,6 +531,8 @@ export class WebGPUEncoder {
 
     let qBytes = 0, sFloats = 0, vFloats = 0;
     const entries = [];
+    /* The conv-out projection has no bias, but the GEMM always adds one, so
+     * reserve a run of zeros for it rather than branching in the shader. */
     for (let i = 0; i < n; i++) {
       const e = d.subarray(i * 8, i * 8 + 8);
       const rec = { kind: e[0], layer: e[1], rows: e[2], cols: e[3],
@@ -369,6 +552,8 @@ export class WebGPUEncoder {
       entries.push(rec);
     }
     this.entries = entries;
+    this.zeroVec = vFloats;
+    vFloats += Math.max(this.dModel, this.outDim);
 
     report(`allocating ${((qBytes + sFloats * 4 + vFloats * 4) / 1e9).toFixed(2)} GB on the GPU...`);
     const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
@@ -436,10 +621,15 @@ export class WebGPUEncoder {
     this.pipeLN = await mk(LN_WGSL, "layernorm");
     this.pipeMatmul = await mk(MATMUL_WGSL, "matmul");
     this.pipeAttn = await mk(ATTN_WGSL, "attention");
+    this.pipeConv = await mk(CONV_WGSL, "conv2d");
+    this.pipeReshape = await mk(RESHAPE_WGSL, "reshape");
+    this.pipeAdd = await mk(ADD_WGSL, "add");
   }
 
-  /* Activation regions, all [rows][seqPad] so the GEMM's lanes stay on the
-   * sequence axis. Offsets are in floats. */
+  /* Activation regions. The transformer's are all [rows][seqPad] so its
+   * kernels' lanes stay on the sequence axis; the conv stem's are sized by the
+   * chunk group instead, since the stem works in image space. Offsets are in
+   * floats. */
   prepare(tokens) {
     const sp = ceilDiv(tokens, 64) * 64;
     if (this.seqPad === sp) { this.tokens = tokens; return; }
@@ -447,16 +637,31 @@ export class WebGPUEncoder {
     this.tokens = tokens;
 
     const d = this.dModel;
+    const CH = this.convHidden;
+    const cw = this.chunkSize;
+    const w1 = ((cw - 1) >> 1) + 1, w2 = ((w1 - 1) >> 1) + 1, w3 = ((w2 - 1) >> 1) + 1;
+    const G = this.convGroup;
+
     let off = 0;
-    const region = (rows) => { const o = off; off += rows * sp; return o; };
-    this.oX = region(d);
-    this.oXN = region(d);
-    this.oQ = region(d);
-    this.oK = region(d);
-    this.oV = region(d);
-    this.oATT = region(d);
-    this.oFF = region(this.ffnDim);
-    this.oOUT = region(this.outDim);
+    const region = (n) => { const o = off; off += n; return o; };
+    this.oX = region(d * sp);
+    this.oXN = region(d * sp);
+    this.oQ = region(d * sp);
+    this.oK = region(d * sp);
+    this.oV = region(d * sp);
+    this.oATT = region(d * sp);
+    this.oFF = region(this.ffnDim * sp);
+    this.oOUT = region(this.outDim * sp);
+    this.oCX = region(this.convProjDim * sp);
+    this.oPE = region(d * sp);
+    /* Every chunk becomes its own image, so the mel is stored once at
+     * chunk granularity. Must be an integer: a fractional region size makes
+     * every later offset fractional, and writeBuffer rejects those. */
+    const maxChunks = ceilDiv(tokens, w3) + G + 1;
+    this.oMEL = region(128 * maxChunks * cw);
+    this.oC1 = region(CH * G * 64 * w1);
+    this.oC2 = region(CH * G * 32 * w2);
+    this.oC3 = region(CH * G * 16 * w3);
     this.actFloats = off;
 
     this.bufAct?.destroy();
@@ -471,9 +676,11 @@ export class WebGPUEncoder {
       usage: GPUBufferUsage.STORAGE,
     });
 
-    /* Nine dispatches per layer - two LayerNorms, Q/K/V, attention, O, and
-     * the two FFN matmuls - plus the three tail steps. */
-    this.slots = this.layers * 9 + 3;
+    /* Nine dispatches per layer - two LayerNorms, Q/K/V, attention, O, and the
+     * two FFN matmuls - plus the three tail steps, plus the stem: four per
+     * chunk group and two to project and add position embeddings. */
+    const maxGroups = ceilDiv(ceilDiv(tokens, this.tokensPerChunk), G) + 2;
+    this.slots = this.layers * 9 + 3 + maxGroups * 4 + 2;
     this.bufParams?.destroy();
     this.bufParams = this.device.createBuffer({
       size: this.slots * PARAM_STRIDE,
@@ -519,8 +726,8 @@ export class WebGPUEncoder {
     this.hostU[u + 3] = f.cols || 0;
     this.hostU[u + 4] = f.xOff || 0;
     this.hostU[u + 5] = f.yOff || 0;
-    this.hostU[u + 6] = this.seqPad;
-    this.hostU[u + 7] = this.tokens;
+    this.hostU[u + 6] = f.stride === undefined ? this.seqPad : f.stride;
+    this.hostU[u + 7] = f.n === undefined ? this.tokens : f.n;
     this.hostU[u + 8] = f.vecA || 0;
     this.hostU[u + 9] = f.vecB || 0;
     this.hostU[u + 10] = f.flags || 0;
@@ -534,10 +741,8 @@ export class WebGPUEncoder {
   /* Build every uniform slot for one run, then upload them in one write.
    * The decoder learned this the hard way: filling the host array without
    * uploading it left prefill reading zeros. */
-  buildParams() {
+  buildParams(slot = 0, plan = []) {
     const d = this.dModel;
-    let slot = 0;
-    const plan = [];
 
     const matmul = (mat, biasKind, layer, xOff, yOff, flags) => {
       const w = this.find(mat, layer);
@@ -585,9 +790,151 @@ export class WebGPUEncoder {
     layernorm(E_LN_POST_W, E_LN_POST_B, 0, this.oX, this.oXN);
     matmul(E_PROJ1, E_PROJ1_B, 0, this.oXN, this.oQ, F_GELU);
     matmul(E_PROJ2, E_PROJ2_B, 0, this.oQ, this.oOUT, 0);
+    return { slot, plan };
+  }
 
-    this.device.queue.writeBuffer(this.bufParams, 0, this.host, 0, slot * PARAM_STRIDE);
-    this.plan = plan;
+  /* The stem: conv groups, the projection onto d_model, and the position
+   * embeddings. Leaves its result at oX, where the transformer starts. */
+  buildStemParams(convPlan) {
+    const plan = [];
+    const ref = { v: 0 };
+    for (const g of convPlan.groups) this.encodeConvGroup(plan, ref, g);
+
+    const w = this.find(E_CONV_OUT);
+    let slot = ref.v++;
+    this.setSlot(slot, {
+      wordBase: w.wordBase, scaleBase: w.scaleBase,
+      rows: w.rows, cols: w.cols,
+      xOff: this.oCX, yOff: this.oX,
+      vecA: this.zeroVec, flags: 0,
+    });
+    plan.push({ pipe: this.pipeMatmul, slot,
+                x: ceilDiv(this.tokens, 64), y: ceilDiv(w.rows, 128) });
+
+    slot = ref.v++;
+    this.setSlot(slot, { xOff: this.oPE, yOff: this.oX });
+    plan.push({ pipe: this.pipeAdd, slot,
+                x: ceilDiv(this.tokens, 64), y: this.dModel });
+    return { slot: ref.v, plan };
+  }
+
+  /* mel in, [tokens][output_dim] out - the whole audio tower. */
+  async runFromMel(melPtr, melFrames) {
+    const cp = this.convPlan(melFrames);
+    this.prepare(cp.tokens);
+    this.uploadPE(cp);
+    this.uploadMel(melPtr, melFrames, cp);
+
+    const stem = this.buildStemParams(cp);
+    const rest = this.buildParams(stem.slot, stem.plan.slice());
+    this.device.queue.writeBuffer(this.bufParams, 0, this.host, 0, rest.slot * PARAM_STRIDE);
+    this.plan = rest.plan;
+    return this.submit();
+  }
+
+
+  /* ---- Conv2D stem ----
+   *
+   * Chunks are convolved in groups of equal width, like the C encoder does,
+   * because a single 100-frame chunk gives the second layer a 480x4320x800
+   * GEMM - too narrow to keep the GPU busy - and one dispatch per layer. The
+   * trailing partial chunk, when there is one, runs on its own.
+   */
+  convPlan(melFrames) {
+    const cw = this.chunkSize;
+    const nChunks = Math.ceil(melFrames / cw);
+    const groups = [];
+    let tokenBase = 0;
+    for (let c = 0; c < nChunks; ) {
+      /* Only chunks of the same width can share a batch. */
+      const full = (c + 1) * cw <= melFrames;
+      let g = 1;
+      if (full) {
+        while (g < this.convGroup && c + g < nChunks && (c + g + 1) * cw <= melFrames) g++;
+      }
+      const width = full ? cw : melFrames - c * cw;
+      const w1 = ((width - 1) >> 1) + 1, w2 = ((w1 - 1) >> 1) + 1, w3 = ((w2 - 1) >> 1) + 1;
+      groups.push({ chunk: c, batch: g, width, w1, w2, w3, tokenBase, melStart: c * cw });
+      tokenBase += g * w3;
+      c += g;
+    }
+    return { groups, tokens: tokenBase };
+  }
+
+  /* Sinusoidal position embeddings, restarting at 0 in every chunk, written
+   * transposed to match the activation layout. */
+  uploadPE(plan) {
+    const d = this.dModel, sp = this.seqPad, half = d >> 1;
+    const pe = new Float32Array(d * sp);
+    const logTs = Math.log(10000.0) / (half - 1);
+    for (const g of plan.groups) {
+      for (let b = 0; b < g.batch; b++) {
+        for (let t = 0; t < g.w3; t++) {
+          const tok = g.tokenBase + b * g.w3 + t;
+          for (let i = 0; i < half; i++) {
+            const angle = t * Math.exp(-i * logTs);
+            pe[i * sp + tok] = Math.sin(angle);
+            pe[(half + i) * sp + tok] = Math.cos(angle);
+          }
+        }
+      }
+    }
+    this.device.queue.writeBuffer(this.bufAct, this.oPE * 4, pe.buffer, 0, pe.byteLength);
+  }
+
+  /* mel arrives as [128][melFrames]; the stem wants every chunk as its own
+   * image, so it is rewritten to a run of [128][width] blocks. All groups go
+   * up in one write - they share the conv scratch but not their input, since
+   * the whole stem is queued as a single command buffer. */
+  uploadMel(melPtr, melFrames, plan) {
+    const src = new Float32Array(this.M.HEAPU8.buffer, melPtr >>> 0, 128 * melFrames);
+    let total = 0;
+    for (const g of plan.groups) { g.melOff = total; total += g.batch * 128 * g.width; }
+    const dst = new Float32Array(total);
+    for (const g of plan.groups) {
+      for (let b = 0; b < g.batch; b++) {
+        const start = g.melStart + b * g.width;
+        for (let m = 0; m < 128; m++) {
+          const from = m * melFrames + start;
+          dst.set(src.subarray(from, from + g.width),
+                  g.melOff + b * 128 * g.width + m * g.width);
+        }
+      }
+    }
+    this.device.queue.writeBuffer(this.bufAct, this.oMEL * 4, dst.buffer, 0, dst.byteLength);
+  }
+
+  /* Queue one group's three convolutions and its reshape. */
+  encodeConvGroup(plan, slotRef, g) {
+    const CH = this.convHidden;
+    const stage = (wKind, bKind, xOff, yOff, inStride, hIn, wIn, cIn, nOut) => {
+      const w = this.find(wKind), b = this.find(bKind);
+      const slot = slotRef.v++;
+      this.setSlot(slot, {
+        wordBase: w.vecBase, scaleBase: inStride,
+        rows: CH, cols: cIn * 9, xOff, yOff,
+        vecA: b.vecBase, flags: F_GELU,
+        p0: hIn, p1: wIn,
+        stride: nOut, n: nOut,
+      });
+      plan.push({ pipe: this.pipeConv, slot, x: ceilDiv(nOut, 64), y: ceilDiv(CH, 128) });
+    };
+
+    const B = g.batch;
+    const n1 = B * 64 * g.w1, n2 = B * 32 * g.w2, n3 = B * 16 * g.w3;
+    stage(E_CONV1, E_CONV1_B, this.oMEL + g.melOff, this.oC1,
+          128 * g.width, 128, g.width, 1, n1);
+    stage(E_CONV2, E_CONV2_B, this.oC1, this.oC2, n1, 64, g.w1, CH, n2);
+    stage(E_CONV3, E_CONV3_B, this.oC2, this.oC3, n2, 32, g.w2, CH, n3);
+
+    const slot = slotRef.v++;
+    this.setSlot(slot, {
+      rows: 16, p0: g.w3, p1: g.tokenBase,
+      scaleBase: n3, xOff: this.oC3, yOff: this.oCX,
+      n: B * g.w3,
+    });
+    plan.push({ pipe: this.pipeReshape, slot,
+                x: ceilDiv(B * g.w3, 64), y: this.convProjDim });
   }
 
   /* Upload the conv stem's output, transposed into [d_model][seqPad]. */
@@ -602,12 +949,18 @@ export class WebGPUEncoder {
     this.device.queue.writeBuffer(this.bufAct, this.oX * 4, dst.buffer, 0, dst.byteLength);
   }
 
-  /* conv-stem output in, [tokens][output_dim] out. */
+  /* conv-stem output in, [tokens][output_dim] out - the transformer half only,
+   * which is what the golden conv tap checks. */
   async run(convPtr, tokens) {
     this.prepare(tokens);
     this.uploadInput(convPtr, tokens);
-    this.buildParams();
+    const r = this.buildParams();
+    this.device.queue.writeBuffer(this.bufParams, 0, this.host, 0, r.slot * PARAM_STRIDE);
+    this.plan = r.plan;
+    return this.submit();
+  }
 
+  async submit() {
     const t0 = performance.now();
     const enc = this.device.createCommandEncoder();
     const pass = enc.beginComputePass();
@@ -628,6 +981,7 @@ export class WebGPUEncoder {
     this.readBuf.unmap();
 
     /* Back to [tokens][output_dim] for comparison with the C encoder. */
+    const tokens = this.tokens;
     const out = new Float32Array(tokens * this.outDim);
     for (let t = 0; t < tokens; t++)
       for (let i = 0; i < this.outDim; i++)

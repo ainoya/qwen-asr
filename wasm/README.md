@@ -142,6 +142,55 @@ split is mel+encoder 3.9 s (wasm), GPU prefill 2.5 s, GPU generation 3.4 s.
   is only 2048 threads and dominated the step at long contexts: 42 ms/token at a
   1170-token context against 26.5 after splitting into 8 slices plus a merge.
 
+### The audio tower on the GPU
+
+`wasm/demo/webgpu-encoder.js` runs the whole audio tower - the Conv2D stem and
+the 24 transformer layers - leaving only mel in wasm. Check it with
+`wasm/demo/webgpu-encoder-test.html`, which has two buttons: the transformer
+half alone, fed the C encoder's conv-stem output, and the whole tower from mel.
+Both score against tensors tapped out of the C encoder by
+`node wasm/dump-golden.js … --enc`.
+
+    transformer half: 23/23 within 2e-3 relative error, worst 1.5e-5
+    whole tower:      23/23 within 2e-3 relative error, worst 9.6e-4
+
+Measured in a background tab, so these are floors:
+
+| clip | wasm stem + transformer | GPU tower |
+|------|-------------------------|-----------|
+| 11s | 1.4 s | **0.35 s** |
+| 41s | 2.4 s | **0.88 s** |
+| 89s | 5.0 s | **1.51 s** |
+
+It does not share the decoder's shaders because the tower is a different
+network: LayerNorm with a bias rather than RMSNorm, a bias on every linear,
+attention that is bidirectional inside a fixed 104-token window with no RoPE
+and no grouped KV, and a GELU FFN rather than SwiGLU. What it does share is the
+transposed `[dim][seqPad]` activation layout and the 128x64 tiled GEMM.
+
+The stem is the same tiled GEMM with the activation tile **gathered** rather
+than read contiguously: the loader turns a (K, column) pair into
+(in_channel, tap) and (batch, out_row, out_col) and reads the input pixel
+directly. That is im2col without ever building it - materializing it would cost
+55 MB per chunk group for the second layer. Chunks are convolved in groups of
+eight for the same reason the C encoder groups them: one 100-frame chunk alone
+gives the second layer a 480x4320x800 GEMM, too narrow to be worth a dispatch.
+
+Three bugs worth remembering, on top of the four below:
+
+5. **`layout: "auto"` infers `hasDynamicOffset: false`**, so stepping a uniform
+   with `setBindGroup(0, bg, [offset])` is a validation error - and validation
+   errors do not throw. A 24-layer run finished in 3 ms with an all-zero
+   result. Declare the bind group layout explicitly.
+6. **A fractional buffer region size** poisons every offset after it.
+   `region(128 * (tokens / w3 + G + 1) * cw)` is not an integer unless tokens
+   divides w3, and `writeBuffer` rejects fractional offsets - on one sample
+   only, which is what made it look like a data bug.
+7. **Reading a field that a later call initializes.** `convGroup` was set in
+   `prepare()` but read by `convPlan()`, which runs first; undefined made the
+   planner fall back to one chunk per group and overrun the uniform buffer,
+   again on the first sample only.
+
 ### Verifying GPU work from a background tab
 
 `webgpu-test.html` runs the wasm decoder and the GPU decoder on the same audio

@@ -8,6 +8,7 @@
  */
 
 import { WebGPUDecoder } from "./webgpu-decoder.js";
+import { tick, until, sleep } from "./tick.js";
 
 const $ = (id) => document.getElementById(id);
 const MODEL_BASE = "../../qwen3-asr-1.7b-q8";
@@ -111,7 +112,7 @@ async function fetchModelInto(url, total) {
       const pct = (off / total * 100);
       $("barfill").style.width = pct.toFixed(1) + "%";
       setStatus(`downloading model ${(off / 1e9).toFixed(2)} / ${(total / 1e9).toFixed(2)} GB`);
-      await new Promise((r) => setTimeout(r, 0));
+      await tick();
     }
   }
   if (off !== total) throw new Error(`model truncated: ${off} of ${total}`);
@@ -222,8 +223,7 @@ async function runBatch(bytes, label) {
       const t0 = performance.now();
       if (Module._qwen_wasm_embeds_start(ptr, samples.length) !== 0)
         throw new Error("encoder failed to start");
-      while (!Module._qwen_wasm_embeds_done())
-        await new Promise((r) => setTimeout(r, 20));
+      await until(() => Module._qwen_wasm_embeds_done());
       const seq = Module._qwen_wasm_embeds_finish();
       if (!seq) throw new Error("encoder failed");
       const encMs = performance.now() - t0;
@@ -395,7 +395,7 @@ $("simstream").onclick = async () => {
       Module.HEAPF32.set(part, f32idx(ptr));
       Module._qwen_wasm_stream_push(ptr, part.length);
       streamedSamples += part.length;
-      await new Promise((res) => setTimeout(res, 250));
+      await sleep(250);
     }
 
     setStatus("draining...");

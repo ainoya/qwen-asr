@@ -14,9 +14,9 @@
 <body>
 <h2>WebGPU decoder check</h2>
 <p>Runs the same utterance twice — once with the wasm decoder, once with token
-generation on the GPU — and compares the transcripts. Timings are only
-meaningful with this tab visible and focused; browsers throttle hidden tabs
-hard.</p>
+generation on the GPU — and compares the transcripts. Correctness runs fine in
+a background tab; timings are only meaningful with this tab visible and
+focused, since a hidden tab loses roughly a quarter of its GPU throughput.</p>
 <p>
   <button id="load">Load model</button>
   <button id="run" disabled>Run comparison</button>
@@ -39,6 +39,7 @@ hard.</p>
 <script src="qwen_asr.js"></script>
 <script type="module">
 import { WebGPUDecoder } from "./webgpu-decoder.js";
+import { until } from "./tick.js";
 
 const MODEL_BASE = "../../qwen3-asr-1.7b-q8";
 const out = document.getElementById("out");
@@ -134,7 +135,7 @@ async function runOne() {
     say("\n[cpu] running...");
     let t0 = performance.now();
     if (M._qwen_wasm_batch_start(sp, samples.length) !== 0) throw new Error("cpu start failed");
-    while (!M._qwen_wasm_job_done()) await new Promise((r) => setTimeout(r, 15));
+    await until(() => M._qwen_wasm_job_done());
     const rp = P(M._qwen_wasm_job_take());
     const cpuText = rp ? M.UTF8ToString(rp) : "";
     if (rp) M._free(rp);
@@ -149,7 +150,7 @@ async function runOne() {
     say("\n[gpu] prefill on cpu, generation on gpu...");
     t0 = performance.now();
     if (M._qwen_wasm_prefill_start(sp, samples.length) !== 0) throw new Error("prefill start failed");
-    while (!M._qwen_wasm_prefill_done()) await new Promise((r) => setTimeout(r, 15));
+    await until(() => M._qwen_wasm_prefill_done());
     const first = M._qwen_wasm_prefill_finish();
     if (first < 0) throw new Error("prefill failed");
     const prefillWall = performance.now() - t0;
@@ -191,7 +192,7 @@ async function runOne() {
     say("\n[gpu2] prefill AND generation on gpu...");
     let t2 = performance.now();
     if (M._qwen_wasm_embeds_start(sp, samples.length) !== 0) throw new Error("embeds start failed");
-    while (!M._qwen_wasm_embeds_done()) await new Promise((res) => setTimeout(res, 15));
+    await until(() => M._qwen_wasm_embeds_done());
     const seq = M._qwen_wasm_embeds_finish();
     if (!seq) throw new Error("embeds failed");
     const embPtr = P(M._qwen_wasm_embeds_ptr());

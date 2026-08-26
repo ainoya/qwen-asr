@@ -125,30 +125,94 @@ function sendSettings() {
 
 /* Stream the packed model straight into wasm memory: response.arrayBuffer()
  * would hold a second ~2 GB copy in the JS heap first. */
-async function fetchModelInto(url, total) {
-  const ptr = P(Module._qwen_wasm_alloc(total));
-  if (!ptr) throw new Error(`could not allocate ${total} bytes of wasm memory`);
+/* Keep the packed model in the origin's private file system.
+ *
+ * It is 2.18 GB and the dev server sends Cache-Control: no-store, so every
+ * reload refetched the whole thing - about three minutes on a 100 Mbit line.
+ * OPFS survives reloads and is per-origin, so the second visit starts in
+ * seconds. The file is named by its byte length: a different model is a
+ * different file rather than a stale hit, and no separate metadata to keep
+ * consistent.
+ *
+ * Every step degrades to plain fetching. OPFS is missing in some private
+ * modes, writes fail on a full disk, and neither is a reason not to run.
+ */
+async function opfsHandle(total, create) {
+  if (!navigator.storage?.getDirectory) return null;
+  try {
+    const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle("qwen-asr", { create });
+    return await dir.getFileHandle(`model-${total}.bin`, { create });
+  } catch {
+    return null;   /* not found, or no OPFS at all */
+  }
+}
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
-  const reader = res.body.getReader();
-
+async function copyStreamInto(stream, ptr, total, label, alsoWrite) {
+  const reader = stream.getReader();
   let off = 0, lastReport = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     // Re-read HEAPU8 every time: growing memory swaps the backing buffer.
     Module.HEAPU8.set(value, ptr + off);
+    if (alsoWrite) {
+      try { await alsoWrite.write(value); } catch { alsoWrite = null; }
+    }
     off += value.length;
     if (off - lastReport > 48 * 1024 * 1024) {
       lastReport = off;
-      const pct = (off / total * 100);
-      $("barfill").style.width = pct.toFixed(1) + "%";
-      setStatus(`downloading model ${(off / 1e9).toFixed(2)} / ${(total / 1e9).toFixed(2)} GB`);
+      $("barfill").style.width = (off / total * 100).toFixed(1) + "%";
+      setStatus(`${label} ${(off / 1e9).toFixed(2)} / ${(total / 1e9).toFixed(2)} GB`);
       await tick();
     }
   }
-  if (off !== total) throw new Error(`model truncated: ${off} of ${total}`);
+  return { off, writer: alsoWrite };
+}
+
+async function fetchModelInto(url, total) {
+  const ptr = P(Module._qwen_wasm_alloc(total));
+  if (!ptr) throw new Error(`could not allocate ${total} bytes of wasm memory`);
+
+  /* Cached copy first. A size mismatch means a different build; refetch. */
+  const cached = await opfsHandle(total, false);
+  if (cached) {
+    try {
+      const file = await cached.getFile();
+      if (file.size === total) {
+        const { off } = await copyStreamInto(file.stream(), ptr, total, "loading cached model", null);
+        if (off === total) {
+          $("barfill").style.width = "100%";
+          log("model loaded from the local cache");
+          return ptr;
+        }
+      }
+    } catch (e) {
+      log(`cache read failed (${e.message}); refetching`, "err");
+    }
+  }
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+
+  /* Write the cache as the bytes stream past, so caching costs no extra pass. */
+  let writer = null, handle = null;
+  try {
+    handle = await opfsHandle(total, true);
+    if (handle) writer = await handle.createWritable();
+  } catch { writer = null; }
+
+  const { off, writer: stillWriting } =
+    await copyStreamInto(res.body, ptr, total, "downloading model", writer);
+
+  if (off !== total) {
+    if (stillWriting) { try { await stillWriting.abort(); } catch {} }
+    throw new Error(`model truncated: ${off} of ${total}`);
+  }
+  if (stillWriting) {
+    try { await stillWriting.close(); log("model cached for next time"); }
+    catch (e) { log(`could not cache the model (${e.message})`, "err"); }
+  }
   $("barfill").style.width = "100%";
   return ptr;
 }

@@ -142,6 +142,22 @@ split is mel+encoder 3.9 s (wasm), GPU prefill 2.5 s, GPU generation 3.4 s.
   is only 2048 threads and dominated the step at long contexts: 42 ms/token at a
   1170-token context against 26.5 after splitting into 8 slices plus a merge.
 
+### The model is cached across reloads
+
+The packed model is 2.18 GB and `serve.py` sends `Cache-Control: no-store`, so
+every reload refetched all of it — seconds from localhost, about three minutes
+on a 100 Mbit line. It now goes into the origin's private file system as it
+streams past, so caching costs no extra pass, and later visits read from there:
+
+    cold  21.2 s to ready
+    warm   4.3 s to ready
+
+The file is named by its byte length (`model-<size>.bin`), so a different build
+is a different file rather than a stale hit and there is no separate metadata to
+keep consistent. Every step degrades to plain fetching: OPFS is missing in some
+private modes and writes fail on a full disk, and neither is a reason not to
+run. A short read or a size mismatch refetches.
+
 ### Weights are sharded, not one binding
 
 Both weight sets are split into shards of at most 256 MB rather than living in

@@ -610,6 +610,15 @@ $("load").onclick = async () => {
 
     ready = true;
     window.__gpu = gpu; window.__enc = encoder; window.__M = Module;  /* debug */
+    /* GPU decode makes 1-second chunks sustainable (measured ~0.8 s per chunk
+     * at a 41 s context in a throttled tab), and halving the chunk halves how
+     * long words sit unconfirmed on screen. CPU decode cannot keep that pace,
+     * so only the GPU path gets the faster default - and only if the user has
+     * not chosen a chunk size themselves. */
+    if (gpu && $("chunk").value === "2") {
+      $("chunk").value = "1";
+      log("GPU decode active: streaming chunk defaults to 1 s");
+    }
     sendSettings();
     for (const id of ["file", "sample-ja", "sample-en", "mic", "simstream"])
       $(id).disabled = false;

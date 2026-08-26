@@ -422,12 +422,19 @@ realtime, 2911 text tokens over 50 segments:
 | mel | 2.0 s | 2% | - |
 | encoder conv stem | 6.0 s | 6% | single-threaded `im2col` |
 | encoder transformer | 16.8 s | 18% | Accelerate `sgemm` |
-| decoder prefill | 41.2 s | 44% | `sgemm`, ~1.4 TFLOPS, at the AMX ceiling |
+| decoder prefill | 41.2 s | 44% | `sgemm`, ~1.4 TFLOPS, at the AMX ceiling (see below) |
 | decoder generation | 27.2 s | 29% | DRAM read bandwidth |
 
 Prefill dominates because segmented decode prefills every segment's audio
 embeddings - about 15000 rows for 25 minutes - and that work is fixed by the
-architecture. Everything except the conv stem is already at a hardware ceiling,
+architecture. The 1.4 TFLOPS ceiling now has a literature-backed mechanism:
+Bhan (arXiv:2606.25426) microbenchmarks the M1 AMX inner loop as *load-issue
+bound* at 610-680 GFLOPS per AMX block once operand loads interleave with the
+FMA stream, and shows the only headroom over `cblas_sgemm` on base M1 comes
+from filling the second AMX block and pre-packing constant weights. The M1
+Pro has two AMX blocks and our measured 1.4 TFLOPS is exactly 2 x that band -
+Accelerate is already filling both here, so a hand-written AMX kernel has
+nothing structural left to win at these shapes. Everything except the conv stem is already at a hardware ceiling,
 so the honest headroom here is roughly 5% (threading the conv stem) plus about
 3% (see the batching note below). Measure before assuming otherwise.
 
@@ -506,7 +513,16 @@ Things that were learned the hard way and should not be re-litigated:
   need a readback between steps.
 - **Lane-per-word beats lane-per-block** in the Q8 matvec (26 vs 40 ms/token).
   Re-reading the block scale per word is cheap because it stays in cache;
-  giving each lane its own byte run is not.
+  giving each lane its own byte run is not. Re-confirmed after the subgroup
+  work from the other side: a pure-read probe shows 16-byte-per-lane loads
+  beating one-word lanes (152 vs 137 GB/s, vec4 bindings 157), but rewriting
+  the row functions to four consecutive words per lane made the real step
+  *2.1x slower* (31.5 vs 15 ms) - the probe's single-stream pattern does not
+  transfer to a kernel that interleaves weight, scale and activation streams.
+  The workgroup width was also re-swept with subgroups on: 64 still wins
+  (15.9 ms against 16.3 at 32, 17.9 at 128, 26.5 at 256). The generation
+  matvec is done; at ~80% of the pure-read probe there is nothing structural
+  left.
 - **Split the attention V-sum over the key axis.** One thread per (head, dim) is
   only 2048 threads and dominated the step at long contexts (42 vs 26.5
   ms/token at a 1170-token context).

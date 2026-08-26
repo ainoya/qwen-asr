@@ -2450,6 +2450,135 @@ static float attn_softmax_inplace(float *scores, int n) {
 }
 
 /* out_row = sum_j w[j] * V[j*stride], four keys at a time for ILP. */
+/* ---- f16 KV cache primitives ----
+ *
+ * Widening f16 -> f32 is exact. The narrowing store must round to nearest
+ * even identically on every backend, because the blas and noblas builds are
+ * contractually transcript-identical: NEON's vcvt and x86's F16C both do RNE
+ * in their default mode, and the portable fallback implements the same
+ * rounding bit for bit. */
+
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+void qwen_f32_to_f16_row(qwen_f16_t *dst, const float *src, int n) {
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float16x4_t a = vcvt_f16_f32(vld1q_f32(src + i));
+        float16x4_t b = vcvt_f16_f32(vld1q_f32(src + i + 4));
+        vst1q_u16(dst + i, vreinterpretq_u16_f16(vcombine_f16(a, b)));
+    }
+    for (; i < n; i++) {
+        __fp16 h = (__fp16)src[i];   /* aarch64: single-instruction RNE convert */
+        uint16_t u;
+        memcpy(&u, &h, sizeof(u));
+        dst[i] = u;
+    }
+}
+void qwen_f16_to_f32_row(float *dst, const qwen_f16_t *src, int n) {
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(src + i));
+        vst1q_f32(dst + i, vcvt_f32_f16(vget_low_f16(h)));
+        vst1q_f32(dst + i + 4, vcvt_f32_f16(vget_high_f16(h)));
+    }
+    for (; i < n; i++) {
+        __fp16 h;
+        memcpy(&h, src + i, sizeof(h));
+        dst[i] = (float)h;
+    }
+}
+static inline float f16_dot(const float *q, const qwen_f16_t *k, int n) {
+    float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(k + i));
+        acc0 = vfmaq_f32(acc0, vld1q_f32(q + i), vcvt_f32_f16(vget_low_f16(h)));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(q + i + 4), vcvt_f32_f16(vget_high_f16(h)));
+    }
+    float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; i < n; i++) {
+        __fp16 h;
+        memcpy(&h, k + i, sizeof(h));
+        acc += q[i] * (float)h;
+    }
+    return acc;
+}
+static inline void f16_axpy(float *o, const qwen_f16_t *v, float w, int n) {
+    float32x4_t wv = vdupq_n_f32(w);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(v + i));
+        vst1q_f32(o + i, vfmaq_f32(vld1q_f32(o + i), wv, vcvt_f32_f16(vget_low_f16(h))));
+        vst1q_f32(o + i + 4, vfmaq_f32(vld1q_f32(o + i + 4), wv, vcvt_f32_f16(vget_high_f16(h))));
+    }
+    for (; i < n; i++) {
+        __fp16 h;
+        memcpy(&h, v + i, sizeof(h));
+        o[i] += w * (float)h;
+    }
+}
+#else
+/* Portable software conversion. Round to nearest even, matching hardware. */
+static inline uint16_t f32_to_f16_scalar(float f) {
+    union { float f; uint32_t u; } x = { f };
+    uint32_t sign = (x.u >> 16) & 0x8000u;
+    uint32_t abs = x.u & 0x7fffffffu;
+    if (abs >= 0x7f800000u)                       /* inf / nan */
+        return (uint16_t)(sign | 0x7c00u | ((abs > 0x7f800000u) ? 0x200u : 0u));
+    if (abs >= 0x477ff000u) return (uint16_t)(sign | 0x7c00u);  /* overflows to inf */
+    if (abs < 0x38800000u) {                      /* subnormal or zero */
+        if (abs < 0x33000000u) return (uint16_t)sign;
+        uint32_t shift = 126u - (abs >> 23);
+        uint32_t mant = (abs & 0x7fffffu) | 0x800000u;
+        uint32_t r = mant >> (shift + 13u);
+        uint32_t rem = mant & ((1u << (shift + 13u)) - 1u);
+        uint32_t half = 1u << (shift + 12u);
+        if (rem > half || (rem == half && (r & 1u))) r++;
+        return (uint16_t)(sign | r);
+    }
+    uint32_t r = (abs >> 13) - (112u << 10);
+    uint32_t rem = abs & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (r & 1u))) r++;
+    return (uint16_t)(sign | r);
+}
+/* Branchless f16 -> f32: place the half's exponent+mantissa as an f32
+ * subnormal and renormalize with one multiply by 2^112. Exact for every
+ * finite value including f16 subnormals; infinities widen to infinity and
+ * NaNs land on infinity, which the cache never stores. Branch-free is the
+ * point - the branchy version kept clang from vectorizing the attention
+ * loops and cost the wasm suite 42%. */
+static inline float f16_to_f32_scalar(uint16_t h) {
+    union { uint32_t u; float f; } x = { (uint32_t)(h & 0x7fffu) << 13 };
+    x.f *= 0x1p+112f;
+    x.u |= (uint32_t)(h & 0x8000u) << 16;
+    return x.f;
+}
+void qwen_f32_to_f16_row(qwen_f16_t *dst, const float *src, int n) {
+    for (int i = 0; i < n; i++) dst[i] = f32_to_f16_scalar(src[i]);
+}
+void qwen_f16_to_f32_row(float *dst, const qwen_f16_t *src, int n) {
+    for (int i = 0; i < n; i++) dst[i] = f16_to_f32_scalar(src[i]);
+}
+static inline float f16_dot(const float *q, const qwen_f16_t *k, int n) {
+    float acc = 0.0f;
+    for (int i = 0; i < n; i++) acc += q[i] * f16_to_f32_scalar(k[i]);
+    return acc;
+}
+static inline void f16_axpy(float *o, const qwen_f16_t *v, float w, int n) {
+    for (int i = 0; i < n; i++) o[i] += w * f16_to_f32_scalar(v[i]);
+}
+#endif
+
+static float *attn_kvpanel = NULL;
+static size_t attn_kvpanel_cap = 0;
+
+static void attn_weighted_sum_f16(float *o_row, const qwen_f16_t *V, int v_stride,
+                                  const float *w, int n, int head_dim) {
+    memset(o_row, 0, (size_t)head_dim * sizeof(float));
+    for (int j = 0; j < n; j++)
+        f16_axpy(o_row, V + (size_t)j * v_stride, w[j], head_dim);
+}
+
 static void attn_weighted_sum(float *o_row, const float *V, int v_stride,
                               const float *w, int n, int head_dim) {
     memset(o_row, 0, (size_t)head_dim * sizeof(float));
@@ -2540,8 +2669,8 @@ void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
                                        window_starts, n_windows, 0, n_heads, 0);
 }
 
-static void qwen_causal_attention_heads(float *out, const float *Q, const float *K,
-                                        const float *V, int seq_q, int seq_k,
+static void qwen_causal_attention_heads(float *out, const float *Q, const qwen_f16_t *K,
+                                        const qwen_f16_t *V, int seq_q, int seq_k,
                                         int n_heads, int n_kv_heads, int head_dim,
                                         float scale, int q_offset,
                                         int head_start, int head_end, int tid) {
@@ -2551,8 +2680,8 @@ static void qwen_causal_attention_heads(float *out, const float *Q, const float 
 
     for (int h = head_start; h < head_end; h++) {
         int kv_h = h / heads_per_kv;
-        const float *k_base = K + (size_t)kv_h * head_dim;
-        const float *v_base = V + (size_t)kv_h * head_dim;
+        const qwen_f16_t *k_base = K + (size_t)kv_h * head_dim;
+        const qwen_f16_t *v_base = V + (size_t)kv_h * head_dim;
 
         for (int i = 0; i < seq_q; i++) {
             const float *q_row = Q + (size_t)i * q_hidden + h * head_dim;
@@ -2569,10 +2698,10 @@ static void qwen_causal_attention_heads(float *out, const float *Q, const float 
             if (!scores) return;
 
             for (int j = 0; j < k_end; j++)
-                scores[j] = qwen_dot_f32(q_row, k_base + (size_t)j * kv_hidden, head_dim) * scale;
+                scores[j] = f16_dot(q_row, k_base + (size_t)j * kv_hidden, head_dim) * scale;
 
             float inv_sum = attn_softmax_inplace(scores, k_end);
-            attn_weighted_sum(o_row, v_base, kv_hidden, scores, k_end, head_dim);
+            attn_weighted_sum_f16(o_row, v_base, kv_hidden, scores, k_end, head_dim);
             qwen_vec_scale_inplace(o_row, inv_sum, head_dim);
         }
     }
@@ -2581,8 +2710,8 @@ static void qwen_causal_attention_heads(float *out, const float *Q, const float 
 typedef struct {
     float *out;
     const float *Q;
-    const float *K;
-    const float *V;
+    const qwen_f16_t *K;
+    const qwen_f16_t *V;
     int seq_q, seq_k;
     int n_heads, n_kv_heads;
     int head_dim;
@@ -2616,12 +2745,30 @@ static void causal_attn_worker(int tid, int n_threads, void *arg) {
 static float *attn_gemm_scores = NULL;
 static size_t attn_gemm_cap = 0;
 
-static int causal_attention_gemm(float *out, const float *Q, const float *K, const float *V,
+static int causal_attention_gemm(float *out, const float *Q, const qwen_f16_t *K16,
+                                 const qwen_f16_t *V16,
                                  int seq_q, int seq_k, int n_heads, int n_kv_heads,
                                  int head_dim, float scale, int q_offset) {
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
+
+    /* sgemm wants f32 operands, so the cache window is widened into a scratch
+     * panel once per call - two panels of seq_k x kv_hidden, a few MB, against
+     * a prefill measured in seconds. */
+    {
+        size_t pn = (size_t)seq_k * kv_hidden;
+        if (pn * 2 > attn_kvpanel_cap) {
+            float *tmp = (float *)realloc(attn_kvpanel, pn * 2 * sizeof(float));
+            if (!tmp) return -1;
+            attn_kvpanel = tmp;
+            attn_kvpanel_cap = pn * 2;
+        }
+        qwen_f16_to_f32_row(attn_kvpanel, K16, (int)pn);
+        qwen_f16_to_f32_row(attn_kvpanel + pn, V16, (int)pn);
+    }
+    const float *K = attn_kvpanel;
+    const float *V = attn_kvpanel + (size_t)seq_k * kv_hidden;
 
     size_t need = (size_t)QWEN_ATTN_QTILE * seq_k;
     if (need > attn_gemm_cap) {
@@ -2682,7 +2829,8 @@ static int causal_attention_gemm(float *out, const float *Q, const float *K, con
 }
 #endif /* USE_BLAS */
 
-void qwen_causal_attention(float *out, const float *Q, const float *K, const float *V,
+void qwen_causal_attention(float *out, const float *Q, const qwen_f16_t *K,
+                            const qwen_f16_t *V,
                             int seq_q, int seq_k, int n_heads, int n_kv_heads,
                             int head_dim, float scale, int q_offset) {
 #ifdef USE_BLAS

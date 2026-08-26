@@ -293,7 +293,26 @@ void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
  * V: [seq_k, n_kv_heads * head_dim]
  * q_offset: global position of first query (for causal mask)
  */
-void qwen_causal_attention(float *out, const float *Q, const float *K, const float *V,
+/* ========================================================================
+ * f16 KV cache
+ *
+ * The decoder's KV cache stores IEEE half floats: K and V live after a norm,
+ * so their range asks nothing of f32, and the cache is both the largest
+ * transient allocation (229 KB per token on the 1.7B model) and half the
+ * bytes the batched decode's attention reads. Published measurements put even
+ * int8 KV caches at quality-neutral; f16 is the conservative half. All
+ * accumulation stays f32; f16 -> f32 widening is exact, and the f32 -> f16
+ * store rounds to nearest even on every backend so transcripts stay identical
+ * across them.
+ * ======================================================================== */
+
+typedef uint16_t qwen_f16_t;
+
+void qwen_f32_to_f16_row(qwen_f16_t *dst, const float *src, int n);
+void qwen_f16_to_f32_row(float *dst, const qwen_f16_t *src, int n);
+
+void qwen_causal_attention(float *out, const float *Q, const qwen_f16_t *K,
+                           const qwen_f16_t *V,
                             int seq_q, int seq_k, int n_heads, int n_kv_heads,
                             int head_dim, float scale, int q_offset);
 

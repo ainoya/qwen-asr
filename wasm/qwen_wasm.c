@@ -827,6 +827,8 @@ EMSCRIPTEN_KEEPALIVE unsigned int qwen_wasm_kv_v_ptr(void) {
 }
 EMSCRIPTEN_KEEPALIVE int qwen_wasm_kv_len(void) { return g_ctx ? g_ctx->kv_cache_len : 0; }
 EMSCRIPTEN_KEEPALIVE int qwen_wasm_kv_stride(void) { return g_ctx ? g_ctx->kv_cache_max : 0; }
+/* The cache stores IEEE halves now; the JS side reads it accordingly. */
+EMSCRIPTEN_KEEPALIVE int qwen_wasm_kv_is_f16(void) { return 1; }
 
 /* ---- tokenizer ---- */
 

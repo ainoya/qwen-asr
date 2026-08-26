@@ -256,8 +256,8 @@ typedef struct {
     char model_dir[512];
 
     /* KV cache for decoder */
-    float *kv_cache_k;         /* [layers, max_seq, kv_heads * head_dim] */
-    float *kv_cache_v;
+    qwen_f16_t *kv_cache_k;    /* [layers, max_seq, kv_heads * head_dim], f16 */
+    qwen_f16_t *kv_cache_v;
     int kv_cache_len;
     int kv_cache_max;
 
@@ -493,8 +493,8 @@ const float *qwen_awq_scales(qwen_awq_t *a, const char *name, int cols);
  * ------------------------------------------------------------------------- */
 
 typedef struct {
-    float *k;                  /* [layers, max, kv_heads * head_dim] */
-    float *v;
+    qwen_f16_t *k;             /* [layers, max, kv_heads * head_dim], f16 */
+    qwen_f16_t *v;
     int len;
     int max;
 } qwen_kv_t;

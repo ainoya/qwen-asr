@@ -1779,13 +1779,27 @@ export class WebGPUDecoder {
       const kPtr = M._qwen_wasm_kv_k_ptr() >>> 0;
       const vPtr = M._qwen_wasm_kv_v_ptr() >>> 0;
       const wasmStride = M._qwen_wasm_kv_stride();
+      const srcF16 = !!(M._qwen_wasm_kv_is_f16 && M._qwen_wasm_kv_is_f16());
       const n = kvLen * cfg.kvDim;
+      const srcBytes = srcF16 ? 2 : 4;
       for (let l = 0; l < cfg.layers; l++) {
         const src = l * wasmStride * cfg.kvDim;
-        let kSrc = new Float32Array(M.HEAPF32.buffer, kPtr + src * 4, n);
-        let vSrc = new Float32Array(M.HEAPF32.buffer, vPtr + src * 4, n);
-        if (this.kvF16) { kSrc = new Float16Array(kSrc); vSrc = new Float16Array(vSrc); }
-        else { kSrc = kSrc.slice(); vSrc = vSrc.slice(); }
+        let kSrc, vSrc;
+        if (srcF16) {
+          kSrc = new Uint16Array(M.HEAPU8.buffer, kPtr + src * srcBytes, n);
+          vSrc = new Uint16Array(M.HEAPU8.buffer, vPtr + src * srcBytes, n);
+          if (this.kvF16) { kSrc = kSrc.slice(); vSrc = vSrc.slice(); }
+          else {
+            /* Widen through Float16Array's element accessors (exact). */
+            kSrc = Float32Array.from(new Float16Array(kSrc.slice().buffer));
+            vSrc = Float32Array.from(new Float16Array(vSrc.slice().buffer));
+          }
+        } else {
+          kSrc = new Float32Array(M.HEAPF32.buffer, kPtr + src * srcBytes, n);
+          vSrc = new Float32Array(M.HEAPF32.buffer, vPtr + src * srcBytes, n);
+          if (this.kvF16) { kSrc = new Float16Array(kSrc); vSrc = new Float16Array(vSrc); }
+          else { kSrc = kSrc.slice(); vSrc = vSrc.slice(); }
+        }
         device.queue.writeBuffer(this.bufKV, l * perLayer * this.kvBytes, kSrc);
         device.queue.writeBuffer(this.bufKV, (this.vDelta + l * perLayer) * this.kvBytes, vSrc);
       }

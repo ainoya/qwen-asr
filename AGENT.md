@@ -446,12 +446,20 @@ matching across batch sizes is the tell, since it cannot depend on batch size.
 
 Known remaining opportunities, in rough value order:
 
-1. **f16 KV cache.** The cache is f32 today. At a 1500-token context it is
-   ~15% of the bytes read per generated token, and it dominates RAM for very
-   long files. Halving it is worth ~7% of decode there. The catch is that the
-   prefill attention path hands K/V straight to `cblas_sgemm`, so that path
-   would need an f32 scratch conversion; only the seq_q==1 path benefits
-   directly.
+1. ~~**f16 KV cache.**~~ Done, natively and on the GPU. The cache stores IEEE
+   halves (`qwen_f16_t`); accumulation stays f32, the f32->f16 store rounds to
+   nearest even identically on every backend (blas/noblas transcripts verified
+   identical), and the BLAS prefill path widens the cache window into an f32
+   scratch panel before `sgemm`. Measured: KV RAM halves (458 -> 229 MB on the
+   25-min `-S 30 --batch 4` workload), that workload runs ~2.7% faster (attention
+   -bound batched decode reads half the bytes), English suites stay 22/22 with
+   blas/noblas identical, and the GPU golden suite kept all three of its
+   numbers including 18/23 byte-identity. The cost is small but real: Japanese
+   eval CER 0.1639 -> 0.1694 (+3.4% relative, ~10 char edits over the TTS set),
+   and 3.8% token-level drift on 25 min of real speech with no degeneration
+   (0 collapses, repetition metrics unchanged). The f16->f32 read must stay
+   branchless (magic-multiply by 2^112) - a branchy converter stopped clang
+   vectorizing the wasm attention loops and cost that suite 42%.
 2. **Opt-in 4-bit weights.** Would roughly halve both the browser download and
    the decode bandwidth, at a measured quality cost (see below). Should never
    become the default.

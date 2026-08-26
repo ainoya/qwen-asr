@@ -360,9 +360,9 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
 
 static int kv_cache_init(qwen_ctx_t *ctx, int max_seq) {
     int kv_dim = ctx->config.dec_kv_heads * ctx->config.dec_head_dim;
-    size_t cache_size = (size_t)ctx->config.dec_layers * max_seq * kv_dim * sizeof(float);
-    ctx->kv_cache_k = (float *)calloc(1, cache_size);
-    ctx->kv_cache_v = (float *)calloc(1, cache_size);
+    size_t cache_size = (size_t)ctx->config.dec_layers * max_seq * kv_dim * sizeof(qwen_f16_t);
+    ctx->kv_cache_k = (qwen_f16_t *)calloc(1, cache_size);
+    ctx->kv_cache_v = (qwen_f16_t *)calloc(1, cache_size);
     ctx->kv_cache_len = 0;
     ctx->kv_cache_max = max_seq;
     if (!ctx->kv_cache_k || !ctx->kv_cache_v) return -1;
@@ -378,13 +378,13 @@ static int kv_cache_grow(qwen_ctx_t *ctx, int required) {
 
     size_t new_stride = (size_t)new_max * kv_dim;
     size_t old_stride = (size_t)ctx->kv_cache_max * kv_dim;
-    size_t total = (size_t)ctx->config.dec_layers * new_stride * sizeof(float);
+    size_t total = (size_t)ctx->config.dec_layers * new_stride * sizeof(qwen_f16_t);
 
-    float *new_k = (float *)calloc(1, total);
-    float *new_v = (float *)calloc(1, total);
+    qwen_f16_t *new_k = (qwen_f16_t *)calloc(1, total);
+    qwen_f16_t *new_v = (qwen_f16_t *)calloc(1, total);
     if (!new_k || !new_v) { free(new_k); free(new_v); return -1; }
 
-    size_t copy = (size_t)ctx->kv_cache_len * kv_dim * sizeof(float);
+    size_t copy = (size_t)ctx->kv_cache_len * kv_dim * sizeof(qwen_f16_t);
     for (int l = 0; l < ctx->config.dec_layers; l++) {
         memcpy(new_k + l * new_stride, ctx->kv_cache_k + l * old_stride, copy);
         memcpy(new_v + l * new_stride, ctx->kv_cache_v + l * old_stride, copy);
@@ -398,12 +398,12 @@ static int kv_cache_grow(qwen_ctx_t *ctx, int required) {
     return 0;
 }
 
-static float *kv_cache_k_at(qwen_ctx_t *ctx, int layer, int pos) {
+static qwen_f16_t *kv_cache_k_at(qwen_ctx_t *ctx, int layer, int pos) {
     int kv_dim = ctx->config.dec_kv_heads * ctx->config.dec_head_dim;
     return ctx->kv_cache_k + ((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
 }
 
-static float *kv_cache_v_at(qwen_ctx_t *ctx, int layer, int pos) {
+static qwen_f16_t *kv_cache_v_at(qwen_ctx_t *ctx, int layer, int pos) {
     int kv_dim = ctx->config.dec_kv_heads * ctx->config.dec_head_dim;
     return ctx->kv_cache_v + ((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
 }
@@ -565,18 +565,18 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
         qwen_apply_rope_neox(q, rope_cos, rope_sin, seq_len, n_heads, head_dim);
         qwen_apply_rope_neox(k, rope_cos, rope_sin, seq_len, n_kv_heads, head_dim);
 
-        /* Store K, V in cache */
+        /* Store K, V in cache, narrowed to f16 */
         for (int s = 0; s < seq_len; s++) {
-            memcpy(kv_cache_k_at(ctx, layer, start_pos + s),
-                   k + s * kv_dim, kv_dim * sizeof(float));
-            memcpy(kv_cache_v_at(ctx, layer, start_pos + s),
-                   v + s * kv_dim, kv_dim * sizeof(float));
+            qwen_f32_to_f16_row(kv_cache_k_at(ctx, layer, start_pos + s),
+                                k + s * kv_dim, kv_dim);
+            qwen_f32_to_f16_row(kv_cache_v_at(ctx, layer, start_pos + s),
+                                v + s * kv_dim, kv_dim);
         }
 
         /* Causal attention */
         int total_seq = start_pos + seq_len;
-        float *full_k = kv_cache_k_at(ctx, layer, 0);
-        float *full_v = kv_cache_v_at(ctx, layer, 0);
+        qwen_f16_t *full_k = kv_cache_k_at(ctx, layer, 0);
+        qwen_f16_t *full_v = kv_cache_v_at(ctx, layer, 0);
         qwen_causal_attention(attn_out, q, full_k, full_v,
                                seq_len, total_seq, n_heads, n_kv_heads,
                                head_dim, scale, start_pos);
@@ -701,12 +701,12 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
         qwen_apply_rope_neox(q, rope_cos, rope_sin, 1, n_heads, head_dim);
         qwen_apply_rope_neox(k, rope_cos, rope_sin, 1, n_kv_heads, head_dim);
 
-        memcpy(kv_cache_k_at(ctx, layer, pos), k, kv_dim * sizeof(float));
-        memcpy(kv_cache_v_at(ctx, layer, pos), v, kv_dim * sizeof(float));
+        qwen_f32_to_f16_row(kv_cache_k_at(ctx, layer, pos), k, kv_dim);
+        qwen_f32_to_f16_row(kv_cache_v_at(ctx, layer, pos), v, kv_dim);
 
         int total_seq = pos + 1;
-        float *full_k = kv_cache_k_at(ctx, layer, 0);
-        float *full_v = kv_cache_v_at(ctx, layer, 0);
+        qwen_f16_t *full_k = kv_cache_k_at(ctx, layer, 0);
+        qwen_f16_t *full_v = kv_cache_v_at(ctx, layer, 0);
 
         qwen_causal_attention(attn_out, q, full_k, full_v,
                                1, total_seq, n_heads, n_kv_heads,
@@ -756,9 +756,9 @@ qwen_kv_t *qwen_kv_create(qwen_ctx_t *ctx, int max_seq) {
     qwen_kv_t *kv = (qwen_kv_t *)calloc(1, sizeof(*kv));
     if (!kv) return NULL;
     int kv_dim = ctx->config.dec_kv_heads * ctx->config.dec_head_dim;
-    size_t bytes = (size_t)ctx->config.dec_layers * max_seq * kv_dim * sizeof(float);
-    kv->k = (float *)calloc(1, bytes);
-    kv->v = (float *)calloc(1, bytes);
+    size_t bytes = (size_t)ctx->config.dec_layers * max_seq * kv_dim * sizeof(qwen_f16_t);
+    kv->k = (qwen_f16_t *)calloc(1, bytes);
+    kv->v = (qwen_f16_t *)calloc(1, bytes);
     kv->max = max_seq;
     kv->len = 0;
     if (!kv->k || !kv->v) { qwen_kv_free(kv); return NULL; }
@@ -866,13 +866,13 @@ int qwen_decoder_forward_batch(qwen_ctx_t *ctx, qwen_kv_t **kvs, int n,
             qwen_apply_rope_neox(q + (size_t)s * q_dim, rc, rs, 1, n_heads, head_dim);
             qwen_apply_rope_neox(k + (size_t)s * kv_dim, rc, rs, 1, n_kv_heads, head_dim);
 
-            float *dst_k = kvs[s]->k + ((size_t)layer * kvs[s]->max + pos) * kv_dim;
-            float *dst_v = kvs[s]->v + ((size_t)layer * kvs[s]->max + pos) * kv_dim;
-            memcpy(dst_k, k + (size_t)s * kv_dim, kv_dim * sizeof(float));
-            memcpy(dst_v, v + (size_t)s * kv_dim, kv_dim * sizeof(float));
+            qwen_f16_t *dst_k = kvs[s]->k + ((size_t)layer * kvs[s]->max + pos) * kv_dim;
+            qwen_f16_t *dst_v = kvs[s]->v + ((size_t)layer * kvs[s]->max + pos) * kv_dim;
+            qwen_f32_to_f16_row(dst_k, k + (size_t)s * kv_dim, kv_dim);
+            qwen_f32_to_f16_row(dst_v, v + (size_t)s * kv_dim, kv_dim);
 
-            float *full_k = kvs[s]->k + (size_t)layer * kvs[s]->max * kv_dim;
-            float *full_v = kvs[s]->v + (size_t)layer * kvs[s]->max * kv_dim;
+            qwen_f16_t *full_k = kvs[s]->k + (size_t)layer * kvs[s]->max * kv_dim;
+            qwen_f16_t *full_v = kvs[s]->v + (size_t)layer * kvs[s]->max * kv_dim;
             qwen_causal_attention(attn_out + (size_t)s * q_dim, q + (size_t)s * q_dim,
                                   full_k, full_v, 1, pos + 1, n_heads, n_kv_heads,
                                   head_dim, scale, pos);
@@ -1001,10 +1001,10 @@ int qwen_decoder_prefill_multi(qwen_ctx_t *ctx, qwen_kv_t **kvs,
             qwen_apply_rope_neox(qi, rope_cos, rope_sin, len, n_heads, head_dim);
             qwen_apply_rope_neox(ki, rope_cos, rope_sin, len, n_kv_heads, head_dim);
 
-            float *ck = kvs[i]->k + (size_t)layer * kvs[i]->max * kv_dim;
-            float *cv = kvs[i]->v + (size_t)layer * kvs[i]->max * kv_dim;
-            memcpy(ck, ki, (size_t)len * kv_dim * sizeof(float));
-            memcpy(cv, vi, (size_t)len * kv_dim * sizeof(float));
+            qwen_f16_t *ck = kvs[i]->k + (size_t)layer * kvs[i]->max * kv_dim;
+            qwen_f16_t *cv = kvs[i]->v + (size_t)layer * kvs[i]->max * kv_dim;
+            qwen_f32_to_f16_row(ck, ki, len * kv_dim);
+            qwen_f32_to_f16_row(cv, vi, len * kv_dim);
 
             qwen_causal_attention(attn_out + (size_t)off * q_dim, qi, ck, cv,
                                   len, len, n_heads, n_kv_heads, head_dim, scale, 0);

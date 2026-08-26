@@ -26,6 +26,9 @@ void qwen_q8_argmax_range_generic(const int8_t *qx, const float *sx,
 void qwen_q4_matvec_generic(float *y, const int8_t *qx, const float *sx,
                             const int8_t *W, const float *ws,
                             int in_dim, int rows);
+void qwen_q4_matvec_m_generic(float *y, int ldy, const int8_t *qx, const float *sx,
+                              int m, const int8_t *W, const float *ws,
+                              int in_dim, int rows);
 void qwen_q8_matvec_m_generic(float *y, int ldy, const int8_t *qx, const float *sx,
                               int m, const int8_t *W, const float *ws,
                               int in_dim, int rows);
@@ -61,6 +64,7 @@ void qwen_vec_scale_add_wasm(float *dst, const float *src, float correction, int
 #define qwen_argmax_bf16_range_impl qwen_argmax_bf16_range_wasm
 #define qwen_q8_matvec_impl qwen_q8_matvec_wasm
 #define qwen_q8_matvec_m_impl qwen_q8_matvec_m_wasm
+#define qwen_q4_matvec_m_impl qwen_q4_matvec_m_generic
 #define qwen_q4_matvec_impl qwen_q4_matvec_generic
 #define qwen_q8_argmax_range_impl qwen_q8_argmax_range_wasm
 #define qwen_q8_quantize_row_impl qwen_q8_quantize_row_wasm
@@ -85,6 +89,9 @@ void qwen_q8_argmax_range_neon(const int8_t *qx, const float *sx,
 void qwen_q4_matvec_neon(float *y, const int8_t *qx, const float *sx,
                          const int8_t *W, const float *ws,
                          int in_dim, int rows);
+void qwen_q4_matvec_m_neon(float *y, int ldy, const int8_t *qx, const float *sx,
+                           int m, const int8_t *W, const float *ws,
+                           int in_dim, int rows);
 void qwen_q8_matvec_m_neon(float *y, int ldy, const int8_t *qx, const float *sx,
                            int m, const int8_t *W, const float *ws,
                            int in_dim, int rows);
@@ -98,6 +105,7 @@ void qwen_vec_scale_add_neon(float *dst, const float *src, float correction, int
 #define qwen_argmax_bf16_range_impl qwen_argmax_bf16_range_neon
 #define qwen_q8_matvec_impl qwen_q8_matvec_neon
 #define qwen_q8_matvec_m_impl qwen_q8_matvec_m_neon
+#define qwen_q4_matvec_m_impl qwen_q4_matvec_m_neon
 #define qwen_q4_matvec_impl qwen_q4_matvec_neon
 #define qwen_q8_argmax_range_impl qwen_q8_argmax_range_neon
 #define qwen_q8_quantize_row_impl qwen_q8_quantize_row_neon
@@ -129,6 +137,7 @@ void qwen_vec_scale_add_avx(float *dst, const float *src, float correction, int 
 #define qwen_argmax_bf16_range_impl qwen_argmax_bf16_range_avx
 #define qwen_q8_matvec_impl qwen_q8_matvec_avx
 #define qwen_q8_matvec_m_impl qwen_q8_matvec_m_generic
+#define qwen_q4_matvec_m_impl qwen_q4_matvec_m_generic
 #define qwen_q4_matvec_impl qwen_q4_matvec_generic
 #define qwen_q8_argmax_range_impl qwen_q8_argmax_range_avx
 #define qwen_q8_quantize_row_impl qwen_q8_quantize_row_avx
@@ -142,6 +151,7 @@ void qwen_vec_scale_add_avx(float *dst, const float *src, float correction, int 
 #define qwen_argmax_bf16_range_impl qwen_argmax_bf16_range_generic
 #define qwen_q8_matvec_impl qwen_q8_matvec_generic
 #define qwen_q8_matvec_m_impl qwen_q8_matvec_m_generic
+#define qwen_q4_matvec_m_impl qwen_q4_matvec_m_generic
 #define qwen_q4_matvec_impl qwen_q4_matvec_generic
 #define qwen_q8_argmax_range_impl qwen_q8_argmax_range_generic
 #define qwen_q8_quantize_row_impl qwen_q8_quantize_row_generic

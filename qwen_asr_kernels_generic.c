@@ -213,3 +213,66 @@ void qwen_q4_matvec_generic(float *y, const int8_t *qx, const float *sx,
         y[o] = acc;
     }
 }
+
+/* 4-bit weights against M activation rows at once.
+ *
+ * The counterpart to the Q8 batched kernel, and it matters more here: a short
+ * sequence would otherwise fall to the panel path, which dequantizes the whole
+ * matrix into f32 to hand it to sgemm - fine amortized over a long prefill,
+ * ruinous for the 2-8 rows a batched segment decode asks for. Unpacking each
+ * block's nibbles once and dotting them against all M rows keeps the weight
+ * read down to one pass. */
+#define Q4_MATVEC_M_KERNEL(NAME, M)                                            \
+static void NAME(float *y, int ldy, const int8_t *qx, const float *sx,         \
+                 const int8_t *W, const float *ws, int in_dim, int rows) {     \
+    int nb = in_dim / Q8B;                                                     \
+    const int half = Q8B / 2;                                                  \
+    for (int o = 0; o < rows; o++) {                                           \
+        const unsigned char *w =                                               \
+            (const unsigned char *)W + (size_t)o * (in_dim / 2);               \
+        const float *s = ws + (size_t)o * nb;                                  \
+        float acc[M];                                                          \
+        for (int r = 0; r < M; r++) acc[r] = 0.0f;                             \
+        for (int b = 0; b < nb; b++) {                                         \
+            const unsigned char *wb = w + (size_t)b * half;                    \
+            float sc = s[b];                                                   \
+            int8_t lo[Q8B / 2], hi[Q8B / 2];                                   \
+            for (int j = 0; j < half; j++) {                                    \
+                lo[j] = (int8_t)((int)(wb[j] & 0x0F) - 8);                     \
+                hi[j] = (int8_t)((int)(wb[j] >> 4) - 8);                       \
+            }                                                                  \
+            for (int r = 0; r < M; r++) {                                      \
+                const int8_t *xb = qx + (size_t)r * in_dim + b * Q8B;          \
+                int32_t d = 0;                                                 \
+                for (int j = 0; j < half; j++)                                 \
+                    d += (int32_t)lo[j] * (int32_t)xb[j] +                     \
+                         (int32_t)hi[j] * (int32_t)xb[j + half];               \
+                acc[r] += (float)d * sc * sx[(size_t)r * nb + b];              \
+            }                                                                  \
+        }                                                                      \
+        for (int r = 0; r < M; r++) y[(size_t)r * ldy + o] = acc[r];           \
+    }                                                                          \
+}
+
+Q4_MATVEC_M_KERNEL(q4_mv_m1, 1)
+Q4_MATVEC_M_KERNEL(q4_mv_m2, 2)
+Q4_MATVEC_M_KERNEL(q4_mv_m4, 4)
+Q4_MATVEC_M_KERNEL(q4_mv_m8, 8)
+
+void qwen_q4_matvec_m_generic(float *y, int ldy, const int8_t *qx, const float *sx,
+                              int m, const int8_t *W, const float *ws,
+                              int in_dim, int rows) {
+    int nb = in_dim / Q8B;
+    int off = 0;
+    while (off < m) {
+        int take = m - off;
+        const int8_t *x = qx + (size_t)off * in_dim;
+        const float *xs = sx + (size_t)off * nb;
+        float *dst = y + (size_t)off * ldy;
+        if (take >= 8)      { q4_mv_m8(dst, ldy, x, xs, W, ws, in_dim, rows); take = 8; }
+        else if (take >= 4) { q4_mv_m4(dst, ldy, x, xs, W, ws, in_dim, rows); take = 4; }
+        else if (take >= 2) { q4_mv_m2(dst, ldy, x, xs, W, ws, in_dim, rows); take = 2; }
+        else                { q4_mv_m1(dst, ldy, x, xs, W, ws, in_dim, rows); take = 1; }
+        off += take;
+    }
+}

@@ -883,10 +883,10 @@ static inline float q8_bf16_to_f32(uint16_t h) {
 }
 
 size_t qwen_q8_bytes(const qwen_q8_mat_t *m) {
+    if (!m || !m->q) return 0;
     if (QWEN_IS_Q4(m))
         return (size_t)m->rows * m->cols / 2 +
                (size_t)m->rows * (m->cols / QWEN_Q8_BLOCK) * sizeof(float);
-    if (!m || !m->q) return 0;
     size_t n = (size_t)m->rows * m->cols;
     return n + (n / QWEN_Q8_BLOCK) * sizeof(float);
 }
@@ -1483,6 +1483,26 @@ static void q4_matvec_worker(int tid, int n_threads, void *arg) {
     }
 }
 
+static void q4_matvec_m_worker(int tid, int n_threads, void *arg) {
+    (void)tid;
+    q8_matvec_m_task_t *t = (q8_matvec_m_task_t *)arg;
+    const qwen_q8_mat_t *W = t->W;
+    int nb = W->cols / QWEN_Q8_BLOCK;
+    int chunk = qwen_chunk_size(W->rows, n_threads, 32);
+
+    for (int c = qwen_claim_chunk(); ; c = qwen_claim_chunk()) {
+        int start = c * chunk;
+        if (start >= W->rows) return;
+        int end = start + chunk;
+        if (end > W->rows) end = W->rows;
+
+        qwen_q4_matvec_m_impl(t->y + start, t->ldy, t->qx, t->sx, t->m,
+                              W->q + (size_t)start * (W->cols / 2),
+                              W->scales + (size_t)start * nb,
+                              W->cols, end - start);
+    }
+}
+
 static void q8_linear_prefill(float *y, const float *x, const qwen_q8_mat_t *W,
                               int seq_len) {
     int cols = W->cols;
@@ -1572,6 +1592,15 @@ void qwen_linear_nobias_q8(float *y, const float *x, const qwen_q8_mat_t *W,
             if (q8_act_prepare(x, W->cols) != 0) return;
             q8_matvec_task_t task = { y, q8_act_q, q8_act_s, W };
             parallel_for(q4_matvec_worker, &task);
+            return;
+        }
+        /* Batched segment decode asks for 2-8 rows. Sending those to the panel
+         * path would dequantize the whole matrix into f32 for a handful of
+         * rows, which measured ten times slower than Q8 on a segmented run. */
+        if (seq_len <= qwen_q8_batch_max()) {
+            if (q8_act_prepare_m(x, W->cols, seq_len) != 0) return;
+            q8_matvec_m_task_t task = { y, W->rows, q8_act_q, q8_act_s, seq_len, W };
+            parallel_for(q4_matvec_m_worker, &task);
             return;
         }
         q8_linear_prefill(y, x, W, seq_len);

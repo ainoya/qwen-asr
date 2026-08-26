@@ -526,3 +526,79 @@ void qwen_q4_matvec_neon(float *y, const int8_t *qx, const float *sx,
 #endif
     }
 }
+
+/* 4-bit weights against M activation rows, NEON.
+ *
+ * The nibble unpack is the expensive part per weight byte, so it is hoisted out
+ * of the row loop: each 16-byte load becomes two int8x16 vectors that stay in
+ * registers while all M rows dot against them. At M=4 that is 4 unpacked
+ * vectors plus 4 accumulators plus the activation loads, which still fits. */
+#ifdef __ARM_FEATURE_DOTPROD
+#define Q4_MATVEC_M_NEON(NAME, M)                                              \
+static void NAME(float *y, int ldy, const int8_t *qx, const float *sx,         \
+                 const int8_t *W, const float *ws, int in_dim, int rows) {     \
+    int nb = in_dim / Q8B;                                                     \
+    const int half = Q8B / 2;                                                  \
+    const uint8x16_t mask = vdupq_n_u8(0x0F);                                  \
+    const int8x16_t bias = vdupq_n_s8(8);                                      \
+    for (int o = 0; o < rows; o++) {                                           \
+        const int8_t *w = W + (size_t)o * (in_dim / 2);                        \
+        const float *s = ws + (size_t)o * nb;                                  \
+        float32x4_t accf[M];                                                   \
+        for (int r = 0; r < M; r++) accf[r] = vdupq_n_f32(0.0f);               \
+        for (int b = 0; b < nb; b++) {                                         \
+            const int8_t *wb = w + (size_t)b * half;                           \
+            int32x4_t a[M];                                                    \
+            for (int r = 0; r < M; r++) a[r] = vdupq_n_s32(0);                 \
+            for (int j = 0; j < half; j += 16) {                               \
+                uint8x16_t raw = vld1q_u8((const uint8_t *)(wb + j));          \
+                int8x16_t lo =                                                 \
+                    vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask)), bias);  \
+                int8x16_t hi =                                                 \
+                    vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), bias);   \
+                for (int r = 0; r < M; r++) {                                  \
+                    const int8_t *xb = qx + (size_t)r * in_dim + b * Q8B;      \
+                    a[r] = vdotq_s32(a[r], lo, vld1q_s8(xb + j));              \
+                    a[r] = vdotq_s32(a[r], hi, vld1q_s8(xb + half + j));       \
+                }                                                              \
+            }                                                                  \
+            float sc = s[b];                                                   \
+            for (int r = 0; r < M; r++)                                        \
+                accf[r] = vfmaq_n_f32(accf[r], vcvtq_f32_s32(a[r]),            \
+                                      sc * sx[(size_t)r * nb + b]);            \
+        }                                                                      \
+        for (int r = 0; r < M; r++)                                            \
+            y[(size_t)r * ldy + o] = vaddvq_f32(accf[r]);                      \
+    }                                                                          \
+}
+
+Q4_MATVEC_M_NEON(q4n_mv_m1, 1)
+Q4_MATVEC_M_NEON(q4n_mv_m2, 2)
+Q4_MATVEC_M_NEON(q4n_mv_m4, 4)
+Q4_MATVEC_M_NEON(q4n_mv_m8, 8)
+#endif
+
+void qwen_q4_matvec_m_neon(float *y, int ldy, const int8_t *qx, const float *sx,
+                           int m, const int8_t *W, const float *ws,
+                           int in_dim, int rows) {
+#ifdef __ARM_FEATURE_DOTPROD
+    int nb = in_dim / Q8B;
+    int off = 0;
+    while (off < m) {
+        int take = m - off;
+        const int8_t *x = qx + (size_t)off * in_dim;
+        const float *xs = sx + (size_t)off * nb;
+        float *dst = y + (size_t)off * ldy;
+        if (take >= 8)      { q4n_mv_m8(dst, ldy, x, xs, W, ws, in_dim, rows); take = 8; }
+        else if (take >= 4) { q4n_mv_m4(dst, ldy, x, xs, W, ws, in_dim, rows); take = 4; }
+        else if (take >= 2) { q4n_mv_m2(dst, ldy, x, xs, W, ws, in_dim, rows); take = 2; }
+        else                { q4n_mv_m1(dst, ldy, x, xs, W, ws, in_dim, rows); take = 1; }
+        off += take;
+    }
+#else
+    int nb = in_dim / Q8B;
+    for (int r = 0; r < m; r++)
+        qwen_q4_matvec_neon(y + (size_t)r * ldy, qx + (size_t)r * in_dim,
+                            sx + (size_t)r * nb, W, ws, in_dim, rows);
+#endif
+}

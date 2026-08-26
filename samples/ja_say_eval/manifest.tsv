@@ -1,19 +1,19 @@
 sample_id	case_id	category	profile	voice	rate	wav	reference
-daily__kyoko_normal	daily	daily	kyoko_normal	Kyoko	180	audio/daily__kyoko_normal.wav	audio/daily__kyoko_normal.txt
-daily__eddy_fast	daily	daily	eddy_fast	Eddy (日本語（日本）)	215	audio/daily__eddy_fast.wav	audio/daily__eddy_fast.txt
-daily__grandpa_slow	daily	daily	grandpa_slow	Grandpa (日本語（日本）)	155	audio/daily__grandpa_slow.wav	audio/daily__grandpa_slow.txt
-schedule__kyoko_normal	schedule	numbers	kyoko_normal	Kyoko	180	audio/schedule__kyoko_normal.wav	audio/schedule__kyoko_normal.txt
-schedule__eddy_fast	schedule	numbers	eddy_fast	Eddy (日本語（日本）)	215	audio/schedule__eddy_fast.wav	audio/schedule__eddy_fast.txt
-schedule__grandpa_slow	schedule	numbers	grandpa_slow	Grandpa (日本語（日本）)	155	audio/schedule__grandpa_slow.wav	audio/schedule__grandpa_slow.txt
-figures__kyoko_normal	figures	numbers	kyoko_normal	Kyoko	180	audio/figures__kyoko_normal.wav	audio/figures__kyoko_normal.txt
-figures__eddy_fast	figures	numbers	eddy_fast	Eddy (日本語（日本）)	215	audio/figures__eddy_fast.wav	audio/figures__eddy_fast.txt
-figures__grandpa_slow	figures	numbers	grandpa_slow	Grandpa (日本語（日本）)	155	audio/figures__grandpa_slow.wav	audio/figures__grandpa_slow.txt
-names__kyoko_normal	names	proper_nouns	kyoko_normal	Kyoko	180	audio/names__kyoko_normal.wav	audio/names__kyoko_normal.txt
-names__eddy_fast	names	proper_nouns	eddy_fast	Eddy (日本語（日本）)	215	audio/names__eddy_fast.wav	audio/names__eddy_fast.txt
-names__grandpa_slow	names	proper_nouns	grandpa_slow	Grandpa (日本語（日本）)	155	audio/names__grandpa_slow.wav	audio/names__grandpa_slow.txt
-technical__kyoko_normal	technical	code_switch	kyoko_normal	Kyoko	180	audio/technical__kyoko_normal.wav	audio/technical__kyoko_normal.txt
-technical__eddy_fast	technical	code_switch	eddy_fast	Eddy (日本語（日本）)	215	audio/technical__eddy_fast.wav	audio/technical__eddy_fast.txt
-technical__grandpa_slow	technical	code_switch	grandpa_slow	Grandpa (日本語（日本）)	155	audio/technical__grandpa_slow.wav	audio/technical__grandpa_slow.txt
-context__kyoko_normal	context	homophones	kyoko_normal	Kyoko	180	audio/context__kyoko_normal.wav	audio/context__kyoko_normal.txt
-context__eddy_fast	context	homophones	eddy_fast	Eddy (日本語（日本）)	215	audio/context__eddy_fast.wav	audio/context__eddy_fast.txt
-context__grandpa_slow	context	homophones	grandpa_slow	Grandpa (日本語（日本）)	155	audio/context__grandpa_slow.wav	audio/context__grandpa_slow.txt
+daily__kyoko_normal	daily	daily	kyoko_normal	Kyoko	180	audio/daily__kyoko_normal.wav	references/daily__kyoko_normal.txt
+daily__eddy_fast	daily	daily	eddy_fast	Eddy (日本語（日本）)	215	audio/daily__eddy_fast.wav	references/daily__eddy_fast.txt
+daily__grandpa_slow	daily	daily	grandpa_slow	Grandpa (日本語（日本）)	155	audio/daily__grandpa_slow.wav	references/daily__grandpa_slow.txt
+schedule__kyoko_normal	schedule	numbers	kyoko_normal	Kyoko	180	audio/schedule__kyoko_normal.wav	references/schedule__kyoko_normal.txt
+schedule__eddy_fast	schedule	numbers	eddy_fast	Eddy (日本語（日本）)	215	audio/schedule__eddy_fast.wav	references/schedule__eddy_fast.txt
+schedule__grandpa_slow	schedule	numbers	grandpa_slow	Grandpa (日本語（日本）)	155	audio/schedule__grandpa_slow.wav	references/schedule__grandpa_slow.txt
+figures__kyoko_normal	figures	numbers	kyoko_normal	Kyoko	180	audio/figures__kyoko_normal.wav	references/figures__kyoko_normal.txt
+figures__eddy_fast	figures	numbers	eddy_fast	Eddy (日本語（日本）)	215	audio/figures__eddy_fast.wav	references/figures__eddy_fast.txt
+figures__grandpa_slow	figures	numbers	grandpa_slow	Grandpa (日本語（日本）)	155	audio/figures__grandpa_slow.wav	references/figures__grandpa_slow.txt
+names__kyoko_normal	names	proper_nouns	kyoko_normal	Kyoko	180	audio/names__kyoko_normal.wav	references/names__kyoko_normal.txt
+names__eddy_fast	names	proper_nouns	eddy_fast	Eddy (日本語（日本）)	215	audio/names__eddy_fast.wav	references/names__eddy_fast.txt
+names__grandpa_slow	names	proper_nouns	grandpa_slow	Grandpa (日本語（日本）)	155	audio/names__grandpa_slow.wav	references/names__grandpa_slow.txt
+technical__kyoko_normal	technical	code_switch	kyoko_normal	Kyoko	180	audio/technical__kyoko_normal.wav	references/technical__kyoko_normal.txt
+technical__eddy_fast	technical	code_switch	eddy_fast	Eddy (日本語（日本）)	215	audio/technical__eddy_fast.wav	references/technical__eddy_fast.txt
+technical__grandpa_slow	technical	code_switch	grandpa_slow	Grandpa (日本語（日本）)	155	audio/technical__grandpa_slow.wav	references/technical__grandpa_slow.txt
+context__kyoko_normal	context	homophones	kyoko_normal	Kyoko	180	audio/context__kyoko_normal.wav	references/context__kyoko_normal.txt
+context__eddy_fast	context	homophones	eddy_fast	Eddy (日本語（日本）)	215	audio/context__eddy_fast.wav	references/context__eddy_fast.txt
+context__grandpa_slow	context	homophones	grandpa_slow	Grandpa (日本語（日本）)	155	audio/context__grandpa_slow.wav	references/context__grandpa_slow.txt

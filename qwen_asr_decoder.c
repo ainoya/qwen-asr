@@ -66,11 +66,57 @@ static uint16_t *load_bf16_direct(multi_safetensors_t *ms, const char *name) {
  * than from the original bf16 costs almost nothing at this width: the block
  * scale is already correct and only the 16-level grid matters. Doing it this
  * way means the packed-image and bf16 load paths share one conversion. */
-static int narrow_to_q4(qwen_q8_mat_t *m) {
+static int narrow_to_q4_scaled(qwen_q8_mat_t *m, const float *colscale) {
     qwen_q8_mat_t q4;
-    if (qwen_q4_from_q8(&q4, m) != 0) return -1;
+    int rc = colscale ? qwen_q4_from_q8_scaled(&q4, m, colscale)
+                      : qwen_q4_from_q8(&q4, m);
+    if (rc != 0) return -1;
     if (m->owns) qwen_q8_free(m);   /* only free a copy we made ourselves */
     *m = q4;
+    return 0;
+}
+
+/* Narrow one layer's six matrices to four bits, optionally rescaling channels
+ * (AWQ) on the way.
+ *
+ * Rescaling needs the matching input channel divided by the same factor. Every
+ * such division folds into something already there, so inference is untouched:
+ * q/k/v are fed by input_layernorm and gate/up by post_attention_layernorm, so
+ * the reciprocal goes into that norm's weight; down's input is the SwiGLU
+ * product, so it goes into the `up` rows of the fused gate/up matrix (rows
+ * interleave as gate0, up0, gate1, up1, ...), which is exact because only a
+ * block scale changes.
+ *
+ * O is deliberately left unscaled. Under grouped-query attention two of its
+ * input channels share one V row, so a per-channel division has nowhere exact
+ * to fold - and O measured the smallest gain of the four groups anyway (4.6%,
+ * against 19% for down and 16% for q/k/v). */
+static int narrow_layer_to_q4(qwen_dec_layer_t *l, int layer, qwen_awq_t *awq,
+                              int hidden, int inter) {
+    char key[64];
+    const float *s;
+
+    snprintf(key, sizeof(key), "L%02d.q", layer);
+    s = awq ? qwen_awq_scales(awq, key, hidden) : NULL;
+    qwen_q8_mat_t *attn[] = { &l->wq_q8, &l->wk_q8, &l->wv_q8 };
+    for (size_t k = 0; k < sizeof(attn) / sizeof(attn[0]); k++) {
+        if (narrow_to_q4_scaled(attn[k], s) != 0) return -1;
+    }
+    if (s && l->input_norm)
+        for (int c = 0; c < hidden; c++) l->input_norm[c] /= s[c];
+
+    snprintf(key, sizeof(key), "L%02d.gate_up", layer);
+    s = awq ? qwen_awq_scales(awq, key, hidden) : NULL;
+    if (narrow_to_q4_scaled(&l->gate_up_q8, s) != 0) return -1;
+    if (s && l->post_attn_norm)
+        for (int c = 0; c < hidden; c++) l->post_attn_norm[c] /= s[c];
+
+    snprintf(key, sizeof(key), "L%02d.down", layer);
+    s = awq ? qwen_awq_scales(awq, key, inter) : NULL;
+    if (narrow_to_q4_scaled(&l->down_q8, s) != 0) return -1;
+    if (s) qwen_q8_scale_rows(&l->gate_up_q8, s, 1, 2, inter);
+
+    if (narrow_to_q4_scaled(&l->wo_q8, NULL) != 0) return -1;
     return 0;
 }
 
@@ -135,6 +181,25 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
         q8_bytes += qwen_q8_bytes(&dec->tok_embeddings_q8);
     }
 
+    /* Channel rescaling is only a 4-bit concern: it trades resolution between
+     * channels sharing a block, and eight bits has enough to go round. */
+    qwen_awq_t *awq = NULL;
+    const char *awq_env = getenv("QWEN_AWQ");
+    const char *awq_file = (awq_env && awq_env[0]) ? awq_env : qwen_awq_path;
+    if (use_q4_layers && awq_file) {
+        double alpha = qwen_awq_alpha;
+        const char *ae = getenv("QWEN_AWQ_ALPHA");
+        if (ae && ae[0]) alpha = atof(ae);
+        awq = qwen_awq_open(awq_file, alpha);
+        if (!awq) {
+            fprintf(stderr, "decoder: cannot use AWQ statistics from %s\n", awq_file);
+            return -1;
+        }
+        if (qwen_verbose > 0)
+            fprintf(stderr, "AWQ channel rescaling from %s, alpha %.2f\n",
+                    awq_file, alpha);
+    }
+
     /* Transformer layers */
     for (int i = 0; i < cfg->dec_layers; i++) {
         qwen_dec_layer_t *l = &dec->layers[i];
@@ -168,12 +233,15 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
                     fprintf(stderr, "decoder: packed model missing %s.q8\n", name);
                     return -1;
                 }
-                if (use_q4_layers && narrow_to_q4(q8[k].dst) != 0) {
-                    fprintf(stderr, "decoder: 4-bit conversion failed for %s\n", name);
-                    return -1;
-                }
-                q8_bytes += qwen_q8_bytes(q8[k].dst);
             }
+            if (use_q4_layers &&
+                narrow_layer_to_q4(l, i, awq, cfg->dec_hidden,
+                                   cfg->dec_intermediate) != 0) {
+                fprintf(stderr, "decoder: 4-bit conversion failed at layer %d\n", i);
+                return -1;
+            }
+            for (size_t k = 0; k < sizeof(q8) / sizeof(q8[0]); k++)
+                q8_bytes += qwen_q8_bytes(q8[k].dst);
             continue;
         }
 
@@ -221,15 +289,10 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
                     fprintf(stderr, "decoder: quantization failed at layer %d\n", i);
                     return -1;
                 }
-                if (use_q4_layers) {
-                    qwen_q8_mat_t *all[] = { &l->wq_q8, &l->wk_q8, &l->wv_q8,
-                                             &l->wo_q8, &l->gate_up_q8, &l->down_q8 };
-                    for (size_t k = 0; k < sizeof(all) / sizeof(all[0]); k++) {
-                        if (narrow_to_q4(all[k]) != 0) {
-                            fprintf(stderr, "decoder: 4-bit conversion failed at layer %d\n", i);
-                            return -1;
-                        }
-                    }
+                if (use_q4_layers &&
+                    narrow_layer_to_q4(l, i, awq, hidden, inter) != 0) {
+                    fprintf(stderr, "decoder: 4-bit conversion failed at layer %d\n", i);
+                    return -1;
                 }
                 q8_bytes += qwen_q8_bytes(&l->wq_q8) + qwen_q8_bytes(&l->wk_q8) +
                             qwen_q8_bytes(&l->wv_q8) + qwen_q8_bytes(&l->wo_q8) +
@@ -246,6 +309,8 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
             }
         }
     }
+
+    qwen_awq_close(awq);
 
     /* Final RMSNorm */
     dec->norm = load_f32(ms, "thinker.model.norm.weight");

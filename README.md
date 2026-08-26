@@ -81,6 +81,7 @@ Tokens stream to stdout as they are generated. By default, timing info is printe
 ```bash
 ./qwen_asr -d qwen3-asr-1.7b -i audio.wav                    # q8 (default)
 ./qwen_asr -d qwen3-asr-1.7b -i audio.wav --weights q8-lm    # also quantize the LM head
+./qwen_asr -d qwen3-asr-1.7b -i audio.wav --weights q4       # 4-bit layers, opt-in
 ./qwen_asr -d qwen3-asr-1.7b -i audio.wav --weights bf16     # no quantization
 ```
 
@@ -93,7 +94,8 @@ as blocks of 64 int8 values with one f32 scale — 1.0625 bytes per weight again
 |------|-------------------|--------------------|-------|
 | `bf16` | nothing | 3.44 GB | reference precision |
 | `q8` (default) | the 28 transformer layers | 1.50 GB + 0.62 GB bf16 LM head | quality-neutral on both models |
-| `q8-lm` | layers **and** the tied embedding / LM head | 1.83 GB | fastest; identical output on 1.7B, degrades 0.6B |
+| `q8-lm` | layers **and** the tied embedding / LM head | 1.83 GB | identical output on 1.7B, degrades 0.6B |
+| `q4` | layers at 4 bits, LM head Q8 | 1.01 GB | 1.43x on decode, but see below |
 
 The LM head is left in bf16 by default on purpose. It is only 18% of the bytes,
 but it decides the token: on the 0.6B model, block-int8 weights there flip
@@ -102,6 +104,58 @@ the sample set rises from 3.1% to 5.0%). On the 1.7B model `q8-lm` is
 output-identical across the whole regression suite, so it is a reasonable choice
 if you only run the large model. Quantizing the activation instead of the weight
 was ruled out as the cause — an f32-activation argmax made no difference.
+
+#### Four bits (`--weights q4`)
+
+Opt-in, and it should stay that way. Blocks of 64 nibbles plus one f32 scale is
+0.5625 bytes per weight, and since token generation is bandwidth bound that is
+close to a direct cut: decode over the Japanese eval set drops from 15.1 s to
+10.5 s (1.43x). Two things spoil it.
+
+Prefill gets *slower*, 9.9 s to 11.9 s. Sequences past the batched-matvec
+threshold take the panel path, which dequantizes into an f32 panel for `sgemm`,
+and four bits means more unpacking for the same multiply. The net over a whole
+run is only 1.10x.
+
+Quality drops about as much as the published INT4 numbers for this model family
+predict. Japanese CER goes 0.164 to 0.209; the English regression suite fails 2
+of 22 samples where `q8-lm` passes all 22.
+
+#### Channel rescaling (`--awq`)
+
+The 4-bit loss is uneven across input channels: a weight column feeding a loud
+activation channel deserves more of the quantization grid than one feeding a
+quiet channel. Scaling that column up and dividing the activation back down
+leaves the product unchanged but moves what the block quantizer sees.
+
+```bash
+tools/prep-calib.sh ~/recordings /tmp/calib 30 45      # 16 kHz mono clips
+sox /tmp/calib/*.wav /tmp/all.wav                      # or any concatenation
+./qwen_asr -d qwen3-asr-1.7b -i /tmp/all.wav -S 30 --calib-out act.qacs
+./qwen_asr -d qwen3-asr-1.7b -i audio.wav --weights q4 --awq act.qacs
+```
+
+Calibration needs audio only - no transcripts - and 25 minutes is plenty. Use
+recordings resembling what you will transcribe. Every division folds into a norm
+weight or into the block scales of the matrix that produced the activation, so
+inference itself costs nothing extra.
+
+It recovers most of what four bits gives up. Measured on 25 minutes of real
+Japanese speech, then evaluated on the Japanese set:
+
+| Weights | CER | Decode | Whole run |
+|---------|-----|--------|-----------|
+| `q8-lm` | 0.164 | 15.97 s | 31.2 s |
+| `q4` | 0.209 | 10.64 s | 26.5 s |
+| `q4 --awq` | 0.169 | 8.70 s | 24.2 s |
+
+`--awq-alpha` (default 0.25) sets the exponent and the optimum is sharp - 0.15
+gives 0.187 and 0.40 gives 0.236, worse than not rescaling at all. `--awq-search`
+reports what each value buys in weighted error, and picked the same 0.25.
+
+It does not make four bits safe everywhere. The two English regression samples
+that collapse at four bits collapse just as hard with rescaling (normalized
+error 0.245 and 0.437 without, 0.265 and 0.437 with), so `q4` stays opt-in.
 
 Quantization happens at load time from the mmap'd bf16 tensors, so no separate
 model file is needed; it adds a few hundred milliseconds to startup.

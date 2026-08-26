@@ -259,13 +259,22 @@ re-litigate these.
   relative error changes nothing.
 - **The L2 error metric is therefore a ranking tool, not a quality predictor.**
   Use it to compare candidate quantizations, never to claim a CER.
-- **AWQ has a measured ceiling of ~18% here.** `--awq-search` puts the overall
-  weighted error at 0.122 -> 0.100 with a global alpha of 0.25, which wins in
-  107 of 113 groups (so a per-group alpha table buys nothing). Gains concentrate
-  on the down projections (mean 19%) and q/k/v (16%); O gains 5%. That closes
-  under a fifth of the distance from Q4 back to Q8, so it does not make four
-  bits quality-neutral - which matches the official Qwen3-ASR INT4 AWQ release
-  losing ~18% relative WER.
+- **AWQ works, and is worth more than its L2 number suggests.** `--awq-search`
+  puts the overall weighted error at 0.122 -> 0.100 with a global alpha of 0.25,
+  which wins in 107 of 113 groups (a per-group alpha table buys nothing). That
+  is an 18% error reduction, but the effect on transcripts is far larger: with
+  `--awq` at that alpha, Japanese CER goes 0.209 -> 0.169 against a Q8 reference
+  of 0.164, recovering 88% of the gap. Do not extrapolate CER from the L2 metric
+  in either direction - it under-predicted here as badly as it over-predicted
+  for the V exemption.
+- **Alpha is sharply peaked and 0.25 is the optimum.** Measured Japanese CER:
+  0.15 -> 0.187, 0.25 -> 0.169, 0.40 -> 0.236. Going past the optimum is worse
+  than not rescaling at all.
+- **AWQ does not rescue the two English samples that break at four bits.**
+  `15s_there_are_two_of_them_out_there` and `21s_hey_thats_us_were_doing_all_right`
+  fail the suite at normalized error 0.245 and 0.437 without AWQ, and 0.265 and
+  0.437 with it. Those are collapses rather than marginal drift, so four bits
+  stays opt-in no matter how good the calibration is.
 
 ## Regression Workflow
 

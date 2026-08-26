@@ -1140,6 +1140,54 @@ int qwen_q4_from_q8(qwen_q8_mat_t *dst, const qwen_q8_mat_t *src) {
     return 0;
 }
 
+/* Q8 -> Q4, scaling column c by colscale[c] on the way through.
+ *
+ * This is the weight half of AWQ channel rescaling: the caller divides the
+ * matching input channel by the same factor - see the folding in
+ * qwen_asr_decoder.c - so the product is unchanged and only what the block
+ * quantizer sees moves. */
+int qwen_q4_from_q8_scaled(qwen_q8_mat_t *dst, const qwen_q8_mat_t *src,
+                           const float *colscale) {
+    if (!src->q || QWEN_IS_Q4(src) || !colscale) return -1;
+    if (q4_alloc(dst, src->rows, src->cols) != 0) return -1;
+    int nb = src->cols / QWEN_Q8_BLOCK;
+    float blk[QWEN_Q8_BLOCK];
+    for (int r = 0; r < src->rows; r++) {
+        const int8_t *q = src->q + (size_t)r * src->cols;
+        const float *s = src->scales + (size_t)r * nb;
+        for (int b = 0; b < nb; b++) {
+            float sc = s[b];
+            const int8_t *qb = q + b * QWEN_Q8_BLOCK;
+            const float *cs = colscale + b * QWEN_Q8_BLOCK;
+            for (int i = 0; i < QWEN_Q8_BLOCK; i++) blk[i] = (float)qb[i] * sc * cs[i];
+            q4_pack_block(dst->q + ((size_t)r * nb + b) * Q4_HALF,
+                          &dst->scales[(size_t)r * nb + b], blk);
+        }
+    }
+    return 0;
+}
+
+/* Divide rows row0, row0+stride, ... by s[0], s[1], ... - exactly, by touching
+ * only the block scales.
+ *
+ * This is how the *input* side of AWQ rescaling gets folded away for the O and
+ * down projections, which are not fed by a norm: O's input channel c is V's
+ * output row c, and down's input channel c is the fused gate/up matrix's `up`
+ * row c (rows interleave as gate0, up0, gate1, up1, ...), so scaling those rows
+ * scales the activation with no work at inference time. */
+void qwen_q8_scale_rows(qwen_q8_mat_t *m, const float *s, int row0, int stride,
+                        int n) {
+    if (!m->q || !m->scales || !s) return;
+    int nb = m->cols / QWEN_Q8_BLOCK;
+    for (int i = 0; i < n; i++) {
+        int r = row0 + i * stride;
+        if (r < 0 || r >= m->rows) break;
+        float inv = s[i] != 0.0f ? 1.0f / s[i] : 1.0f;
+        float *sc = m->scales + (size_t)r * nb;
+        for (int b = 0; b < nb; b++) sc[b] *= inv;
+    }
+}
+
 static float bf16_to_f32_(uint16_t h) {
     uint32_t bits = ((uint32_t)h) << 16;
     float f;

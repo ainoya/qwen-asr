@@ -111,6 +111,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "                   (used by the wasm/browser build; see README)\n");
     fprintf(stderr, "  --calib-out <f>  Record per-channel activation magnitudes to <f>\n");
     fprintf(stderr, "                   while transcribing (for quantization calibration)\n");
+    fprintf(stderr, "  --awq <f>     Rescale channels using the statistics in <f> when\n");
+    fprintf(stderr, "                narrowing weights to 4 bits (--weights q4 only)\n");
+    fprintf(stderr, "  --awq-alpha <a>  Rescaling exponent (default 0.25)\n");
     fprintf(stderr, "  --calib-rank <f> Rank matrices by the error 4-bit weights would\n");
     fprintf(stderr, "                   cost, using the statistics in <f>, and exit\n");
     fprintf(stderr, "  -h            Show this help\n");
@@ -138,6 +141,7 @@ int main(int argc, char **argv) {
     const char *calib_out = NULL;
     const char *calib_rank = NULL;
     const char *awq_search = NULL;
+    const char *awq_file = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -197,6 +201,10 @@ int main(int argc, char **argv) {
             calib_rank = argv[++i];
         } else if (strcmp(argv[i], "--awq-search") == 0 && i + 1 < argc) {
             awq_search = argv[++i];
+        } else if (strcmp(argv[i], "--awq") == 0 && i + 1 < argc) {
+            awq_file = argv[++i];
+        } else if (strcmp(argv[i], "--awq-alpha") == 0 && i + 1 < argc) {
+            qwen_awq_alpha = atof(argv[++i]);
         } else if (strcmp(argv[i], "--stdin") == 0) {
             use_stdin = 1;
         } else if (strcmp(argv[i], "--monitor") == 0) {
@@ -250,6 +258,8 @@ int main(int argc, char **argv) {
     qwen_set_threads(n_threads);
 
     /* Load model */
+    qwen_awq_path = awq_file;
+
     qwen_ctx_t *ctx = qwen_load(model_dir);
     if (!ctx) {
         fprintf(stderr, "Failed to load model from %s\n", model_dir);

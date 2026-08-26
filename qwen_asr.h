@@ -436,6 +436,24 @@ int qwen_calib_rank(const qwen_ctx_t *ctx, const char *path);
  * input, and report what it saves. Analysis only - it changes no weights. */
 int qwen_awq_search(const qwen_ctx_t *ctx, const char *path);
 
+/* AWQ channel scales derived from a statistics dump, for the decoder load path.
+ *
+ * Set qwen_awq_path (and optionally qwen_awq_alpha) before qwen_load(); the
+ * decoder picks them up while narrowing weights to four bits, and folds the
+ * matching input-side division into the preceding norm or into the matrix that
+ * produced the activation, so inference itself is unchanged. Only meaningful
+ * with QWEN_WEIGHTS_Q4. QWEN_AWQ / QWEN_AWQ_ALPHA override both. */
+extern const char *qwen_awq_path;
+extern double qwen_awq_alpha;
+
+typedef struct qwen_awq qwen_awq_t;
+qwen_awq_t *qwen_awq_open(const char *path, double alpha);
+void qwen_awq_close(qwen_awq_t *a);
+
+/* Scale vector for the matrix group recorded under `name`, or NULL when the
+ * dump has no matching entry of that width. Valid until the next call. */
+const float *qwen_awq_scales(qwen_awq_t *a, const char *name, int cols);
+
 /* ---------------------------------------------------------------------------
  * Batched decoding
  *

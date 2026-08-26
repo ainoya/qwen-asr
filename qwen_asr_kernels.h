@@ -165,6 +165,16 @@ void qwen_q8_free(qwen_q8_mat_t *m);
  * block scale is already right and only the 16-level grid matters. */
 int qwen_q4_from_q8(qwen_q8_mat_t *dst, const qwen_q8_mat_t *src);
 
+/* Q8 -> Q4, scaling column c by colscale[c] on the way through (AWQ). */
+int qwen_q4_from_q8_scaled(qwen_q8_mat_t *dst, const qwen_q8_mat_t *src,
+                           const float *colscale);
+
+/* Divide rows row0, row0+stride, ... (n of them) by s[0..n-1], exactly, by
+ * scaling the block scales. Folds the input side of AWQ rescaling into the
+ * matrix that produced that activation. */
+void qwen_q8_scale_rows(qwen_q8_mat_t *m, const float *s, int row0, int stride,
+                        int n);
+
 /* Quantize a row-major bf16 weight matrix to 4 bits. */
 int qwen_q4_from_bf16(qwen_q8_mat_t *m, const uint16_t *W_bf16, int rows, int cols);
 

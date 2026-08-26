@@ -464,3 +464,69 @@ int qwen_awq_search(const qwen_ctx_t *ctx, const char *path) {
                 100.0 * (1.0 - sqrt(tot_best / tot_a0)));
     return rc;
 }
+
+/* ========================================================================
+ * Applying the rescaling: scale vectors for the decoder load path
+ * ======================================================================== */
+
+struct qwen_awq {
+    calib_entry_t *v;
+    int n;
+    double alpha;
+    float *s;      /* scratch holding the most recently requested group */
+    uint32_t cap;
+};
+
+qwen_awq_t *qwen_awq_open(const char *path, double alpha) {
+    int n = 0;
+    calib_entry_t *v = calib_read(path, &n);
+    if (!v) return NULL;
+    qwen_awq_t *a = (qwen_awq_t *)calloc(1, sizeof(*a));
+    if (!a) { calib_entries_free(v, n); return NULL; }
+    a->v = v;
+    a->n = n;
+    a->alpha = alpha;
+    return a;
+}
+
+void qwen_awq_close(qwen_awq_t *a) {
+    if (!a) return;
+    calib_entries_free(a->v, a->n);
+    free(a->s);
+    free(a);
+}
+
+const float *qwen_awq_scales(qwen_awq_t *a, const char *name, int cols) {
+    if (!a) return NULL;
+    const calib_entry_t *e = calib_find(a->v, a->n, name);
+    if (!e || (int)e->cols != cols || e->rows <= 0) return NULL;
+
+    if (e->cols > a->cap) {
+        float *ns = (float *)realloc(a->s, (size_t)e->cols * sizeof(float));
+        if (!ns) return NULL;
+        a->s = ns;
+        a->cap = e->cols;
+    }
+    /* Normalising by the geometric mean keeps the scales centred on 1, so the
+     * block amax - and with it the quantization step - moves as little as the
+     * rescaling allows. */
+    double *mean = (double *)malloc((size_t)e->cols * sizeof(double));
+    if (!mean) return NULL;
+    for (uint32_t c = 0; c < e->cols; c++) mean[c] = e->absmean[c] / e->rows;
+    double g = awq_geomean(mean, (int)e->cols);
+    for (uint32_t c = 0; c < e->cols; c++) {
+        double ratio = mean[c] > 0 ? mean[c] / g : 1.0;
+        /* An all-but-silent channel would otherwise scale to nearly zero and
+         * take its whole block's resolution down with it. */
+        if (ratio < 1e-3) ratio = 1e-3;
+        a->s[c] = (float)pow(ratio, a->alpha);
+    }
+    free(mean);
+    return a->s;
+}
+
+/* Chosen by --awq-search over 25 minutes of real speech: 0.25 was the best of
+ * {0, 0.25, 0.5, 0.75, 1.0} in 107 of 113 matrix groups, so a per-group table
+ * would buy nothing over this constant. */
+const char *qwen_awq_path = NULL;
+double qwen_awq_alpha = 0.25;

@@ -1102,7 +1102,22 @@ static void q8_matvec_worker(int tid, int n_threads, void *arg) {
 
 /* ---- Short sequences: batched matvec, no dequantize ---- */
 
+static int q8_batch_max_override = -1;
+
+/* Setting this to 1 turns the batched path off, which is how a caller asks for
+ * the f32-activation panel path everywhere. That matters for more than
+ * benchmarking: the two paths are numerically different. The panel path
+ * dequantizes the weights and multiplies in f32, while the batched matvec
+ * quantizes the activations to int8, which costs about 2% relative error on
+ * the encoder's output. It buys 40% off the encoder's transformer stack on a
+ * short clip, so it stays on by default - but a reference dump that wants to
+ * be compared against f32 arithmetic needs to be able to ask for f32. */
+void qwen_set_q8_batch_max(int n) {
+    q8_batch_max_override = n < 0 ? -1 : n;
+}
+
 static int qwen_q8_batch_max(void) {
+    if (q8_batch_max_override >= 0) return q8_batch_max_override;
     static int v = -1;
     if (v < 0) {
         v = QWEN_Q8_BATCH_MAX;

@@ -90,7 +90,16 @@ function collectWavs(args) {
     const sp = P(m._qwen_wasm_alloc(samples.length * 4));
     m.HEAPF32.set(samples, sp / 4);
 
-    /* Embeddings: mel + encoder + prompt assembly. */
+    /* Embeddings: mel + encoder + prompt assembly.
+     *
+     * With --enc, ask for f32 activations first. The default batched Q8 matvec
+     * quantizes activations to int8 for sequences of 256 rows or fewer, which
+     * is most of the encoder's work on a short clip and shifts its output by
+     * about 2% relative - enough to swamp a GPU kernel check. The GPU shader
+     * multiplies in f32, so the reference has to as well. The reference
+     * transcript below is taken with the default path restored, since that is
+     * what the shipping pipeline does. */
+    if (wantEnc) m._qwen_wasm_set_q8_batch_max(1);
     if (m._qwen_wasm_embeds_start(sp, samples.length) !== 0) throw new Error(`${name}: embeds start`);
     while (!m._qwen_wasm_embeds_done()) await new Promise((r) => setImmediate(r));
     const seq = m._qwen_wasm_embeds_finish();
@@ -117,6 +126,8 @@ function collectWavs(args) {
       fs.writeFileSync(path.join(OUT_DIR, `${name}.encout.f32`),
                        Buffer.from(slice(outPtr, encTokens * encOutDim).buffer));
     }
+
+    if (wantEnc) m._qwen_wasm_set_q8_batch_max(-1);
 
     /* Reference transcript from the wasm decoder on the same audio. */
     if (m._qwen_wasm_batch_start(sp, samples.length) !== 0) throw new Error(`${name}: batch start`);

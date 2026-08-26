@@ -543,6 +543,9 @@ int qwen_wasm_enc_desc(unsigned int *out, int max_entries) {
     return n;
 }
 
+/* Ask for f32 activations everywhere (1) or restore the default (-1). */
+EMSCRIPTEN_KEEPALIVE void qwen_wasm_set_q8_batch_max(int n) { qwen_set_q8_batch_max(n); }
+
 /* Conv-stem tap; see qwen_enc_tap in qwen_asr.h. */
 EMSCRIPTEN_KEEPALIVE void qwen_wasm_enc_tap_set(int on) { qwen_enc_tap = on ? 1 : 0; }
 EMSCRIPTEN_KEEPALIVE float *qwen_wasm_enc_tap_mel(void) { return qwen_enc_tap_mel; }

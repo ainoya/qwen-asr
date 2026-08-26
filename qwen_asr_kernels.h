@@ -69,6 +69,11 @@ void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
 #define QWEN_Q8_BATCH_MAX 256
 #endif
 
+/* Override the batched-matvec threshold at runtime; -1 restores the default.
+ * See the note in qwen_asr_kernels.c - the two paths are not numerically
+ * equivalent, so this is how a caller asks for f32 activations throughout. */
+void qwen_set_q8_batch_max(int n);
+
 /* Activation rows handled per pass by the batched kernel (register budget). */
 #define QWEN_Q8_GROUP 16
 

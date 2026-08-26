@@ -55,6 +55,42 @@ static void out_append(const char *piece, void *userdata) {
     pthread_mutex_unlock(&g_out_mutex);
 }
 
+/* The stream's guess for audio it has not committed yet. Unlike the committed
+ * text this is not a queue: each chunk replaces it outright, and the page
+ * renders it after the committed text and dimmed. */
+static char *g_partial = NULL;
+static size_t g_partial_cap = 0;
+
+static void out_partial(const char *text, void *userdata) {
+    (void)userdata;
+    size_t n = strlen(text);
+    pthread_mutex_lock(&g_out_mutex);
+    if (n + 1 > g_partial_cap) {
+        size_t cap = g_partial_cap ? g_partial_cap : 256;
+        while (n + 1 > cap) cap *= 2;
+        char *tmp = (char *)realloc(g_partial, cap);
+        if (!tmp) { pthread_mutex_unlock(&g_out_mutex); return; }
+        g_partial = tmp;
+        g_partial_cap = cap;
+    }
+    memcpy(g_partial, text, n + 1);
+    pthread_mutex_unlock(&g_out_mutex);
+}
+
+/* Current provisional text. Caller frees. */
+EMSCRIPTEN_KEEPALIVE
+char *qwen_wasm_take_partial(void) {
+    pthread_mutex_lock(&g_out_mutex);
+    size_t n = g_partial ? strlen(g_partial) : 0;
+    char *r = (char *)malloc(n + 1);
+    if (r) {
+        memcpy(r, g_partial ? g_partial : "", n);
+        r[n] = '\0';
+    }
+    pthread_mutex_unlock(&g_out_mutex);
+    return r;
+}
+
 /* Hand the page everything emitted since the last call. Caller frees. */
 EMSCRIPTEN_KEEPALIVE
 char *qwen_wasm_take_text(void) {
@@ -92,6 +128,7 @@ int qwen_wasm_init(void *model, unsigned int model_len, const char *aux_dir,
     if (!g_ctx) return -1;
 
     qwen_set_token_callback(g_ctx, out_append, NULL);
+    qwen_set_partial_callback(g_ctx, out_partial, NULL);
     return 0;
 }
 
@@ -153,6 +190,19 @@ void qwen_wasm_set_batch_size(int n) {
     if (n < 1) n = 1;
     if (n > QWEN_MAX_BATCH) n = QWEN_MAX_BATCH;
     g_ctx->batch_size = n;
+}
+
+EMSCRIPTEN_KEEPALIVE
+/* Reuse previously decoded text as context for the next chunk.
+ *
+ * The CLI turns this on for --stream and the browser never did, which is not
+ * just a conditioning difference: the streaming loop's periodic re-anchor is
+ * gated on it, so with it off the decoded prefix grows for the whole session.
+ * Per-chunk prefill then grows with it and the stream falls further behind the
+ * longer someone talks. */
+EMSCRIPTEN_KEEPALIVE
+void qwen_wasm_set_past_text(int on) {
+    if (g_ctx) g_ctx->past_text_conditioning = on ? 1 : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -752,6 +802,9 @@ int qwen_wasm_stream_start(void) {
     reset_perf();
     free(g_stream_result);
     g_stream_result = NULL;
+    pthread_mutex_lock(&g_out_mutex);
+    if (g_partial) g_partial[0] = '\0';
+    pthread_mutex_unlock(&g_out_mutex);
 
     g_live = qwen_live_audio_create();
     if (!g_live) return -1;

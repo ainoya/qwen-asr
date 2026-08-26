@@ -251,6 +251,16 @@ Current streaming behavior in `qwen_transcribe_stream()`:
 - Prefix rollback policy for token stability
 - Monotonic commit frontier (no retracting already-emitted text)
 
+Provisional text:
+- `qwen_set_partial_callback()` fires once per chunk with the decoded tail past
+  the commit frontier - the hypothesis the loop already computes and used to
+  discard. Each call replaces the previous one; it may be revised or vanish.
+  Committed text still goes through `token_cb` and is never retracted.
+- CLI `--partial` draws it dimmed on stderr and erases it before the next
+  committed piece, so stdout keeps carrying only the transcription. Needs a
+  tty; ignored otherwise.
+- wasm: `qwen_wasm_take_partial()`, rendered by the demo as a `.partial` span.
+
 Debug/env switch:
 - `QWEN_STREAM_NO_ENC_CACHE=1` disables encoder window cache (debug/regression only)
 

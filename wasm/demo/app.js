@@ -61,12 +61,35 @@ function ensureSampleBuf(n) {
   return sampleBuf;
 }
 
+/* Committed text is append-only; the provisional guess replaces itself every
+ * chunk, so the two are separate nodes and only the second one is rewritten. */
+let committedText = "";
+
+function renderStream(partial) {
+  const out = $("out");
+  out.textContent = committedText;
+  if (partial) {
+    const span = document.createElement("span");
+    span.className = "partial";
+    span.textContent = partial;
+    out.appendChild(span);
+  }
+}
+
 function drainText() {
   const p = P(Module._qwen_wasm_take_text());
-  if (!p) return;
-  const s = Module.UTF8ToString(p);
-  Module._free(p);
-  if (s) $("out").textContent += s;
+  if (p) {
+    const s = Module.UTF8ToString(p);
+    Module._free(p);
+    if (s) committedText += s;
+  }
+  let partial = "";
+  const q = P(Module._qwen_wasm_take_partial());
+  if (q) {
+    partial = Module.UTF8ToString(q);
+    Module._free(q);
+  }
+  renderStream(partial);
 }
 
 function showPerf(audioSec) {
@@ -209,6 +232,7 @@ async function runBatch(bytes, label) {
   if (!ready || busy) return;
   busy = true;
   $("out").textContent = "";
+  committedText = "";
   $("perf").textContent = "";
   setStatus("decoding audio...");
   sendSettings();
@@ -306,7 +330,9 @@ async function runBatch(bytes, label) {
     const rp = P(Module._qwen_wasm_job_take());
     drainText();
     if (rp) {
-      $("out").textContent = Module.UTF8ToString(rp);
+      /* The final text supersedes both the committed run and the guess. */
+      committedText = Module.UTF8ToString(rp);
+      $("out").textContent = committedText;
       Module._free(rp);
     }
     showPerf(audioSec);
@@ -340,6 +366,7 @@ $("mic").onclick = async () => {
   busy = true;
   streamedSamples = 0;
   $("out").textContent = "";
+  committedText = "";
   $("perf").textContent = "";
   sendSettings();
 
@@ -394,7 +421,9 @@ $("micstop").onclick = async () => {
   if (poller) { clearInterval(poller); poller = null; }
   drainText();
   if (rp) {
-    $("out").textContent = Module.UTF8ToString(rp);
+    /* The final text supersedes both the committed run and the guess. */
+    committedText = Module.UTF8ToString(rp);
+    $("out").textContent = committedText;
     Module._free(rp);
   }
   showPerf(streamedSamples / 16000);
@@ -409,6 +438,7 @@ $("simstream").onclick = async () => {
   busy = true;
   streamedSamples = 0;
   $("out").textContent = "";
+  committedText = "";
   $("perf").textContent = "";
   sendSettings();
 
@@ -438,7 +468,9 @@ $("simstream").onclick = async () => {
     if (poller) { clearInterval(poller); poller = null; }
     drainText();
     if (rp) {
-      $("out").textContent = Module.UTF8ToString(rp);
+      /* The final text supersedes both the committed run and the guess. */
+      committedText = Module.UTF8ToString(rp);
+      $("out").textContent = committedText;
       Module._free(rp);
     }
     showPerf(streamedSamples / 16000);

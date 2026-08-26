@@ -8,15 +8,44 @@
 #include "qwen_asr_audio.h"
 #include "qwen_asr_kernels.h"
 #include <ctype.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* Token streaming callback: print each piece as it's decoded */
+/* Provisional streaming text.
+ *
+ * Committed text goes to stdout and must stay clean, so the guess ahead of it
+ * is drawn on stderr and erased before the next committed piece lands. The
+ * cursor is saved where the guess starts and restored to erase it, rather than
+ * counting characters: a terminal cell is not a code point, and Japanese text
+ * would need width tables to back over correctly. */
+static int partial_shown = 0;
+
+static void erase_partial(void) {
+    if (!partial_shown) return;
+    fputs("\0338\033[J", stderr);   /* restore saved cursor, clear from there */
+    fflush(stderr);
+    partial_shown = 0;
+}
+
 static void stream_token(const char *piece, void *userdata) {
     (void)userdata;
+    erase_partial();
     fputs(piece, stdout);
     fflush(stdout);
+}
+
+static void stream_partial(const char *text, void *userdata) {
+    (void)userdata;
+    erase_partial();
+    if (!text || !*text) return;
+    fflush(stdout);                  /* keep the two streams in step */
+    fputs("\0337", stderr);          /* save cursor where the guess starts */
+    fprintf(stderr, "\033[2m%s\033[0m", text);
+    fflush(stderr);
+    partial_shown = 1;
 }
 
 /* Parse --past-text value.
@@ -75,6 +104,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --monitor     Show inline Unicode symbols on stderr (streaming diagnostics)\n");
     fprintf(stderr, "  --debug       Debug output (per-layer details)\n");
     fprintf(stderr, "  --silent      No status output (only final transcription on stdout)\n");
+    fprintf(stderr, "  --partial     Streaming: show the not-yet-committed guess dimmed on stderr,\n");
+    fprintf(stderr, "                replaced as it firms up. Needs a terminal; stdout stays clean.\n");
     fprintf(stderr, "                 with -i + --stream, uses non-interactive final refinement\n");
     fprintf(stderr, "  --pack-q8 <out>  Write a pre-quantized single-file model image and exit\n");
     fprintf(stderr, "                   (used by the wasm/browser build; see README)\n");
@@ -89,6 +120,7 @@ int main(int argc, char **argv) {
     int n_threads = 0; /* 0 = auto-detect */
     float segment_sec = -1; /* -1 = use default (0) */
     int batch_size = -1;    /* -1 = use default */
+    int show_partial = 0;
     float search_sec = -1;  /* -1 = use default (3) */
     int stream_mode = 0;
     int stream_max_new_tokens = -1; /* -1 = use default (32) */
@@ -156,6 +188,8 @@ int main(int argc, char **argv) {
             qwen_monitor = 1;
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
+        } else if (strcmp(argv[i], "--partial") == 0) {
+            show_partial = 1;
         } else if (strcmp(argv[i], "--silent") == 0) {
             verbosity = 0;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -241,6 +275,11 @@ int main(int argc, char **argv) {
      * In silent mode we print the final string returned by the API. */
     if (emit_tokens) qwen_set_token_callback(ctx, stream_token, NULL);
     else qwen_set_token_callback(ctx, NULL, NULL);
+
+    /* Provisional text needs a terminal to draw and erase on; without one the
+     * escape codes would just litter a log. */
+    if (show_partial && emit_tokens && isatty(fileno(stderr)))
+        qwen_set_partial_callback(ctx, stream_partial, NULL);
 
     /* Transcribe */
     char *text = NULL;

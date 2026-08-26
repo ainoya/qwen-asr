@@ -28,6 +28,11 @@ void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata) 
     ctx->token_cb_userdata = userdata;
 }
 
+void qwen_set_partial_callback(qwen_ctx_t *ctx, qwen_partial_cb cb, void *userdata) {
+    ctx->partial_cb = cb;
+    ctx->partial_cb_userdata = userdata;
+}
+
 static const char *QWEN_SUPPORTED_LANGUAGES[] = {
     "Chinese", "English", "Cantonese", "Arabic", "German", "French",
     "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
@@ -1764,7 +1769,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
      * streaming chunks are not externally consumed and the final answer is
      * already produced by a full refinement pass. Skip chunk-by-chunk
      * decoding entirely. (In live mode we must still use the chunked loop.) */
-    if (!ctx->token_cb && !live) {
+    if (!ctx->token_cb && !ctx->partial_cb && !live) {
         if (qwen_verbose >= 2) {
             fprintf(stderr, "Streaming: no token callback, using direct final refinement\n");
         }
@@ -2482,6 +2487,35 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                                            full_end);
                     did_periodic_reset = 1;
                 }
+            }
+        }
+
+        /* Provisional tail: everything this chunk decoded past the committed
+         * frontier. The engine has it either way - holding it back is what
+         * makes streaming feel slow - so hand it to the UI as a guess. On the
+         * final chunk there is nothing left unconfirmed, so clear it. */
+        if (ctx->partial_cb) {
+            size_t plen = 0, pcap = 256;
+            char *ptext = (char *)malloc(pcap);
+            if (ptext) {
+                ptext[0] = '\0';
+                if (!is_final) {
+                    for (int i = candidate_len; i < n_text_tokens; i++) {
+                        const char *piece = qwen_tokenizer_decode(tokenizer, candidate_tokens[i]);
+                        size_t n = strlen(piece);
+                        if (plen + n + 1 > pcap) {
+                            while (plen + n + 1 > pcap) pcap *= 2;
+                            char *tmp = (char *)realloc(ptext, pcap);
+                            if (!tmp) break;
+                            ptext = tmp;
+                        }
+                        memcpy(ptext + plen, piece, n);
+                        plen += n;
+                        ptext[plen] = '\0';
+                    }
+                }
+                ctx->partial_cb(ptext, ctx->partial_cb_userdata);
+                free(ptext);
             }
         }
 

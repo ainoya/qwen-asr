@@ -202,6 +202,16 @@ extern int qwen_weight_quant;
  * 'piece' is the decoded token string (UTF-8). */
 typedef void (*qwen_token_cb)(const char *piece, void *userdata);
 
+/* Provisional hypothesis for the audio the stream has not committed yet.
+ *
+ * Streaming decodes the whole utterance every chunk and only releases the part
+ * that has stopped changing; the tail beyond that frontier is a real guess the
+ * engine already has, and it is what a UI shows greyed out ahead of the
+ * confirmed text. Called once per chunk with that tail, which *replaces*
+ * whatever the previous call passed - it is not a delta and it may be revised
+ * or disappear. An empty string means there is nothing provisional. */
+typedef void (*qwen_partial_cb)(const char *text, void *userdata);
+
 /* ========================================================================
  * Main Context
  * ======================================================================== */
@@ -242,6 +252,8 @@ typedef struct {
     /* Token streaming callback (optional) */
     qwen_token_cb token_cb;
     void *token_cb_userdata;
+    qwen_partial_cb partial_cb;
+    void *partial_cb_userdata;
 
     /* Segmentation settings */
     float segment_sec;             /* 0 = no splitting, default full-audio decode */
@@ -314,6 +326,9 @@ void qwen_free(qwen_ctx_t *ctx);
 /* Set a callback to receive each decoded token as it's generated.
  * Set cb=NULL to disable. The callback is invoked during transcription. */
 void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata);
+
+/* Streaming only. See qwen_partial_cb. */
+void qwen_set_partial_callback(qwen_ctx_t *ctx, qwen_partial_cb cb, void *userdata);
 
 /* Set optional system prompt text (UTF-8). Pass NULL or "" to clear.
  * Returns 0 on success, -1 on allocation/encoding errors. */

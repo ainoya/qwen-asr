@@ -166,6 +166,42 @@ Streaming tuning:
 ./qwen_asr -d qwen3-asr-0.6b -i audio.wav --stream --stream-max-new-tokens 64
 ```
 
+### Provisional Text (`--partial`)
+
+Streaming holds text back until it stops changing, which is what keeps the
+output stable but also what makes it feel late: on an 11s clip the first
+committed words arrive about four seconds in. The engine has a guess long
+before that — it decodes the whole utterance every chunk and only releases the
+part behind its commit frontier — so `--partial` shows the rest, dimmed, and
+rewrites it as it firms up:
+
+```bash
+cat speech.wav | ./qwen_asr -d qwen3-asr-1.7b --stdin --stream --partial
+```
+
+What that looks like chunk by chunk, committed text in plain type and the
+guess in brackets:
+
+```text
+                                                    [And so, my fellow Americans.]
+                                                    [And so, my fellow Americans, ask.]
+And so, my fellow Americans,                        [ ask not what your country]
+And so, my fellow Americans, ask not what your country  [ can do for you.]
+```
+
+The guess is a real hypothesis, not a partial word: it can be revised or
+disappear entirely, as "Americans." becomes "Americans, ask." above. Committed
+text is never retracted.
+
+The provisional text is drawn on **stderr** and erased before the next
+committed piece lands, so stdout still carries only the transcription and
+`--silent` still works. It needs a terminal — with stderr redirected the flag
+is ignored rather than writing escape codes into a log.
+
+Through the C API this is `qwen_set_partial_callback()`, called once per chunk
+with the text after the frontier; each call replaces the previous one. The
+browser demo renders it the same way, greyed after the confirmed text.
+
 ### Monitor Mode (`--monitor`)
 
 ```bash

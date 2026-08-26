@@ -56,7 +56,7 @@ struct Params {
 @group(0) @binding(2) var<storage, read> scales : array<f32>;
 @group(0) @binding(3) var<storage, read> norms  : array<f32>;
 @group(0) @binding(4) var<storage, read_write> act : array<f32>;
-@group(0) @binding(5) var<storage, read_write> kv  : array<f32>;
+@group(0) @binding(5) var<storage, read_write> kv  : array<KVT>;
 @group(0) @binding(6) var<storage, read_write> tok : array<u32>;
 @group(0) @binding(7) var<storage, read_write> scratch : array<f32>;
 
@@ -307,8 +307,8 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
   if (!isQ && lid.x < hd) {
     let kvh = head - P.n;
     let slot = P.pos * P.cols + kvh * hd + lid.x;
-    kv[P.scaleBase + slot] = act[base + lid.x];
-    kv[P.wordBase + slot] = act[P.c + kvh * hd + lid.x];
+    kv[P.scaleBase + slot] = KVT(act[base + lid.x]);
+    kv[P.wordBase + slot] = KVT(act[P.c + kvh * hd + lid.x]);
   }
 }
 `;
@@ -324,7 +324,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let kb = P.scaleBase + j * P.cols + (h / P.b) * P.d;
   var acc : f32 = 0.0;
   for (var d : u32 = 0u; d < P.d; d = d + 1u) {
-    acc = acc + act[qb + d] * kv[kb + d];
+    acc = acc + act[qb + d] * f32(kv[kb + d]);
   }
   scratch[P.yOff + h * P.c + j] = acc * P.fa;
 }
@@ -365,10 +365,10 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
     var d0 : u32 = sglane * 4u;
     loop {
       if (d0 >= P.d) { break; }
-      acc = acc + qv[d0]      * kv[kb + d0]
-                + qv[d0 + 1u] * kv[kb + d0 + 1u]
-                + qv[d0 + 2u] * kv[kb + d0 + 2u]
-                + qv[d0 + 3u] * kv[kb + d0 + 3u];
+      acc = acc + qv[d0]      * f32(kv[kb + d0])
+                + qv[d0 + 1u] * f32(kv[kb + d0 + 1u])
+                + qv[d0 + 2u] * f32(kv[kb + d0 + 2u])
+                + qv[d0 + 3u] * f32(kv[kb + d0 + 3u]);
       d0 = d0 + sgsz * 4u;
     }
   }
@@ -462,7 +462,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   var j : u32 = j0;
   loop {
     if (j >= j1) { break; }
-    acc = acc + scratch[sb + j] * kv[vb + j * P.cols];
+    acc = acc + scratch[sb + j] * f32(kv[vb + j * P.cols]);
     j = j + 1u;
   }
   scratch[P.a + (slice * P.rows + h) * P.d + d] = acc;
@@ -792,8 +792,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let d = gid.x;
   if (d >= P.cols) { return; }
   for (var p = 0u; p < P.b; p = p + 1u) {
-    kv[P.scaleBase + (P.pos + p) * P.cols + d] = act[(P.c + d) * P.a + p];
-    kv[P.wordBase + (P.pos + p) * P.cols + d] = act[(P.d + d) * P.a + p];
+    kv[P.scaleBase + (P.pos + p) * P.cols + d] = KVT(act[(P.c + d) * P.a + p]);
+    kv[P.wordBase + (P.pos + p) * P.cols + d] = KVT(act[(P.d + d) * P.a + p]);
   }
 }
 `;
@@ -836,10 +836,10 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
     var d0 : u32 = sglane * 4u;
     loop {
       if (d0 >= P.d) { break; }
-      acc = acc + qv[d0]      * kv[kb + d0]
-                + qv[d0 + 1u] * kv[kb + d0 + 1u]
-                + qv[d0 + 2u] * kv[kb + d0 + 2u]
-                + qv[d0 + 3u] * kv[kb + d0 + 3u];
+      acc = acc + qv[d0]      * f32(kv[kb + d0])
+                + qv[d0 + 1u] * f32(kv[kb + d0 + 1u])
+                + qv[d0 + 2u] * f32(kv[kb + d0 + 2u])
+                + qv[d0 + 3u] * f32(kv[kb + d0 + 3u]);
       d0 = d0 + sgsz * 4u;
     }
   }
@@ -862,7 +862,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let kb = P.wordBase + j * P.cols + (h / P.rows) * P.d;
   var acc : f32 = 0.0;
   for (var d = 0u; d < P.d; d = d + 1u) {
-    acc = acc + act[(P.c + h * P.d + d) * P.a + sq] * kv[kb + d];
+    acc = acc + act[(P.c + h * P.d + d) * P.a + sq] * f32(kv[kb + d]);
   }
   scratch[P.scaleBase + (h * P.b + sq) * P.n + j] = acc * P.fa;
 }
@@ -965,7 +965,7 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
       let idx = tid + t * 256u;
       let jj = idx / TD;
       let dd = idx % TD;
-      vt[idx] = select(0.0, kv[vb + (j0 + jj) * P.cols + dd], j0 + jj < kvTotal);
+      vt[idx] = select(0.0, f32(kv[vb + (j0 + jj) * P.cols + dd]), j0 + jj < kvTotal);
     }
     for (var t = 0u; t < 2u; t = t + 1u) {
       let idx = tid + t * 256u;
@@ -1371,6 +1371,16 @@ export class WebGPUDecoder {
     this.hasSubgroups = wantFeatures.includes("subgroups");
     this.hasTimestamps = wantFeatures.includes("timestamp-query");
     this.hasF16 = wantFeatures.includes("shader-f16");
+    /* KV cache storage type. f16 halves the biggest allocation this backend
+     * makes - the cache is what dominates once weights are sharded - and K/V
+     * live after a norm, so their range is tame. Research agrees the format
+     * has margin to spare (int8 KV caches measure as quality-neutral; f16 is
+     * gentler still). Accumulation stays f32 in every kernel. Set kvF16Pref =
+     * false before init() to keep f32 - the CPU-comparison harness does, since
+     * bitwise identity with the wasm decoder cannot survive rounded KV. */
+    this.kvF16 = this.hasF16 && this.kvF16Pref !== false &&
+                 typeof Float16Array !== "undefined";
+    this.kvBytes = this.kvF16 ? 2 : 4;
     this.device = device;
     this.maxDim = device.limits.maxComputeWorkgroupsPerDimension;
     this.adapterInfo = adapter.info || {};
@@ -1503,6 +1513,12 @@ export class WebGPUDecoder {
      * up as "impossibly fast and wrong" rather than as an error. */
     const modules = [];
     const mk = (code, name) => {
+      /* Every module sees the KV cache through the KVT alias; enable
+       * directives must precede everything else, so hoist them. */
+      code = (this.kvF16 ? "enable f16;\nalias KVT = f16;\n"
+                         : "alias KVT = f32;\n") + code;
+      const enables = [...new Set([...code.matchAll(/^enable [^;]+;$/gm)].map((m) => m[0]))];
+      code = enables.join("\n") + "\n" + code.replace(/^enable [^;]+;$/gm, "");
       const module = device.createShaderModule({ code, label: name });
       modules.push([name, module]);
       return device.createComputePipeline({
@@ -1714,18 +1730,19 @@ export class WebGPUDecoder {
 
     if (!this.bufKV || this.kvCap < kvFloats || (suffix && perLayer !== this.perLayer)) {
       const old = this.bufKV;
-      this.bufKV = device.createBuffer({ size: kvFloats * 4,
+      this.bufKV = device.createBuffer({ size: kvFloats * this.kvBytes,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
       /* Growing under a suffix prefill re-lays the cache out: every layer's
        * region moves, so the retained positions are copied across. */
       if (old && suffix && this.perLayer) {
+        const eb = this.kvBytes;
         const enc = device.createCommandEncoder();
-        const bytes = Math.min(this.perLayer, perLayer) * 4;
+        const bytes = Math.min(this.perLayer, perLayer) * eb;
         for (let l = 0; l < cfg.layers; l++) {
-          enc.copyBufferToBuffer(old, l * this.perLayer * 4,
-                                 this.bufKV, l * perLayer * 4, bytes);
-          enc.copyBufferToBuffer(old, (this.vDelta + l * this.perLayer) * 4,
-                                 this.bufKV, (cfg.layers * perLayer + l * perLayer) * 4, bytes);
+          enc.copyBufferToBuffer(old, l * this.perLayer * eb,
+                                 this.bufKV, l * perLayer * eb, bytes);
+          enc.copyBufferToBuffer(old, (this.vDelta + l * this.perLayer) * eb,
+                                 this.bufKV, (cfg.layers * perLayer + l * perLayer) * eb, bytes);
         }
         device.queue.submit([enc.finish()]);
       }
@@ -1762,11 +1779,15 @@ export class WebGPUDecoder {
       const kPtr = M._qwen_wasm_kv_k_ptr() >>> 0;
       const vPtr = M._qwen_wasm_kv_v_ptr() >>> 0;
       const wasmStride = M._qwen_wasm_kv_stride();
-      const bytes = kvLen * cfg.kvDim * 4;
+      const n = kvLen * cfg.kvDim;
       for (let l = 0; l < cfg.layers; l++) {
-        const src = l * wasmStride * cfg.kvDim * 4;
-        device.queue.writeBuffer(this.bufKV, l * perLayer * 4, M.HEAPU8, kPtr + src, bytes);
-        device.queue.writeBuffer(this.bufKV, (this.vDelta + l * perLayer) * 4, M.HEAPU8, vPtr + src, bytes);
+        const src = l * wasmStride * cfg.kvDim;
+        let kSrc = new Float32Array(M.HEAPF32.buffer, kPtr + src * 4, n);
+        let vSrc = new Float32Array(M.HEAPF32.buffer, vPtr + src * 4, n);
+        if (this.kvF16) { kSrc = new Float16Array(kSrc); vSrc = new Float16Array(vSrc); }
+        else { kSrc = kSrc.slice(); vSrc = vSrc.slice(); }
+        device.queue.writeBuffer(this.bufKV, l * perLayer * this.kvBytes, kSrc);
+        device.queue.writeBuffer(this.bufKV, (this.vDelta + l * perLayer) * this.kvBytes, vSrc);
       }
     }
 

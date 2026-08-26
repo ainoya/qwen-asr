@@ -109,6 +109,9 @@ document.getElementById("load").onclick = async () => {
 
     if (probe.ok) {
       gpu = new WebGPUDecoder(M);
+      /* This page's whole point is bitwise agreement with the wasm decoder,
+       * which rounded f16 KV cannot provide. */
+      gpu.kvF16Pref = false;
       window.__gpu = gpu;
       await gpu.init((m) => say("  " + m));
       say(`GPU decoder ready (${(gpu.weightBytes / 1e9).toFixed(2)} GB of weights resident)`);

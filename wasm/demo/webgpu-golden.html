@@ -29,6 +29,7 @@ weight upload are paid once per page, not once per edit.</p>
 <p>
   <button id="load">Load model + weights</button>
   <button id="run" disabled>Run all golden samples</button>
+  <button id="runtower" disabled>Run with the GPU audio tower</button>
   <label>threads <input id="threads" type="number" min="1" max="12" value="4" style="width:56px"></label>
   <label>maxNew <input id="maxnew" type="number" min="64" max="2048" step="64" value="640" style="width:70px"></label>
 </p>
@@ -37,6 +38,7 @@ weight upload are paid once per page, not once per edit.</p>
 <script src="qwen_asr.js"></script>
 <script type="module">
 import { until } from "./tick.js";
+import { WebGPUEncoder } from "./webgpu-encoder.js";
 
 /* Same normalization and metric as wasm/check-node.js and asr_regression.py,
  * so the numbers here are comparable with the CPU suite's. */
@@ -70,7 +72,7 @@ const out = document.getElementById("out");
 const say = (s = "") => { out.textContent += s + "\n"; };
 const P = (x) => x >>> 0;
 
-let M = null, gpu = null, golden = null, version = 0;
+let M = null, gpu = null, encoder = null, golden = null, version = 0;
 
 function cstr(s) {
   const len = M.lengthBytesUTF8(s) + 1;
@@ -128,26 +130,51 @@ document.getElementById("load").onclick = async () => {
 
     await reload();
     say(`GPU decoder ready (${(gpu.weightBytes / 1e9).toFixed(2)} GB resident)`);
+    encoder = new WebGPUEncoder(M);
+    await encoder.init(() => {});
+    say(`GPU audio tower ready (${(encoder.weightBytes / 1e6).toFixed(0)} MB)`);
     document.getElementById("run").disabled = false;
+    document.getElementById("runtower").disabled = false;
   } catch (e) {
     say("error: " + e.message);
     console.error(e);
   }
 };
 
-async function runOne(entry) {
-  const maxNew = Number(document.getElementById("maxnew").value) || 640;
-  const buf = await (await fetch(`./golden/${entry.name}.f32`)).arrayBuffer();
-  const emb = new Float32Array(buf);
-  if (emb.length !== entry.seq * golden.dim)
-    throw new Error(`${entry.name}: expected ${entry.seq * golden.dim} floats, got ${emb.length}`);
+/* Everything after mel on the GPU: the audio tower, then the decoder. wasm
+ * computes the mel and assembles the prompt around the tower's output. */
+async function towerEmbeds(entry) {
+  const mel = new Float32Array(await (await fetch(`./golden/${entry.name}.mel.f32`)).arrayBuffer());
+  const mp = P(M._qwen_wasm_alloc(mel.byteLength));
+  M.HEAPF32.set(mel, mp / 4);
+  const out = await encoder.runFromMel(mp, entry.melFrames);
+  M._qwen_wasm_release(mp);
 
-  const ptr = P(M._qwen_wasm_alloc(emb.length * 4));
-  M.HEAPF32.set(emb, ptr / 4);
+  const ep = P(M._qwen_wasm_alloc(out.byteLength));
+  M.HEAPF32.set(out, ep / 4);
+  const seq = M._qwen_wasm_embeds_from_enc(ep, encoder.tokens);
+  M._qwen_wasm_release(ep);
+  if (!seq) throw new Error("embeds_from_enc failed");
+  return { ptr: P(M._qwen_wasm_embeds_ptr()), seq, encMs: encoder.runMs, owned: false };
+}
+
+async function runOne(entry, tower = false) {
+  const maxNew = Number(document.getElementById("maxnew").value) || 640;
+  let ptr, seq, encMs = 0, owned = true;
+  if (tower) {
+    ({ ptr, seq, encMs, owned } = await towerEmbeds(entry));
+  } else {
+    const emb = new Float32Array(await (await fetch(`./golden/${entry.name}.f32`)).arrayBuffer());
+    if (emb.length !== entry.seq * golden.dim)
+      throw new Error(`${entry.name}: expected ${entry.seq * golden.dim} floats, got ${emb.length}`);
+    seq = entry.seq;
+    ptr = P(M._qwen_wasm_alloc(emb.length * 4));
+    M.HEAPF32.set(emb, ptr / 4);
+  }
   const t0 = performance.now();
-  const r = await gpu.prefillAndGenerate(ptr, entry.seq, maxNew, null);
+  const r = await gpu.prefillAndGenerate(ptr, seq, maxNew, null);
   const ms = performance.now() - t0;
-  M._qwen_wasm_release(ptr);
+  if (owned) M._qwen_wasm_release(ptr);
 
   const got = r.text.trim(), want = entry.text.trim();
   const same = got === want;
@@ -162,7 +189,8 @@ async function runOne(entry) {
   const rate = gpuErr ? gpuErr.err / gpuErr.len : null;
   const pass = rate === null ? same : rate <= THRESHOLD;
 
-  say(`[${pass ? " OK " : "FAIL"}] ${entry.name}  seq=${entry.seq} tokens=${r.tokens} ` +
+  say(`[${pass ? " OK " : "FAIL"}] ${entry.name}  seq=${seq} tokens=${r.tokens} ` +
+      (tower ? `tower ${encMs.toFixed(0)}ms ` : "") +
       `${(ms / 1000).toFixed(2)}s (prefill ${(gpu.prefillMs / 1000).toFixed(2)}s)` +
       (gpuErr ? `  cer gpu ${rate.toFixed(3)} / cpu ${(cpuErr.err / cpuErr.len).toFixed(3)}` : "") +
       (same ? "  [matches cpu]" : ""));
@@ -179,20 +207,20 @@ async function runOne(entry) {
 
 let running = false;
 
-async function runAll() {
+async function runAll(tower = false) {
   /* One decoder context is shared by every sample, so two overlapping runs
    * corrupt each other's KV state and every sample comes out DIFF. Refuse
    * rather than produce a confusing result. */
   if (running) throw new Error("a run is already in flight");
   running = true;
   try {
-    return await runAllInner();
+    return await runAllInner(tower);
   } finally {
     running = false;
   }
 }
 
-async function runAllInner() {
+async function runAllInner(tower = false) {
   /* Re-read the manifest every run so a fresh dump-golden.js is picked up
    * without reloading the page - the weights are the expensive part and they
    * stay resident. */
@@ -203,7 +231,7 @@ async function runAllInner() {
   let gpuErr = 0, cpuErr = 0, refLen = 0;
   for (const entry of golden.samples) {
     try {
-      const r = await runOne(entry);
+      const r = await runOne(entry, tower);
       if (r.pass) pass++;
       if (r.same) same++;
       if (r.gpuErr) {
@@ -226,6 +254,13 @@ async function runAllInner() {
 
 window.runAll = runAll;
 window.state = () => ({ M, gpu, golden, version });
+
+document.getElementById("runtower").onclick = async () => {
+  document.getElementById("runtower").disabled = true;
+  say();
+  await runAll(true).catch((e) => say("error: " + e.message));
+  document.getElementById("runtower").disabled = false;
+};
 
 document.getElementById("run").onclick = async () => {
   document.getElementById("run").disabled = true;

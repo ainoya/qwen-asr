@@ -354,6 +354,16 @@ char *qwen_transcribe_stream_live(qwen_ctx_t *ctx, qwen_live_audio_t *live);
  * prefill + generation loop.
  * ======================================================================== */
 
+#include "qwen_asr_tokenizer.h"
+
+/* Assemble the decoder's input embeddings around an encoder output computed
+ * elsewhere - the WebGPU audio tower runs on the GPU and hands its result
+ * back here. enc_output stays owned by the caller; the return is malloc'd. */
+float *qwen_assemble_embeds(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer,
+                            const float *enc_output, int enc_seq_len,
+                            const int *past_tokens, int n_past_tokens,
+                            int *out_seq);
+
 /* Build the decoder input embeddings for one utterance.
  * Returns a malloc'd [*out_seq_len, dec_hidden] f32 buffer; caller frees.
  * Also fills mel/encoder timings when the pointers are non-NULL. */

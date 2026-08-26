@@ -36,6 +36,8 @@ EXPORTS='["_qwen_wasm_alloc","_qwen_wasm_release","_qwen_wasm_init","_qwen_wasm_
 "_qwen_wasm_set_segment_sec","_qwen_wasm_set_batch_size","_qwen_wasm_set_stream_params",
 "_qwen_wasm_enc_shape","_qwen_wasm_enc_desc","_qwen_wasm_enc_tap_set",
 "_qwen_wasm_set_q8_batch_max",
+"_qwen_wasm_mel_start","_qwen_wasm_mel_done","_qwen_wasm_mel_finish",
+"_qwen_wasm_mel_ptr","_qwen_wasm_mel_ms","_qwen_wasm_embeds_from_enc",
 "_qwen_wasm_enc_tap_ptr","_qwen_wasm_enc_tap_out","_qwen_wasm_enc_tap_tokens",
 "_qwen_wasm_enc_tap_mel","_qwen_wasm_enc_tap_frames",
 "_qwen_wasm_stream_start","_qwen_wasm_stream_push","_qwen_wasm_stream_finish",

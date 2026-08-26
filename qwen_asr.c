@@ -634,39 +634,19 @@ static int find_split_point(const float *samples, int n_samples,
  * Split out of transcribe_segment() so an alternative decoder backend (the
  * WebGPU one in wasm/webgpu/) can reuse everything up to the point where the
  * decoder takes over. Returns a malloc'd [*out_seq, dec_hidden] buffer, or NULL. */
-static float *build_input_embeds(qwen_ctx_t *ctx, const float *samples, int n_samples,
-                                qwen_tokenizer_t *tokenizer,
-                                const int *past_tokens, int n_past_tokens,
-                                int *out_seq, double *out_mel_ms, double *out_enc_ms,
-                                int *out_enc_seq_len) {
+/* Assemble the decoder's input embeddings around an encoder output.
+ *
+ * Split out of build_input_embeds() so the audio tower can run somewhere else
+ * - the WebGPU encoder computes enc_output on the GPU and hands it back here.
+ * enc_output stays owned by the caller. */
+float *qwen_assemble_embeds(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer,
+                            const float *enc_output, int enc_seq_len,
+                            const int *past_tokens, int n_past_tokens,
+                            int *out_seq) {
     const qwen_config_t *cfg = &ctx->config;
     int dim = cfg->dec_hidden;
 
-    /* ---- Mel spectrogram ---- */
-    double t0 = get_time_ms();
-    int mel_frames = 0;
-    float *mel = qwen_mel_spectrogram(samples, n_samples, &mel_frames);
-    if (!mel) return NULL;
-    double mel_ms = get_time_ms() - t0;
-
-    if (qwen_verbose >= 2)
-        fprintf(stderr, "  Mel: %d frames (%.0f ms)\n", mel_frames, mel_ms);
-
-    /* ---- Encoder ---- */
-    t0 = get_time_ms();
-    int enc_seq_len = 0;
-    float *enc_output = qwen_encoder_forward(ctx, mel, mel_frames, &enc_seq_len);
-    free(mel);
-    if (!enc_output) return NULL;
-    double enc_ms = get_time_ms() - t0;
-
-    if (qwen_verbose >= 2)
-        fprintf(stderr, "  Encoder: %d tokens (%.0f ms)\n", enc_seq_len, enc_ms);
-
-    if (prepare_prompt_tokens(ctx, tokenizer) != 0) {
-        free(enc_output);
-        return NULL;
-    }
+    if (prepare_prompt_tokens(ctx, tokenizer) != 0) return NULL;
 
     /* ---- Build input embeddings ---- */
     int prefix_len = PREFIX_HEAD_LEN + ctx->n_prompt_tokens + PREFIX_TAIL_LEN;
@@ -676,7 +656,6 @@ static float *build_input_embeds(qwen_ctx_t *ctx, const float *samples, int n_sa
     float *input_embeds = (float *)malloc((size_t)total_seq * dim * sizeof(float));
     float *tmp_embed = (float *)malloc(dim * sizeof(float));
     if (!input_embeds || !tmp_embed) {
-        free(enc_output);
         free(input_embeds);
         free(tmp_embed);
         return NULL;
@@ -710,7 +689,6 @@ static float *build_input_embeds(qwen_ctx_t *ctx, const float *samples, int n_sa
                enc_output + i * dim,
                dim * sizeof(float));
     }
-    free(enc_output);
 
     /* Embed suffix base: <|audio_end|><|im_end|>\n<|im_start|>assistant\n */
     int suffix_off = prefix_len + enc_seq_len;
@@ -740,11 +718,40 @@ static float *build_input_embeds(qwen_ctx_t *ctx, const float *samples, int n_sa
 
 
     if (out_seq) *out_seq = total_seq;
+    free(tmp_embed);
+    return input_embeds;
+}
+
+/* Mel + encoder + assembly: the whole path from audio to decoder inputs. */
+static float *build_input_embeds(qwen_ctx_t *ctx, const float *samples, int n_samples,
+                                 qwen_tokenizer_t *tokenizer,
+                                 const int *past_tokens, int n_past_tokens,
+                                 int *out_seq, double *out_mel_ms, double *out_enc_ms,
+                                 int *out_enc_seq_len) {
+    double t0 = get_time_ms();
+    int mel_frames = 0;
+    float *mel = qwen_mel_spectrogram(samples, n_samples, &mel_frames);
+    if (!mel) return NULL;
+    double mel_ms = get_time_ms() - t0;
+    if (qwen_verbose >= 2)
+        fprintf(stderr, "  Mel: %d frames (%.0f ms)\n", mel_frames, mel_ms);
+
+    t0 = get_time_ms();
+    int enc_seq_len = 0;
+    float *enc_output = qwen_encoder_forward(ctx, mel, mel_frames, &enc_seq_len);
+    free(mel);
+    if (!enc_output) return NULL;
+    double enc_ms = get_time_ms() - t0;
+    if (qwen_verbose >= 2)
+        fprintf(stderr, "  Encoder: %d tokens (%.0f ms)\n", enc_seq_len, enc_ms);
+
+    float *embeds = qwen_assemble_embeds(ctx, tokenizer, enc_output, enc_seq_len,
+                                         past_tokens, n_past_tokens, out_seq);
+    free(enc_output);
     if (out_mel_ms) *out_mel_ms = mel_ms;
     if (out_enc_ms) *out_enc_ms = enc_ms;
     if (out_enc_seq_len) *out_enc_seq_len = enc_seq_len;
-    free(tmp_embed);
-    return input_embeds;
+    return embeds;
 }
 
 static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,

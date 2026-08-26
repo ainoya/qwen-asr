@@ -554,6 +554,86 @@ EMSCRIPTEN_KEEPALIVE float *qwen_wasm_enc_tap_ptr(void) { return qwen_enc_tap_co
 EMSCRIPTEN_KEEPALIVE float *qwen_wasm_enc_tap_out(void) { return qwen_enc_tap_out; }
 EMSCRIPTEN_KEEPALIVE int qwen_wasm_enc_tap_tokens(void) { return qwen_enc_tap_tokens; }
 
+
+/* ---- Audio tower on the GPU: mel here, encoder there, assembly back here ----
+ *
+ * qwen_build_embeds() runs mel, the encoder and the prompt assembly as one
+ * step, which leaves no way to substitute an encoder that lives on the GPU.
+ * These split it: compute the mel, hand it out, take an encoder output back,
+ * and assemble the decoder's inputs around it. The result lands in the same
+ * place qwen_wasm_embeds_finish() leaves it, so the GPU decoder path that
+ * follows is unchanged.
+ */
+
+static pthread_t g_mel_thread;
+static volatile int g_mel_running = 0;
+static volatile int g_mel_done = 0;
+static float *g_mel_samples = NULL;
+static int g_mel_n = 0;
+static float *g_mel = NULL;
+static int g_mel_frames = 0;
+static double g_mel_ms = 0;
+
+static void *mel_main(void *arg) {
+    (void)arg;
+    double t0 = emscripten_get_now();
+    free(g_mel);
+    g_mel_frames = 0;
+    g_mel = qwen_mel_spectrogram(g_mel_samples, g_mel_n, &g_mel_frames);
+    g_mel_ms = emscripten_get_now() - t0;
+    g_mel_done = 1;
+    return NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int qwen_wasm_mel_start(const float *samples, int n_samples) {
+    if (!g_ctx || g_mel_running || n_samples <= 0) return -1;
+    free(g_mel_samples);
+    g_mel_samples = (float *)malloc((size_t)n_samples * sizeof(float));
+    if (!g_mel_samples) return -1;
+    memcpy(g_mel_samples, samples, (size_t)n_samples * sizeof(float));
+    g_mel_n = n_samples;
+    g_mel_done = 0;
+    if (pthread_create(&g_mel_thread, NULL, mel_main, NULL) != 0) return -1;
+    g_mel_running = 1;
+    return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int qwen_wasm_mel_done(void) { return g_mel_running ? g_mel_done : 0; }
+
+/* Reaps the thread; returns the frame count (0 on failure). */
+EMSCRIPTEN_KEEPALIVE
+int qwen_wasm_mel_finish(void) {
+    if (!g_mel_running || !g_mel_done) return 0;
+    pthread_join(g_mel_thread, NULL);
+    g_mel_running = 0;
+    free(g_mel_samples);
+    g_mel_samples = NULL;
+    return g_mel ? g_mel_frames : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE float *qwen_wasm_mel_ptr(void) { return g_mel; }
+EMSCRIPTEN_KEEPALIVE double qwen_wasm_mel_ms(void) { return g_mel_ms; }
+
+/* Assemble the decoder inputs around an encoder output computed on the GPU.
+ * Returns the sequence length; the embeddings are at qwen_wasm_embeds_ptr(). */
+EMSCRIPTEN_KEEPALIVE
+int qwen_wasm_embeds_from_enc(const float *enc_output, int enc_seq_len) {
+    if (!g_ctx || !enc_output || enc_seq_len <= 0) return 0;
+    char vocab_path[1024];
+    snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", g_ctx->model_dir);
+    qwen_tokenizer_t *tok = qwen_tokenizer_load(vocab_path);
+    if (!tok) return 0;
+
+    int seq = 0;
+    free(g_emb);
+    g_emb = qwen_assemble_embeds(g_ctx, tok, enc_output, enc_seq_len, NULL, 0, &seq);
+    qwen_tokenizer_free(tok);
+    if (!g_emb) return 0;
+    g_emb_seq = seq;
+    return seq;
+}
+
 /* ---- CPU prefill, so the GPU only has to run generation ----
  *
  * Mel, encoder and decoder prefill stay on the CPU: prefill is a batched GEMM

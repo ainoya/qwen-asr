@@ -166,8 +166,12 @@ From `qwen_load()` and CLI:
   - `qwen_wasm.c` browser entry points, `build.sh`, `serve.py`,
     node harnesses (`bench-node.js`, `check-node.js`, `stream-node.js`,
     `dump-golden.js`), and `demo/` (batch + streaming demo,
-    `webgpu-decoder.js`, `webgpu-test.html`, `webgpu-golden.html`,
-    `webgpu-probe.html`, `tick.js`)
+    `webgpu-decoder.js`, `webgpu-encoder.js`, `webgpu-test.html`,
+    `webgpu-golden.html`, `webgpu-encoder-test.html`, `webgpu-probe.html`,
+    `tick.js`)
+  - the whole audio tower and the whole decoder can run on the GPU; only mel
+    stays in wasm. `qwen_assemble_embeds()` builds the decoder inputs around an
+    encoder output computed elsewhere.
   - GPU work is verified from a background tab via `dump-golden.js` +
     `webgpu-golden.html`; the CPU reference must stay out of the page
     because a background renderer only gets ~1.2 cores. See `wasm/README.md`.

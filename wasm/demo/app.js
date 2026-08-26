@@ -9,6 +9,7 @@
 
 import { WebGPUDecoder } from "./webgpu-decoder.js";
 import { tick, until, sleep } from "./tick.js";
+import { WebGPUEncoder } from "./webgpu-encoder.js";
 
 const $ = (id) => document.getElementById(id);
 const MODEL_BASE = "../../qwen3-asr-1.7b-q8";
@@ -19,7 +20,7 @@ let busy = false;
 let sampleBuf = 0;
 let sampleCap = 0;
 let poller = null;
-let gpu = null;
+let gpu = null, encoder = null;
 
 function log(msg, cls) {
   const d = document.createElement("div");
@@ -161,6 +162,18 @@ $("load").onclick = async () => {
         gpu = new WebGPUDecoder(Module);
         await gpu.init((m) => setStatus(m));
         log(`GPU decoder ready (${(gpu.weightBytes / 1e9).toFixed(2)} GB resident on the GPU)`);
+
+        /* The audio tower is optional: if it will not start, mel and the
+         * encoder stay in wasm and only the decoder moves. */
+        try {
+          setStatus("uploading the audio tower to the GPU...");
+          const e = new WebGPUEncoder(Module);
+          await e.init(() => {});
+          encoder = e;
+          log(`GPU audio tower ready (${(e.weightBytes / 1e6).toFixed(0)} MB)`);
+        } catch (err) {
+          log(`GPU audio tower unavailable (${err.message}); mel and the encoder stay on the cpu`, "err");
+        }
       }
     }
 
@@ -217,15 +230,35 @@ async function runBatch(bytes, label) {
   if (!ptr) { busy = false; log("out of wasm memory for the audio buffer", "err"); return; }
 
   if (gpu && $("backend").value === "gpu") {
-    /* mel + encoder in wasm, then prefill and generation on the GPU. */
+    /* Everything but mel on the GPU when the audio tower is available:
+     * mel here, tower and decoder there, prompt assembly back here. */
     try {
       Module.HEAPF32.set(samples, f32idx(ptr));
       const t0 = performance.now();
-      if (Module._qwen_wasm_embeds_start(ptr, samples.length) !== 0)
-        throw new Error("encoder failed to start");
-      await until(() => Module._qwen_wasm_embeds_done());
-      const seq = Module._qwen_wasm_embeds_finish();
-      if (!seq) throw new Error("encoder failed");
+      let seq, melMs = 0;
+      if (encoder) {
+        if (Module._qwen_wasm_mel_start(ptr, samples.length) !== 0)
+          throw new Error("mel failed to start");
+        await until(() => Module._qwen_wasm_mel_done());
+        const frames = Module._qwen_wasm_mel_finish();
+        if (!frames) throw new Error("mel failed");
+        melMs = Module._qwen_wasm_mel_ms();
+        setStatus(`running the audio tower on the GPU (${frames} frames)...`);
+
+        const encOut = await encoder.runFromMel(P(Module._qwen_wasm_mel_ptr()), frames);
+        const ep = P(Module._qwen_wasm_alloc(encOut.byteLength));
+        if (!ep) throw new Error("out of wasm memory for the encoder output");
+        Module.HEAPF32.set(encOut, f32idx(ep));
+        seq = Module._qwen_wasm_embeds_from_enc(ep, encoder.tokens);
+        Module._qwen_wasm_release(ep);
+        if (!seq) throw new Error("prompt assembly failed");
+      } else {
+        if (Module._qwen_wasm_embeds_start(ptr, samples.length) !== 0)
+          throw new Error("encoder failed to start");
+        await until(() => Module._qwen_wasm_embeds_done());
+        seq = Module._qwen_wasm_embeds_finish();
+        if (!seq) throw new Error("encoder failed");
+      }
       const encMs = performance.now() - t0;
       setStatus(`prefilling ${seq} tokens on the GPU...`);
 
@@ -240,7 +273,9 @@ async function runBatch(bytes, label) {
       $("perf").innerHTML =
         `audio <b>${audioSec.toFixed(1)}s</b> · total <b>${(wall / 1000).toFixed(2)}s</b> ` +
         `(<b>${(audioSec * 1000 / wall).toFixed(2)}x</b> realtime) · ` +
-        `mel+encoder <b>${Math.round(encMs)}ms</b> (cpu) · ` +
+        (encoder
+          ? `mel <b>${Math.round(melMs)}ms</b> (cpu) · gpu tower <b>${Math.round(encoder.runMs)}ms</b> · `
+          : `mel+encoder <b>${Math.round(encMs)}ms</b> (cpu) · `) +
         `gpu prefill <b>${Math.round(gpu.prefillMs)}ms</b> · ` +
         `gpu generation <b>${Math.round(decMs - gpu.prefillMs)}ms</b> for <b>${r.tokens}</b> tokens`;
       setStatus("done");

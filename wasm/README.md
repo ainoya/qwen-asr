@@ -162,6 +162,18 @@ Measured in a background tab, so these are floors:
 | 41s | 2.4 s | **0.88 s** |
 | 89s | 5.0 s | **1.51 s** |
 
+The demo uses it automatically when the GPU backend is selected and the tower
+starts; if it does not, mel and the encoder stay in wasm and only the decoder
+moves. mel is still wasm either way - it is 254 ms on the 41s clip and not
+worth a port.
+
+Running the whole pipeline that way changes nothing measurable in the output:
+
+```text
+wasm encoder + GPU decoder: 23/23 within 0.15, cer gpu 0.0062 vs cpu 0.0024
+GPU tower   + GPU decoder: 23/23 within 0.15, cer gpu 0.0062 vs cpu 0.0024
+```
+
 It does not share the decoder's shaders because the tower is a different
 network: LayerNorm with a bias rather than RMSNorm, a bias on every linear,
 attention that is bidirectional inside a fixed 104-token window with no RoPE

@@ -111,6 +111,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "                   (used by the wasm/browser build; see README)\n");
     fprintf(stderr, "  --calib-out <f>  Record per-channel activation magnitudes to <f>\n");
     fprintf(stderr, "                   while transcribing (for quantization calibration)\n");
+    fprintf(stderr, "  --pack-q4 <out>  Same, with the decoder layers at 4 bits; pair it\n");
+    fprintf(stderr, "                   with --awq to bake channel rescaling in\n");
     fprintf(stderr, "  --awq <f>     Rescale channels using the statistics in <f> when\n");
     fprintf(stderr, "                narrowing weights to 4 bits (--weights q4 only)\n");
     fprintf(stderr, "  --awq-alpha <a>  Rescaling exponent (default 0.25)\n");
@@ -138,6 +140,7 @@ int main(int argc, char **argv) {
     int skip_silence = 0;
     int emit_tokens = 1;
     const char *pack_out = NULL;
+    int pack_four_bit = 0;
     const char *calib_out = NULL;
     const char *calib_rank = NULL;
     const char *awq_search = NULL;
@@ -195,6 +198,9 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--pack-q8") == 0 && i + 1 < argc) {
             pack_out = argv[++i];
+        } else if (strcmp(argv[i], "--pack-q4") == 0 && i + 1 < argc) {
+            pack_out = argv[++i];
+            pack_four_bit = 1;
         } else if (strcmp(argv[i], "--calib-out") == 0 && i + 1 < argc) {
             calib_out = argv[++i];
         } else if (strcmp(argv[i], "--calib-rank") == 0 && i + 1 < argc) {
@@ -229,7 +235,7 @@ int main(int argc, char **argv) {
         qwen_verbose = verbosity;
         if (n_threads <= 0) n_threads = qwen_get_num_cpus();
         qwen_set_threads(n_threads);
-        return qwen_pack_q8(model_dir, pack_out) == 0 ? 0 : 1;
+        return qwen_pack(model_dir, pack_out, pack_four_bit, awq_file) == 0 ? 0 : 1;
     }
 
     /* Ranking reads the weights and a statistics dump; it needs no audio. */

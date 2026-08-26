@@ -34,22 +34,32 @@ static float *load_f32(multi_safetensors_t *ms, const char *name) {
 
 /* Attach to pre-quantized "<name>.q8" / "<name>.q8s" if the model file carries
  * them. Returns 1 when attached, 0 when the file only has the bf16 original. */
+/* Point a matrix at pre-quantized bytes in the packed image, at whichever width
+ * the image stored them. Four-bit tensors halve their stored width, so the real
+ * column count is twice shape[1]. */
 static int attach_q8(multi_safetensors_t *ms, const char *name, qwen_q8_mat_t *m) {
     char qn[512];
     safetensors_file_t *sfq = NULL, *sfs = NULL;
 
-    snprintf(qn, sizeof(qn), "%s.q8", name);
-    const safetensor_t *tq = multi_safetensors_find(ms, qn, &sfq);
-    if (!tq || tq->ndim != 2) return 0;
+    for (int four = 0; four < 2; four++) {
+        const char *tag = four ? "q4" : "q8";
+        snprintf(qn, sizeof(qn), "%s.%s", name, tag);
+        const safetensor_t *tq = multi_safetensors_find(ms, qn, &sfq);
+        if (!tq || tq->ndim != 2) continue;
 
-    snprintf(qn, sizeof(qn), "%s.q8s", name);
-    const safetensor_t *ts = multi_safetensors_find(ms, qn, &sfs);
-    if (!ts) return 0;
+        snprintf(qn, sizeof(qn), "%s.%ss", name, tag);
+        const safetensor_t *ts = multi_safetensors_find(ms, qn, &sfs);
+        if (!ts) continue;
 
-    qwen_q8_attach(m, (int8_t *)safetensors_data(sfq, tq),
-                   (float *)safetensors_data(sfs, ts),
-                   (int)tq->shape[0], (int)tq->shape[1]);
-    return 1;
+        int8_t *q = (int8_t *)safetensors_data(sfq, tq);
+        float *sc = (float *)safetensors_data(sfs, ts);
+        if (four)
+            qwen_q4_attach(m, q, sc, (int)tq->shape[0], (int)tq->shape[1] * 2);
+        else
+            qwen_q8_attach(m, q, sc, (int)tq->shape[0], (int)tq->shape[1]);
+        return 1;
+    }
+    return 0;
 }
 
 static uint16_t *load_bf16_direct(multi_safetensors_t *ms, const char *name) {
@@ -234,7 +244,10 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
                     return -1;
                 }
             }
-            if (use_q4_layers &&
+            /* A --pack-q4 image already stores four bits, with any channel
+             * rescaling folded in when it was written, so there is nothing left
+             * to convert. */
+            if (use_q4_layers && !QWEN_IS_Q4(&l->wq_q8) &&
                 narrow_layer_to_q4(l, i, awq, cfg->dec_hidden,
                                    cfg->dec_intermediate) != 0) {
                 fprintf(stderr, "decoder: 4-bit conversion failed at layer %d\n", i);
@@ -316,12 +329,27 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
     dec->norm = load_f32(ms, "thinker.model.norm.weight");
     if (!dec->norm) return -1;
 
-    if (use_q8 && qwen_verbose >= 1)
-        fprintf(stderr, "Decoder weights: Q8%s, %.2f GB quantized (%.2f GB as bf16)\n",
-                use_q8_embed ? " incl. LM head" : " (LM head kept bf16)",
-                (double)q8_bytes / 1e9,
-                (double)q8_bytes / 1e9 * (2.0 * QWEN_Q8_BLOCK) /
-                    (QWEN_Q8_BLOCK + sizeof(float)));
+    if (use_q8 && qwen_verbose >= 1) {
+        /* A --pack-q4 image arrives already narrowed, so report what the
+         * weights actually are rather than what was asked for. */
+        int layers_q4 = QWEN_IS_Q4(&dec->layers[0].wq_q8);
+        size_t bf16_bytes = 0;
+        for (int i = 0; i < cfg->dec_layers; i++) {
+            const qwen_dec_layer_t *l = &dec->layers[i];
+            const qwen_q8_mat_t *all[] = { &l->wq_q8, &l->wk_q8, &l->wv_q8,
+                                           &l->wo_q8, &l->gate_up_q8, &l->down_q8 };
+            for (size_t k = 0; k < sizeof(all) / sizeof(all[0]); k++)
+                bf16_bytes += (size_t)all[k]->rows * all[k]->cols * 2;
+        }
+        if (use_q8_embed)
+            bf16_bytes += (size_t)dec->tok_embeddings_q8.rows *
+                          dec->tok_embeddings_q8.cols * 2;
+        fprintf(stderr, "Decoder weights: %s%s, %.2f GB quantized (%.2f GB as bf16)\n",
+                layers_q4 ? "4-bit layers" : "Q8",
+                use_q8_embed ? (layers_q4 ? ", Q8 LM head" : " incl. LM head")
+                             : " (LM head kept bf16)",
+                (double)q8_bytes / 1e9, (double)bf16_bytes / 1e9);
+    }
 
     return 0;
 }

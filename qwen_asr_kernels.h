@@ -131,6 +131,10 @@ void qwen_act_stats_observe(const qwen_q8_mat_t *m, const float *x, int seq_len)
  * file). qwen_q8_free() will not release it. */
 void qwen_q8_attach(qwen_q8_mat_t *m, int8_t *q, float *scales, int rows, int cols);
 
+/* Same, for data stored as 4-bit nibbles. `cols` is the real column count, not
+ * the halved stored width. */
+void qwen_q4_attach(qwen_q8_mat_t *m, int8_t *q, float *scales, int rows, int cols);
+
 /* A weight matrix in whichever representation the model file provided. */
 typedef struct {
     float *f32;          /* non-NULL when stored as f32          */

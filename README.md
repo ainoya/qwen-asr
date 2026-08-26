@@ -51,7 +51,7 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 - **Memory-mapped weights**: BF16 weights are mmap'd directly from safetensors files — loading is near-instant.
 - **Q8 quantized decoder**: the decoder's transformer weights are block-quantized to int8 at load time (`--weights q8`, the default). Token generation is memory-bandwidth bound, so cutting the bytes per weight is close to a direct speedup: ~1.8x end-to-end on an M1 Pro. Quality is unchanged on the regression suite. `--weights q8-lm` also quantizes the LM head for a bit more speed, `--weights bf16` disables quantization.
 - **Runs in a browser**: `wasm/build.sh` compiles the same engine to WebAssembly with SIMD128 and pthreads; `wasm/demo/` is a batch + streaming demo that loads the 1.7B model into a tab. See [wasm/README.md](wasm/README.md).
-- **Pre-quantized model images**: `--pack-q8` writes a single 2.2 GB file (from 4.7 GB of bf16) that both the native and wasm builds use in place, which makes startup instant and is what makes the browser build feasible at all.
+- **Pre-quantized model images**: `--pack-q8` writes a single 2.2 GB file (from 4.7 GB of bf16) that both the native and wasm builds use in place, which makes startup instant and is what makes the browser build feasible at all. `--pack-q4 --awq` writes a 1.5 GB one with the decoder layers at four bits and channel rescaling already folded in.
 - **Performance-core aware threading**: the default thread count is the number of performance cores. On an Apple M1 Pro (8P+2E), including the efficiency cores in a barrier-synchronised split makes every dispatch wait for the slowest core and is measurably slower.
 - **WAV input**: Supports 16-bit PCM WAV files at any sample rate (auto-resampled to 16kHz).
 - **Stdin input**: Reads from stdin with auto-detection (WAV header or raw s16le 16kHz mono).
@@ -156,6 +156,20 @@ reports what each value buys in weighted error, and picked the same 0.25.
 It does not make four bits safe everywhere. The two English regression samples
 that collapse at four bits collapse just as hard with rescaling (normalized
 error 0.245 and 0.437 without, 0.265 and 0.437 with), so `q4` stays opt-in.
+
+To avoid carrying the statistics around at run time, bake them into a model
+image instead:
+
+```bash
+./qwen_asr -d qwen3-asr-1.7b --pack-q4 qwen3-asr-1.7b-q4/qwen-asr-q8.bin --awq act.qacs
+cp qwen3-asr-1.7b/{config.json,generation_config.json,merges.txt,vocab.json} qwen3-asr-1.7b-q4/
+./qwen_asr -d qwen3-asr-1.7b-q4 -i audio.wav
+```
+
+That writes 1.47 GB against 2.18 GB for `--pack-q8`, attaches in place with no
+conversion pass, and needs no flags to use - which is what the browser build
+wants. The scaled weights are the same bytes `--weights q4 --awq` would build at
+load time, so the transcripts match.
 
 Quantization happens at load time from the mmap'd bf16 tensors, so no separate
 model file is needed; it adds a few hundred milliseconds to startup.

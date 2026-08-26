@@ -500,7 +500,7 @@ After editing:
 ## Local-Only Artifacts (Do Not Depend On In Commits)
 
 Common local directories/files are intentionally ignored:
-- `qwen3-asr-0.6b/`, `qwen3-asr-1.7b/`, `qwen3-asr-1.7b-q8/`
+- `qwen3-asr-0.6b/`, `qwen3-asr-1.7b/`, `qwen3-asr-1.7b-q8/`, `qwen3-asr-1.7b-q4/`
 - `wasm/demo/qwen_asr.js`, `wasm/demo/qwen_asr.wasm` (build output)
 - `Qwen3-ASR/`
 - `samples/extra/`

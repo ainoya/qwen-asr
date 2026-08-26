@@ -959,6 +959,11 @@ void qwen_q8_attach(qwen_q8_mat_t *m, int8_t *q, float *scales, int rows, int co
     m->stats = NULL;
 }
 
+void qwen_q4_attach(qwen_q8_mat_t *m, int8_t *q, float *scales, int rows, int cols) {
+    qwen_q8_attach(m, q, scales, rows, cols);
+    m->bits = 4;
+}
+
 void qwen_wmat_free(qwen_wmat_t *w) {
     if (!w) return;
     free(w->f32);

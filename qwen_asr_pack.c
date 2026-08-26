@@ -34,6 +34,12 @@ typedef enum {
     PLAN_Q8_SCALE,   /* scales that go with the preceding PLAN_Q8_QUANT */
 } plan_kind_t;
 
+/* Bits used for one plan entry's quants. The decoder transformer layers can go
+ * to four; the encoder and the tied embedding stay at eight, matching what
+ * --weights q4 does at load time. */
+#define PACK_Q8 8
+#define PACK_Q4 4
+
 typedef struct {
     char name[288];
     plan_kind_t kind;
@@ -43,6 +49,9 @@ typedef struct {
     size_t offset;          /* relative to the start of the data section */
     char src_a[256];        /* source tensor name */
     char src_b[256];        /* second source when fusing gate/up ("" if none) */
+    int bits;               /* PACK_Q8 or PACK_Q4, for the quant entries */
+    int cols;               /* true column count; shape[1] is halved at 4 bits */
+    char awq[64];           /* AWQ scale group, "" when none applies */
 } plan_entry_t;
 
 typedef struct {
@@ -77,28 +86,71 @@ static int ends_with(const char *s, const char *suffix) {
     return ls >= lf && strcmp(s + ls - lf, suffix) == 0;
 }
 
-static int add_q8_pair(plan_t *p, const char *out_base, int rows, int cols,
-                       const char *src_a, const char *src_b) {
+static int add_quant_pair(plan_t *p, const char *out_base, int rows, int cols,
+                          const char *src_a, const char *src_b, int bits,
+                          const char *awq_key) {
+    const char *qs = (bits == PACK_Q4) ? "q4" : "q8";
     plan_entry_t *q = plan_add(p);
     if (!q) return -1;
-    snprintf(q->name, sizeof(q->name), "%s.q8", out_base);
+    snprintf(q->name, sizeof(q->name), "%s.%s", out_base, qs);
     q->kind = PLAN_Q8_QUANT;
     q->ndim = 2;
     q->shape[0] = rows;
-    q->shape[1] = cols;
-    q->nbytes = (size_t)rows * cols;
+    /* Four bits pack two values per byte, so the stored width is halved; the
+     * loader doubles shape[1] back to get the real column count. */
+    q->shape[1] = (bits == PACK_Q4) ? cols / 2 : cols;
+    q->nbytes = (size_t)rows * q->shape[1];
+    q->bits = bits;
+    q->cols = cols;
     snprintf(q->src_a, sizeof(q->src_a), "%s", src_a);
     if (src_b) snprintf(q->src_b, sizeof(q->src_b), "%s", src_b);
+    if (awq_key) snprintf(q->awq, sizeof(q->awq), "%s", awq_key);
 
     plan_entry_t *s = plan_add(p);
     if (!s) return -1;
-    snprintf(s->name, sizeof(s->name), "%s.q8s", out_base);
+    snprintf(s->name, sizeof(s->name), "%s.%ss", out_base, qs);
     s->kind = PLAN_Q8_SCALE;
     s->ndim = 2;
     s->shape[0] = rows;
     s->shape[1] = cols / QWEN_Q8_BLOCK;
     s->nbytes = (size_t)rows * (cols / QWEN_Q8_BLOCK) * sizeof(float);
+    s->bits = bits;
     return 0;
+}
+
+/* Which AWQ scale vector applies to this tensor, if any.
+ *
+ * Keyed by the group whose *input* the tensor consumes, because that is what
+ * the scaling has to be undone against: q, k and v all read the input_layernorm
+ * output, so they share one vector with that norm; gate/up share theirs with
+ * post_attention_layernorm; down has its own. O is absent on purpose - under
+ * grouped-query attention two of its input channels share one V row, so there
+ * is nowhere exact to fold the division. */
+static int awq_group_of(const char *name, char *key, size_t cap) {
+    const char *at = strstr(name, ".layers.");
+    int layer;
+    if (!at || sscanf(at, ".layers.%d.", &layer) != 1) return 0;
+    static const struct { const char *suffix; const char *tag; } map[] = {
+        { "self_attn.q_proj.weight",         "q"       },
+        { "self_attn.k_proj.weight",         "q"       },
+        { "self_attn.v_proj.weight",         "q"       },
+        { "input_layernorm.weight",          "q"       },
+        { "mlp.gate_proj.weight",            "gate_up" },
+        { "post_attention_layernorm.weight", "gate_up" },
+        { "mlp.down_proj.weight",            "down"    },
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        if (!ends_with(name, map[i].suffix)) continue;
+        snprintf(key, cap, "L%02d.%s", layer, map[i].tag);
+        return 1;
+    }
+    return 0;
+}
+
+/* The decoder transformer layers, and only those, are what --weights q4
+ * narrows; the encoder and the tied embedding stay at eight bits. */
+static int is_decoder_layer(const char *name) {
+    return strstr(name, "thinker.model.layers.") != NULL;
 }
 
 static int write_padding(FILE *f, size_t n) {
@@ -111,11 +163,30 @@ static int write_padding(FILE *f, size_t n) {
     return 0;
 }
 
-int qwen_pack_q8(const char *model_dir, const char *out_path) {
+int qwen_pack(const char *model_dir, const char *out_path, int four_bit,
+              const char *awq_stats) {
     multi_safetensors_t *ms = multi_safetensors_open(model_dir);
     if (!ms) {
         fprintf(stderr, "pack: cannot open model in %s\n", model_dir);
         return -1;
+    }
+
+    /* Baking the rescaling into the file rather than applying it at load is the
+     * whole point: the browser fetches weights that are already correct, and
+     * the runtime never needs the statistics. */
+    qwen_awq_t *awq = NULL;
+    if (four_bit && awq_stats) {
+        awq = qwen_awq_open(awq_stats, qwen_awq_alpha);
+        if (!awq) {
+            multi_safetensors_close(ms);
+            return -1;
+        }
+        if (qwen_verbose >= 1)
+            fprintf(stderr, "pack: AWQ rescaling from %s, alpha %.2f\n",
+                    awq_stats, qwen_awq_alpha);
+    } else if (four_bit && qwen_verbose >= 1) {
+        fprintf(stderr, "pack: no --awq statistics given; four bits without "
+                        "channel rescaling costs real accuracy\n");
     }
 
     plan_t plan;
@@ -135,20 +206,26 @@ int qwen_pack_q8(const char *model_dir, const char *out_path) {
             /* up_proj is emitted together with gate_proj below. */
             if (ends_with(t->name, ".mlp.up_proj.weight")) continue;
 
+            char key[64];
+            int has_key = awq && awq_group_of(t->name, key, sizeof(key));
+            int bits = (four_bit && is_decoder_layer(t->name)) ? PACK_Q4 : PACK_Q8;
+
             if (ends_with(t->name, ".mlp.gate_proj.weight")) {
                 char up[256], fused[256];
                 size_t base = strlen(t->name) - strlen("gate_proj.weight");
                 snprintf(up, sizeof(up), "%.*sup_proj.weight", (int)base, t->name);
                 snprintf(fused, sizeof(fused), "%.*sgate_up.weight", (int)base, t->name);
-                if (add_q8_pair(&plan, fused, (int)t->shape[0] * 2,
-                                (int)t->shape[1], t->name, up) != 0)
+                if (add_quant_pair(&plan, fused, (int)t->shape[0] * 2,
+                                   (int)t->shape[1], t->name, up, bits,
+                                   has_key ? key : NULL) != 0)
                     goto done;
                 continue;
             }
 
             if (is_quantizable(t)) {
-                if (add_q8_pair(&plan, t->name, (int)t->shape[0],
-                                (int)t->shape[1], t->name, NULL) != 0)
+                if (add_quant_pair(&plan, t->name, (int)t->shape[0],
+                                   (int)t->shape[1], t->name, NULL, bits,
+                                   has_key ? key : NULL) != 0)
                     goto done;
                 continue;
             }
@@ -161,6 +238,8 @@ int qwen_pack_q8(const char *model_dir, const char *out_path) {
             for (int d = 0; d < t->ndim && d < 4; d++) e->shape[d] = t->shape[d];
             e->nbytes = (size_t)safetensor_numel(t) * sizeof(float);
             snprintf(e->src_a, sizeof(e->src_a), "%s", t->name);
+            /* The norms carry the input-side half of the rescaling. */
+            if (has_key) snprintf(e->awq, sizeof(e->awq), "%s", key);
         }
     }
 
@@ -231,6 +310,14 @@ int qwen_pack_q8(const char *model_dir, const char *out_path) {
             const safetensor_t *t = multi_safetensors_find(ms, e->src_a, &sf);
             float *v = t ? safetensors_get_f32(sf, t) : NULL;
             if (!v) { fprintf(stderr, "pack: missing %s\n", e->src_a); goto write_fail; }
+            /* A norm carrying the input side of the rescaling: dividing its
+             * weight is exact, since RMSNorm's own scale is computed from the
+             * unscaled input. */
+            if (e->awq[0]) {
+                int n = (int)(e->nbytes / sizeof(float));
+                const float *sc = qwen_awq_scales(awq, e->awq, n);
+                if (sc) for (int c = 0; c < n; c++) v[c] /= sc[c];
+            }
             size_t ok = fwrite(v, 1, e->nbytes, f);
             free(v);
             if (ok != e->nbytes) goto write_fail;
@@ -247,12 +334,36 @@ int qwen_pack_q8(const char *model_dir, const char *out_path) {
                 if (!b) { fprintf(stderr, "pack: missing %s\n", e->src_b); goto write_fail; }
                 if (qwen_q8_from_bf16_interleave2(&pending, a, b,
                                                   (int)e->shape[0] / 2,
-                                                  (int)e->shape[1]) != 0)
+                                                  e->cols) != 0)
                     goto write_fail;
             } else {
                 if (qwen_q8_from_bf16(&pending, a, (int)e->shape[0],
-                                      (int)e->shape[1]) != 0)
+                                      e->cols) != 0)
                     goto write_fail;
+            }
+            if (e->bits == PACK_Q4) {
+                /* Go through Q8 so the packed bytes are the same ones
+                 * --weights q4 --awq would produce at load time. */
+                const float *sc = e->awq[0] ? qwen_awq_scales(awq, e->awq, e->cols) : NULL;
+                qwen_q8_mat_t q4;
+                int qrc = sc ? qwen_q4_from_q8_scaled(&q4, &pending, sc)
+                             : qwen_q4_from_q8(&q4, &pending);
+                if (qrc != 0) goto write_fail;
+                /* down's input is the SwiGLU product, so its rescaling folds
+                 * into the `up` rows here (rows interleave gate0, up0, ...). */
+                if (awq && ends_with(e->name, ".mlp.gate_up.weight.q4")) {
+                    char dk[64];
+                    int layer;
+                    const char *at = strstr(e->name, ".layers.");
+                    if (at && sscanf(at, ".layers.%d.", &layer) == 1) {
+                        int inter = (int)e->shape[0] / 2;
+                        snprintf(dk, sizeof(dk), "L%02d.down", layer);
+                        const float *ds = qwen_awq_scales(awq, dk, inter);
+                        if (ds) qwen_q8_scale_rows(&q4, ds, 1, 2, inter);
+                    }
+                }
+                qwen_q8_free(&pending);
+                pending = q4;
             }
             if (fwrite(pending.q, 1, e->nbytes, f) != e->nbytes) goto write_fail;
         } else { /* PLAN_Q8_SCALE */
@@ -283,6 +394,11 @@ write_fail:
 
 done:
     plan_free(&plan);
+    qwen_awq_close(awq);
     multi_safetensors_close(ms);
     return rc;
+}
+
+int qwen_pack_q8(const char *model_dir, const char *out_path) {
+    return qwen_pack(model_dir, out_path, 0, NULL);
 }

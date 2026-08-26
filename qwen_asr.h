@@ -329,6 +329,13 @@ typedef struct {
  * Returns 0 on success. */
 int qwen_pack_q8(const char *model_dir, const char *out_path);
 
+/* Same, but four_bit narrows the decoder transformer layers to 4 bits and
+ * awq_stats (a --calib-out dump, optional but strongly recommended there) bakes
+ * channel rescaling into the weights and norms, so the runtime needs neither
+ * the statistics nor a conversion pass. */
+int qwen_pack(const char *model_dir, const char *out_path, int four_bit,
+              const char *awq_stats);
+
 /* Load model from directory */
 qwen_ctx_t *qwen_load(const char *model_dir);
 

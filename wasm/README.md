@@ -142,6 +142,28 @@ split is mel+encoder 3.9 s (wasm), GPU prefill 2.5 s, GPU generation 3.4 s.
   is only 2048 threads and dominated the step at long contexts: 42 ms/token at a
   1170-token context against 26.5 after splitting into 8 slices plus a merge.
 
+### Will this machine run it?
+
+`wasm/demo/webgpu-report.html` answers that in a few seconds **without
+downloading the model**. The requirement is a property of the model's shape, so
+it is known up front; the old flow only discovered a machine could not run the
+GPU path after fetching 2.18 GB.
+
+The number that decides it: the decoder packs every Q8 matrix into **one
+storage buffer of 1.72 GB**, and WebGPU only guarantees
+`maxStorageBufferBindingSize` of 128 MiB. A machine that offers the baseline
+cannot create that binding at all, whatever its GPU is worth. The report prints
+the requirement against the adapter's limits, then actually attempts the
+allocation, because a limit is a promise and an allocation is a fact.
+
+It also measures coalesced read bandwidth and projects a decode step from it -
+one step reads the whole decoder once, so that is the floor. On an M1 Pro in a
+background tab: 72.7 GB/s, projecting 25.1 ms/token, against 22-27 ms/token
+actually observed. The projection is worth trusting as a screen.
+
+Output ends with a one-line JSON to paste back, which is how to collect
+coverage from machines this repo has never run on.
+
 ### The audio tower on the GPU
 
 `wasm/demo/webgpu-encoder.js` runs the whole audio tower - the Conv2D stem and

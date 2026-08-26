@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WebGPU capability report</title>
+<style>
+  body { background:#12141a; color:#e6e8ef; font:14px/1.6 -apple-system,sans-serif; padding:24px; max-width:900px; margin:0 auto; }
+  pre { background:#0e1015; border:1px solid #2c3040; border-radius:8px; padding:14px; white-space:pre-wrap; word-break:break-word; }
+  button { background:#6ea8fe; color:#101218; border:0; border-radius:7px; padding:9px 16px; font-weight:600; cursor:pointer; margin-right:8px; }
+  .ok { color:#6ee7a8; } .no { color:#f08a8a; } .warn { color:#f0c05e; }
+</style>
+</head>
+<body>
+<h2>WebGPU capability report</h2>
+<p>Answers "would this machine run the GPU path, and how fast" <strong>without
+downloading the 2.18 GB model</strong>. The requirement is a property of the
+model's shape, so it is known up front; the old flow only found out after the
+download. Takes a few seconds — run it on any machine and paste the JSON back.</p>
+<p>
+  <button id="run">Run report</button>
+  <button id="copy">Copy JSON</button>
+</p>
+<pre id="out">idle</pre>
+
+<script>
+const out = document.getElementById("out");
+const say = (s = "") => { out.textContent += s + "\n"; };
+const GB = (n) => (n / 1e9).toFixed(2) + " GB";
+const MB = (n) => (n / 1e6).toFixed(0) + " MB";
+
+/* What this build asks the GPU for. Derived from the 1.7B shape rather than
+ * measured, so the report needs no model: the decoder packs every Q8 matrix
+ * into one storage buffer, and that buffer is the binding that has to fit. */
+const SHAPE = {
+  decLayers: 28, decHidden: 2048, decHeads: 16, decKvHeads: 8, decHeadDim: 128,
+  decInter: 6144, vocab: 151936,
+  encLayers: 24, encDim: 1024, encFfn: 4096, encOut: 2048, convProj: 7680,
+};
+function requirements() {
+  const s = SHAPE;
+  const qdim = s.decHeads * s.decHeadDim, kvdim = s.decKvHeads * s.decHeadDim;
+  const perLayer = s.decHidden * qdim + s.decHidden * kvdim * 2 + qdim * s.decHidden +
+                   s.decHidden * s.decInter * 2 + s.decInter * s.decHidden;
+  const decQuant = s.decLayers * perLayer + s.vocab * s.decHidden;   /* int8 bytes */
+  const encQuant = s.encLayers * (4 * s.encDim * s.encDim + 2 * s.encDim * s.encFfn) +
+                   s.encDim * s.convProj + s.encDim * s.encDim + s.encOut * s.encDim;
+  return {
+    decoderBinding: decQuant,                 /* the largest single binding */
+    decoderScales: (decQuant / 64) * 4,
+    towerBinding: encQuant,
+    total: decQuant + (decQuant / 64) * 4 + encQuant,
+  };
+}
+
+async function main() {
+  out.textContent = "";
+  const req = requirements();
+  const r = { when: new Date().toISOString(), ua: navigator.userAgent };
+
+  if (!navigator.gpu) {
+    say("WebGPU: NOT AVAILABLE — navigator.gpu is missing");
+    r.webgpu = false;
+    window.__report = r;
+    return;
+  }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) { say("WebGPU: no adapter"); r.webgpu = false; window.__report = r; return; }
+
+  const info = adapter.info || {};
+  const lim = adapter.limits;
+  r.webgpu = true;
+  r.adapter = { vendor: info.vendor, architecture: info.architecture, device: info.device };
+  r.features = [...adapter.features];
+  r.limits = {
+    maxBufferSize: lim.maxBufferSize,
+    maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
+    maxComputeInvocationsPerWorkgroup: lim.maxComputeInvocationsPerWorkgroup,
+    maxComputeWorkgroupStorageSize: lim.maxComputeWorkgroupStorageSize,
+  };
+
+  say(`adapter: ${info.vendor || "?"} ${info.architecture || ""} ${info.device || ""}`);
+  say(`features: ${r.features.join(", ") || "(none)"}`);
+  say(`maxStorageBufferBindingSize ${GB(lim.maxStorageBufferBindingSize)}`);
+  say(`maxBufferSize               ${GB(lim.maxBufferSize)}`);
+  say();
+
+  /* The decision this build makes today. */
+  say(`this build needs one storage binding of ${GB(req.decoderBinding)} for the decoder`);
+  say(`                    plus ${MB(req.decoderScales)} of scales and ${MB(req.towerBinding)} for the audio tower`);
+  const fitsDec = req.decoderBinding <= lim.maxStorageBufferBindingSize;
+  const fitsTower = req.towerBinding <= lim.maxStorageBufferBindingSize;
+  r.decoderFits = fitsDec;
+  r.towerFits = fitsTower;
+  say(`GPU decoder    : ${fitsDec ? "would start" : "WOULD NOT START — binding limit too small"}`);
+  say(`GPU audio tower: ${fitsTower ? "would start" : "WOULD NOT START"}`);
+  say();
+
+  /* Limits can be optimistic; try the allocation for real. */
+  let device = null;
+  try {
+    device = await adapter.requestDevice({
+      requiredLimits: {
+        maxBufferSize: Math.min(lim.maxBufferSize, Math.max(req.decoderBinding, 1 << 28)),
+        maxStorageBufferBindingSize:
+          Math.min(lim.maxStorageBufferBindingSize, Math.max(req.decoderBinding, 1 << 28)),
+      },
+      requiredFeatures: adapter.features.has("shader-f16") ? ["shader-f16"] : [],
+    });
+  } catch (e) {
+    say(`requestDevice failed: ${e.message}`);
+    r.deviceError = e.message;
+  }
+  if (!device) { window.__report = r; return; }
+  device.onuncapturederror = (e) => say(`gpu error: ${e.error.message}`);
+
+  if (fitsDec) {
+    say(`allocating the ${GB(req.decoderBinding)} binding for real...`);
+    try {
+      const b = device.createBuffer({ size: req.decoderBinding, usage: GPUBufferUsage.STORAGE });
+      await device.queue.onSubmittedWorkDone();
+      b.destroy();
+      say("  allocation OK");
+      r.allocOk = true;
+    } catch (e) {
+      say(`  allocation FAILED: ${e.message}`);
+      r.allocOk = false;
+    }
+  }
+  say();
+
+  /* Read bandwidth, the thing decode is actually limited by. */
+  const SIZE = Math.min(256 << 20, lim.maxStorageBufferBindingSize);
+  const words = Math.floor(SIZE / 4);
+  const buf = device.createBuffer({ size: words * 4, usage: GPUBufferUsage.STORAGE });
+  const sink = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE });
+  const code = `
+@group(0) @binding(0) var<storage, read> src : array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst : array<u32>;
+const LANES : u32 = ${256 * 1024}u;
+const TOTAL : u32 = ${words}u;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) g : vec3<u32>) {
+  var acc : u32 = 0u; var i : u32 = g.x;
+  loop { if (i >= TOTAL) { break; } acc = acc + src[i]; i = i + LANES; }
+  if (acc == 0xdeadbeefu) { dst[0] = acc; }
+}`;
+  const pipe = device.createComputePipeline({
+    layout: "auto", compute: { module: device.createShaderModule({ code }), entryPoint: "main" },
+  });
+  const bind = device.createBindGroup({
+    layout: pipe.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: buf } }, { binding: 1, resource: { buffer: sink } }],
+  });
+  const go = async () => {
+    const e = device.createCommandEncoder();
+    const p = e.beginComputePass();
+    p.setPipeline(pipe); p.setBindGroup(0, bind); p.dispatchWorkgroups(1024); p.end();
+    device.queue.submit([e.finish()]);
+    await device.queue.onSubmittedWorkDone();
+  };
+  await go();
+  const t0 = performance.now();
+  for (let i = 0; i < 8; i++) await go();
+  const ms = (performance.now() - t0) / 8;
+  const bw = (words * 4 / 1e9) / (ms / 1e3);
+  r.readBandwidthGBs = Number(bw.toFixed(1));
+  say(`coalesced read bandwidth: ${bw.toFixed(1)} GB/s`);
+
+  /* One token of decode reads the whole decoder once, so this is the floor. */
+  const perToken = req.decoderBinding + req.decoderScales;
+  r.projectedMsPerToken = Number(((perToken / 1e9) / bw * 1000).toFixed(1));
+  say(`=> a decode step reads ${GB(perToken)}, so ~${r.projectedMsPerToken} ms/token at that rate`);
+  say(`   (a floor: it ignores attention, the KV cache and dispatch overhead)`);
+  say();
+
+  say(`visibility: ${document.visibilityState}` +
+      (document.visibilityState !== "visible" ? "  <- a hidden tab loses GPU throughput; re-run in front" : ""));
+  say(`shader-f16: ${adapter.features.has("shader-f16") ? "yes" : "no"}`);
+  say(`subgroups : ${adapter.features.has("subgroups") ? "yes" : "no"}`);
+  say();
+  say("--- paste this back ---");
+  say(JSON.stringify(r));
+  window.__report = r;
+}
+
+document.getElementById("run").onclick = () => main().catch((e) => say("error: " + e.message));
+document.getElementById("copy").onclick = () =>
+  navigator.clipboard?.writeText(JSON.stringify(window.__report || {}, null, 2));
+</script>
+</body>
+</html>

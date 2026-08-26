@@ -164,9 +164,13 @@ From `qwen_load()` and CLI:
   - WebAssembly SIMD128 hot kernels (Q8 matvec/argmax/quantize, f32 helpers)
 - `wasm/`
   - `qwen_wasm.c` browser entry points, `build.sh`, `serve.py`,
-    node harnesses (`bench-node.js`, `check-node.js`, `stream-node.js`),
-    and `demo/` (batch + streaming demo, `webgpu-decoder.js`,
-    `webgpu-test.html`, `webgpu-probe.html`)
+    node harnesses (`bench-node.js`, `check-node.js`, `stream-node.js`,
+    `dump-golden.js`), and `demo/` (batch + streaming demo,
+    `webgpu-decoder.js`, `webgpu-test.html`, `webgpu-golden.html`,
+    `webgpu-probe.html`, `tick.js`)
+  - GPU work is verified from a background tab via `dump-golden.js` +
+    `webgpu-golden.html`; the CPU reference must stay out of the page
+    because a background renderer only gets ~1.2 cores. See `wasm/README.md`.
 - `download_model.sh`
   - interactive small/large model downloader
 

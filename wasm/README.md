@@ -142,6 +142,44 @@ split is mel+encoder 3.9 s (wasm), GPU prefill 2.5 s, GPU generation 3.4 s.
   is only 2048 threads and dominated the step at long contexts: 42 ms/token at a
   1170-token context against 26.5 after splitting into 8 slices plus a merge.
 
+### Verifying GPU work from a background tab
+
+`webgpu-test.html` runs the wasm decoder and the GPU decoder on the same audio
+and diffs them, which is the right check but only usable with the window in
+front. Measured on a tab that is not in front:
+
+| | background | in front |
+|---|---|---|
+| GPU storage-buffer read | 92 GB/s | 122 GB/s |
+| wasm inference | ~1.2 cores' worth | all threads |
+| `setTimeout(0)` yield | ~1000 ms | ~0 ms |
+| `MessageChannel` yield | 0.005 ms | 0.005 ms |
+
+So GPU work is barely affected, wasm inference is unusable, and any poll loop
+written with a timer runs at the clamp rate rather than the work's rate. That
+last one is fixed for good in `tick.js`, which all the harnesses now use.
+
+The other two say where the CPU reference belongs: not in the page.
+`wasm/dump-golden.js` runs it under Node, which has no such limits, and writes
+each sample's decoder input embeddings plus the transcript the wasm decoder
+produces from them:
+
+```bash
+node wasm/dump-golden.js qwen3-asr-1.7b-q8 samples   # -> wasm/demo/golden/
+```
+
+`webgpu-golden.html` then feeds those embeddings straight to the GPU decoder
+and diffs the text, running **no wasm inference at all**. It works in a
+background tab, and because the page stays open, the 2.18 GB model load and
+1.72 GB weight upload are paid once per session rather than once per edit.
+For a kernel edit loop, `await reload()` re-imports `webgpu-decoder.js` with a
+fresh cache key against the weights already resident, and `await runAll()`
+re-checks — seconds per iteration.
+
+One decoder context is shared across samples, so `runAll()` refuses to start
+while another run is in flight; two overlapping runs corrupt each other's KV
+state and every sample comes out DIFF.
+
 ### Four bugs worth remembering
 
 All four presented as "the GPU math is wrong" and none of them were.

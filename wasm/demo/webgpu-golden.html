@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WebGPU golden check</title>
+<style>
+  body { background:#12141a; color:#e6e8ef; font:14px/1.6 -apple-system,sans-serif; padding:24px; max-width:1000px; margin:0 auto; }
+  pre { background:#0e1015; border:1px solid #2c3040; border-radius:8px; padding:14px; white-space:pre-wrap; word-break:break-word; }
+  button { background:#6ea8fe; color:#101218; border:0; border-radius:7px; padding:9px 16px; font-weight:600; cursor:pointer; margin-right:8px; }
+  button:disabled { opacity:.45; cursor:default; }
+  code { background:#0e1015; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<h2>WebGPU golden check</h2>
+<p>Runs <strong>only the GPU decoder</strong>, against input embeddings and
+reference transcripts produced beforehand by <code>node wasm/dump-golden.js</code>.
+No wasm inference happens here, which is the point: a tab that is not in front
+has its renderer descheduled to about a core and a bit, so a wasm reference run
+in the page takes minutes. GPU throughput barely cares — a hidden tab measured
+92 GB/s against 122 GB/s in front — so this harness works in the background.</p>
+
+<p>Iterating on a kernel: leave this page open, edit the module, then from the
+console (or a driver) call
+<code>await reload()</code> to re-import the decoder with a fresh cache key and
+<code>await runAll()</code> to re-check. The 2.18 GB model load and 1.72 GB
+weight upload are paid once per page, not once per edit.</p>
+
+<p>
+  <button id="load">Load model + weights</button>
+  <button id="run" disabled>Run all golden samples</button>
+  <label>threads <input id="threads" type="number" min="1" max="12" value="4" style="width:56px"></label>
+  <label>maxNew <input id="maxnew" type="number" min="64" max="2048" step="64" value="640" style="width:70px"></label>
+</p>
+<pre id="out">idle</pre>
+
+<script src="qwen_asr.js"></script>
+<script type="module">
+import { until } from "./tick.js";
+
+const MODEL_BASE = "../../qwen3-asr-1.7b-q8";
+const out = document.getElementById("out");
+const say = (s = "") => { out.textContent += s + "\n"; };
+const P = (x) => x >>> 0;
+
+let M = null, gpu = null, golden = null, version = 0;
+
+function cstr(s) {
+  const len = M.lengthBytesUTF8(s) + 1;
+  const p = P(M._qwen_wasm_alloc(len));
+  M.stringToUTF8(s, p, len);
+  return p;
+}
+
+/* Re-import the decoder module with a fresh cache key and rebuild it against
+ * the weights already resident on the GPU. */
+async function reload() {
+  const { WebGPUDecoder } = await import(`./webgpu-decoder.js?v=${++version}`);
+  gpu = new WebGPUDecoder(M);
+  await gpu.init(() => {});
+  say(`reloaded webgpu-decoder.js (v${version})`);
+  return gpu;
+}
+window.reload = reload;
+
+document.getElementById("load").onclick = async () => {
+  document.getElementById("load").disabled = true;
+  out.textContent = "";
+  try {
+    say(`visibility: ${document.visibilityState} (correctness is unaffected; timings are not)`);
+
+    golden = await (await fetch("./golden/index.json")).json();
+    say(`golden set: ${golden.samples.length} samples, dim=${golden.dim}, model=${golden.model}`);
+
+    say("instantiating wasm...");
+    M = await createQwenASR();
+    M.FS.mkdirTree("/model");
+    for (const f of ["vocab.json", "merges.txt"]) {
+      const r = await fetch(`${MODEL_BASE}/${f}`);
+      M.FS.writeFile(`/model/${f}`, new Uint8Array(await r.arrayBuffer()));
+    }
+    const head = await fetch(`${MODEL_BASE}/qwen-asr-q8.bin`, { method: "HEAD" });
+    const total = Number(head.headers.get("content-length"));
+    say(`fetching ${(total / 1e9).toFixed(2)} GB model...`);
+    const ptr = P(M._qwen_wasm_alloc(total));
+    const res = await fetch(`${MODEL_BASE}/qwen-asr-q8.bin`);
+    const rd = res.body.getReader();
+    let o = 0;
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      M.HEAPU8.set(value, ptr + o);
+      o += value.length;
+    }
+    /* Threads only matter for the tokenizer and weight descriptors here. */
+    const threads = Number(document.getElementById("threads").value) || 4;
+    const dir = cstr("/model");
+    if (M._qwen_wasm_init(ptr, total, dir, threads, 0) !== 0) throw new Error("init failed");
+    M._qwen_wasm_release(dir);
+    say("wasm ready (weights attached; no inference will run here)");
+
+    await reload();
+    say(`GPU decoder ready (${(gpu.weightBytes / 1e9).toFixed(2)} GB resident)`);
+    document.getElementById("run").disabled = false;
+  } catch (e) {
+    say("error: " + e.message);
+    console.error(e);
+  }
+};
+
+async function runOne(entry) {
+  const maxNew = Number(document.getElementById("maxnew").value) || 640;
+  const buf = await (await fetch(`./golden/${entry.name}.f32`)).arrayBuffer();
+  const emb = new Float32Array(buf);
+  if (emb.length !== entry.seq * golden.dim)
+    throw new Error(`${entry.name}: expected ${entry.seq * golden.dim} floats, got ${emb.length}`);
+
+  const ptr = P(M._qwen_wasm_alloc(emb.length * 4));
+  M.HEAPF32.set(emb, ptr / 4);
+  const t0 = performance.now();
+  const r = await gpu.prefillAndGenerate(ptr, entry.seq, maxNew, null);
+  const ms = performance.now() - t0;
+  M._qwen_wasm_release(ptr);
+
+  const got = r.text.trim(), want = entry.text.trim();
+  const ok = got === want;
+  say(`[${ok ? " OK " : "DIFF"}] ${entry.name}  seq=${entry.seq} tokens=${r.tokens} ` +
+      `${(ms / 1000).toFixed(2)}s (prefill ${(gpu.prefillMs / 1000).toFixed(2)}s)`);
+  if (!ok) {
+    let i = 0;
+    while (i < got.length && i < want.length && got[i] === want[i]) i++;
+    say(`       first divergence at char ${i}`);
+    say(`       want ...${want.slice(Math.max(0, i - 20), i + 40)}`);
+    say(`       got  ...${got.slice(Math.max(0, i - 20), i + 40)}`);
+  }
+  return ok;
+}
+
+let running = false;
+
+async function runAll() {
+  /* One decoder context is shared by every sample, so two overlapping runs
+   * corrupt each other's KV state and every sample comes out DIFF. Refuse
+   * rather than produce a confusing result. */
+  if (running) throw new Error("a run is already in flight");
+  running = true;
+  try {
+    return await runAllInner();
+  } finally {
+    running = false;
+  }
+}
+
+async function runAllInner() {
+  /* Re-read the manifest every run so a fresh dump-golden.js is picked up
+   * without reloading the page - the weights are the expensive part and they
+   * stay resident. */
+  golden = await (await fetch(`./golden/index.json?v=${Date.now()}`)).json();
+  say(`golden set: ${golden.samples.length} samples, dim=${golden.dim}`);
+  let pass = 0;
+  for (const entry of golden.samples) {
+    await until(() => true);
+    try {
+      if (await runOne(entry)) pass++;
+    } catch (e) {
+      say(`[ERR ] ${entry.name}: ${e.message}`);
+    }
+  }
+  const line = `golden check: ${pass}/${golden.samples.length} identical to the wasm decoder`;
+  say("\n" + line);
+  return line;
+}
+window.runAll = runAll;
+window.state = () => ({ M, gpu, golden, version });
+
+document.getElementById("run").onclick = async () => {
+  document.getElementById("run").disabled = true;
+  say();
+  await runAll();
+  document.getElementById("run").disabled = false;
+};
+</script>
+</body>
+</html>

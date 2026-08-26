@@ -610,6 +610,10 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
 const PRE_MATMUL_WGSL = HEADER + `
 const TR : u32 = 128u;
 const TS : u32 = 64u;
+/* TK = 16 is a measured optimum, not a guess: 32 puts the staged tiles at
+ * 24 KB and halves how many workgroups fit a core's threadgroup memory
+ * (pre.mm total 1081 -> 1256 ms), and 8 doubles the barrier count for less
+ * shared traffic than the occupancy is worth (1127 ms). */
 const TK : u32 = 16u;
 
 var<workgroup> ws : array<f32, 2048>;   // TR x TK
@@ -1151,6 +1155,11 @@ export class WebGPUDecoder {
       requiredLimits: {
         maxBufferSize: wantBinding,
         maxStorageBufferBindingSize: wantBinding,
+        /* Headroom for tile experiments: the default limit is 16 KB, and an
+         * over-limit pipeline does not throw at creation - it fails at
+         * dispatch time, silently, as an invalid command buffer. */
+        maxComputeWorkgroupStorageSize:
+          Math.min(adapter.limits.maxComputeWorkgroupStorageSize, 32768),
       },
     });
     this.hasSubgroups = wantFeatures.includes("subgroups");

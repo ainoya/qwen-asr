@@ -111,8 +111,51 @@ So GPU prefill is **2.2–3.1x** faster than the wasm one and the whole pipeline
 gains 1.3–1.5x. Generation lands at 22–27 ms/token roughly independent of
 context length.
 
-With that done the encoder is the largest remaining piece — for the 41s clip the
-split is mel+encoder 3.9 s (wasm), GPU prefill 2.5 s, GPU generation 3.4 s.
+### A second pass, driven by GPU timestamps
+
+The numbers above were the first port. A per-kernel profiler
+(`gpu.profileStep()`, `gpu.profilePrefill()`, `encoder.profileRun()` from the
+console — timestamp queries, so a throttled tab cannot distort them) found the
+step time was not where the bytes were, and three kernel rewrites plus step
+batching followed. Same golden suite, same background tab:
+
+| | before | after |
+|---|--------|-------|
+| generation | 22–27 ms/token | **15.3–19.7 ms/token** |
+| prefill, 41s clip (seq 549) | 2.44 s | **1.55 s** |
+| GPU tower, 41s clip | 0.88 s | **0.65 s** |
+| golden suite, 23 samples | 128 s | **65 s** |
+
+Generation now sits at the coalesced-read floor the probe projects from
+bandwidth alone. What changed, in the order it was found:
+
+- **Subgroup reductions** for every matvec/logits row sum (feature-gated, tree
+  fallback kept): the matvec family 23.2 → 17.2 ms/step, ~100 GB/s of weight
+  walk against the 122 GB/s probe ceiling.
+- **The generation score pass** was one thread per (head, key) — 8k threads,
+  21% of the step for 2% of the bytes. One workgroup per (head, 8 keys), q
+  staged once, subgroupAdd per key: 6.2 → 1.0 ms.
+- **The prefill V-sum** was the same shape of mistake at 42% of the prefill,
+  and two more shapes failed before the right one: what matters is the set of
+  addresses one warp instruction gathers (lanes along the head dim lose), and
+  a coalesced kernel with no reuse still re-reads V once per query (68 GB at
+  seq 549). It is a causal GEMM — tile both operands: 929 → ~60 ms.
+- **Steps are batched, 8 per submit.** The token id already lived on the GPU,
+  so chaining costs nothing; one mapAsync returns all eight ids. The
+  ~8 ms/token of submit + readback overhead a throttled tab pays fell to 1–2.
+- **The encoder attention** ran scores, softmax and the V-sum serially in one
+  thread per (query, head). One 32-lane workgroup per (query, head), lanes on
+  the key axis: 198 → 104 ms. Staging q in workgroup memory on top measured
+  *slower* (a warp-wide L1 broadcast beats a barrier), and the GEMM tile sweep
+  confirmed TK=16 over 8 and 32 — both kept as comments in the kernels.
+
+Two Chrome behaviors cost real debugging time and are worth knowing: timestamp
+writes use the `beginningOfPassWriteIndex` field names, and the old
+`beginningOfPassIndex` spelling fails *validation* — which does not throw, it
+returns zeros that look like an impossibly fast pass. And a pipeline whose
+workgroup storage exceeds the device limit (default 16 KB unless
+`maxComputeWorkgroupStorageSize` is requested) also fails not at creation but
+at dispatch, as an invalid command buffer.
 
 ### Design notes
 

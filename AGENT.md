@@ -499,6 +499,27 @@ Things that were learned the hard way and should not be re-litigated:
 - **Split the attention V-sum over the key axis.** One thread per (head, dim) is
   only 2048 threads and dominated the step at long contexts (42 vs 26.5
   ms/token at a 1170-token context).
+- **Coalescing is about the warp's address set, not the thread's loop order.**
+  The prefill V-sum was rewritten three times before this sank in: lanes along
+  the head dim gather seqPad-strided addresses however the j loop is ordered,
+  and a coalesced kernel with no tiling still re-reads V once per query. It is
+  a causal GEMM; tile both operands (929 -> ~60 ms at seq 549).
+- **Profile with GPU timestamps, not wall clocks** - a throttled tab distorts
+  wall time but not on-GPU spans. `gpu.profileStep()`, `gpu.profilePrefill()`,
+  `encoder.profileRun()`. Chrome pitfalls, both silent: `timestampWrites` needs
+  the `beginningOfPassWriteIndex` field names (the old `beginningOfPassIndex`
+  spelling fails validation and reads back zeros), and a pipeline whose shared
+  memory exceeds the device's `maxComputeWorkgroupStorageSize` (16 KB unless
+  requested higher) fails at dispatch as an invalid command buffer, not at
+  creation.
+- **Subgroups are worth requesting everywhere.** Feature-gated with tree/scalar
+  fallbacks kept: matvec row sums 1.35x, the generation score pass 6x, the
+  encoder attention 1.9x. Apple's subgroup size is exactly 32; kernels that
+  assume workgroup == one subgroup check `sgExact32`.
+- **Generation steps are batched 8 per submit** - the token id stays in a GPU
+  buffer, each step copies its id out, one mapAsync returns all eight. This cut
+  ~8 ms/token of per-step submit/readback overhead to 1-2. An EOS inside a
+  batch discards the tail steps.
 - **WebGPU validation errors do not throw.** A missing `COPY_DST` made
   `writeBuffer` a silent no-op and the prefill ran on zeros; an invalid pipeline
   (a shader helper that was not actually inserted) made every dispatch a no-op.

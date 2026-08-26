@@ -142,6 +142,27 @@ split is mel+encoder 3.9 s (wasm), GPU prefill 2.5 s, GPU generation 3.4 s.
   is only 2048 threads and dominated the step at long contexts: 42 ms/token at a
   1170-token context against 26.5 after splitting into 8 slices plus a merge.
 
+### A lost GPU device falls back instead of lying
+
+`device.lost` was not watched at all. A driver reset, the OS switching GPUs or
+the tab being discarded leaves every later call failing, and the failure mode
+that matters is not the crash - it is the quiet one. Twice in this branch a
+broken GPU path presented as "impossibly fast and wrong" rather than as an
+error: an inferred bind group layout that made every dispatch a no-op, and a
+buffer left mapped that failed every later `mapAsync`. WebGPU validation errors
+do not throw, so a dead device can return zeros that read as a transcript.
+
+So both modules now record the loss and their entry points throw on it, and the
+demo treats that as recoverable: it drops the GPU objects, clears the streaming
+hook and redoes the job on the CPU. The streaming path already degraded
+correctly, because the encoder hook reports failure to C and the loop falls back
+to encoding in wasm.
+
+Testable without breaking anything: `device.destroy()` resolves `device.lost`
+with `"destroyed"`, the same path a driver reset takes. Verified end to end -
+the run reports "retrying on the cpu", drops both GPU objects, and finishes
+with the right text.
+
 ### The model is cached across reloads
 
 The packed model is 2.18 GB and `serve.py` sends `Cache-Control: no-store`, so

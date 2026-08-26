@@ -397,6 +397,17 @@ async function runBatch(bytes, label) {
         `gpu generation <b>${Math.round(decMs - gpu.prefillMs)}ms</b> for <b>${r.tokens}</b> tokens`;
       setStatus("done");
     } catch (e) {
+      /* A lost device is recoverable by giving up on the GPU, so do that and
+       * finish the job rather than leaving the user with nothing. */
+      if (gpu?.lost || encoder?.lost) {
+        log(`GPU unavailable (${gpu?.lost || encoder?.lost}); retrying on the cpu`, "err");
+        gpu = null; encoder = null;
+        Module.__gpuEncode = null;
+        Module._qwen_wasm_set_gpu_encoder(0);
+        $("backend").value = "cpu";
+        busy = false;
+        return runBatch(bytes, label);
+      }
       log("error: " + e.message, "err");
       setStatus("failed");
     }

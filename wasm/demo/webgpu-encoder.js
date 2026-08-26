@@ -512,6 +512,13 @@ export class WebGPUEncoder {
     this.device = await adapter.requestDevice({
       requiredLimits: { maxBufferSize: want, maxStorageBufferBindingSize: want },
     });
+    /* See the note in webgpu-decoder.js: a lost device has to be observable,
+     * not discovered through a wrong answer. */
+    this.device.lost.then((info) => {
+      this.lost = info.reason || "unknown";
+      console.error(`GPU device lost (${this.lost})`);
+      report(`GPU device lost (${this.lost}); falling back to wasm`);
+    });
     this.device.onuncapturederror = (e) => {
       console.error("gpu error:", e.error.message);
       report("gpu error: " + e.error.message);
@@ -848,6 +855,7 @@ export class WebGPUEncoder {
    * buffer and one set of activation regions. Queueing is what keeps a slow
    * chunk from corrupting the next one. */
   async runFromMel(melPtr, melFrames) {
+    if (this.lost) throw new Error(`GPU device lost (${this.lost})`);
     const mine = this._queue = Promise.resolve(this._queue).then(
       () => this.runFromMelInner(melPtr, melFrames), () => this.runFromMelInner(melPtr, melFrames));
     return mine;
@@ -987,6 +995,7 @@ export class WebGPUEncoder {
   /* conv-stem output in, [tokens][output_dim] out - the transformer half only,
    * which is what the golden conv tap checks. */
   async run(convPtr, tokens) {
+    if (this.lost) throw new Error(`GPU device lost (${this.lost})`);
     this.prepare(tokens);
     this.uploadInput(convPtr, tokens);
     const r = this.buildParams();

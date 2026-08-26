@@ -978,6 +978,15 @@ export class WebGPUDecoder {
     /* Surface these: a missing buffer usage flag makes writeBuffer a silent
      * no-op, and the symptom is a kernel that runs fast and returns zeros. */
     this.onError = report;
+    /* A device can be lost at any point - a driver reset, the OS switching
+     * GPUs, the tab being discarded. Every call after that fails, so record it
+     * and let callers fall back rather than reporting nonsense. */
+    device.lost.then((info) => {
+      this.lost = info.reason || "unknown";
+      const m = `GPU device lost (${this.lost}); falling back to wasm`;
+      console.error(m);
+      if (this.onError) this.onError(m);
+    });
     device.onuncapturederror = (e) => {
       console.error("gpu:", e.error.message);
       if (this.onError) this.onError("gpu error: " + e.error.message);
@@ -1627,6 +1636,7 @@ export class WebGPUDecoder {
   /* Prefill on the GPU from wasm-built embeddings, then generate.
    * `embedsPtr` points at [seq, hidden] f32 in wasm memory. */
   async prefillAndGenerate(embedsPtr, seq, maxNew, onPiece) {
+    if (this.lost) throw new Error(`GPU device lost (${this.lost})`);
     const { device, cfg, M } = this;
     const t0 = performance.now();
     this.prepareContext(seq, maxNew, { prefillSeq: seq });
@@ -1657,6 +1667,7 @@ export class WebGPUDecoder {
 
   /* Generate from `firstToken` (produced by the CPU prefill). */
   async generate(firstToken, kvLen, maxNew, onPiece, opts = {}) {
+    if (this.lost) throw new Error(`GPU device lost (${this.lost})`);
     const { device, cfg, M } = this;
     if (!opts.keepContext) this.prepareContext(kvLen, maxNew);
 

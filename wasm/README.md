@@ -212,6 +212,26 @@ thread is waiting on - the final chunk sat through its whole 30 s timeout.
 Finish is split into signal-EOF / poll / collect so the main thread stays
 free.
 
+### Memory
+
+Three deliberate choices bound what the GPU backend allocates:
+
+- **The KV cache is f16** (`kvF16Pref = false` before `init()` opts out). It
+  was the biggest allocation after weight sharding - 224 KiB/token in f32, a
+  360 MB binding at a 1600-token context - and halving it changed nothing
+  measurable: the golden suite keeps 23/23, the same aggregate cer, and the
+  same 18/23 byte-identity. The native engine stores its cache as f16 too.
+- **Long prefills chunk at 1024 positions**, so the attention-score scratch is
+  heads x 512 x seq instead of heads x seq x seq - 52 MB rather than 164 MB at
+  seq 1600, and linear rather than quadratic beyond it.
+- **Weights are sharded** at 256 MB (see below), so the largest binding is a
+  shard, not the 1.72 GB weight set.
+
+The elephant that remains: the wasm heap keeps the whole 2.18 GB model image
+even though the GPU holds its own copy of most of it, because wasm memory
+cannot shrink. The fix - uploading GPU-owned tensors straight from OPFS and
+giving wasm a reduced image - is designed but not built; see AGENT.md.
+
 ### A lost GPU device falls back instead of lying
 
 `device.lost` was not watched at all. A driver reset, the OS switching GPUs or

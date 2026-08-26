@@ -570,6 +570,31 @@ The pool is a hybrid spin/park barrier with work stealing
   and the worker silently processes nothing (this was a real SIGSEGV, caught by
   `--stream-cache-check` which runs at `threads=1`).
 
+### Assessed And Deferred (with the numbers that decided it)
+
+- **Speculative decoding for the stream** (SpecASR, arXiv:2507.18181, reports
+  3-3.8x for LLM-ASR with a draft model; prompt-lookup decoding gets 2-4x on
+  input-grounded tasks with exact greedy verification and no draft model).
+  The free draft this engine has is the previous chunk's hypothesis, and the
+  arithmetic caps its value: with `rollback=5`, a chunk's generation re-derives
+  exactly those 5 rolled-back tokens before producing ~7 genuinely new ones
+  (2 s of Japanese at ~3.4 tokens/s). Verifying 5 of ~12 tokens in one batched
+  pass saves ~4 sequential steps of ~15 ms - about 7% of chunk latency for a
+  verification path that must be exactly right. Revisit only if a real draft
+  source appears (a distilled encoder-only head, or Token Map Drafting's
+  n-gram tables, arXiv:2507.21522).
+- **The browser's double retention is the last big memory item.** The wasm
+  heap holds the whole 2.18 GB packed image forever (wasm memory cannot
+  shrink) while the GPU holds its own 1.83 GB of the same weights: ~4.3 GB
+  resident where ~2.6 GB would do. The fix is to never materialize GPU-owned
+  tensors in the wasm heap: parse the safetensors header in JS, upload
+  decoder-layer and encoder tensors to the GPU straight from OPFS file
+  slices, build a reduced image (embedding table + norms + small tensors,
+  ~0.4 GB) for wasm, and teach the C loaders to tolerate the absent tensors
+  behind a gpu-resident flag with CPU paths refusing cleanly (device-loss
+  fallback becomes a reload from OPFS, ~15 s). Sized at a day of careful
+  work; nothing else on the list touches it in value.
+
 Research note: published evaluations of llama.cpp quantization on ASR models
 report Q8_0 matching FP16 word error rate on a 1.7B model, while Q4_K raises
 character error rate by ~8.6% relative. That is why Q8 is the default and why a

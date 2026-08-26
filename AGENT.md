@@ -463,8 +463,11 @@ Known remaining opportunities, in rough value order:
 2. **Opt-in 4-bit weights.** Would roughly halve both the browser download and
    the decode bandwidth, at a measured quality cost (see below). Should never
    become the default.
-3. **Encoder conv stem.** `im2col` still allocates per chunk and runs
-   single-threaded; the conv2 GEMM is the largest single conv cost.
+3. ~~**Encoder conv stem.**~~ Measured closed. The note above was stale: the
+   im2col is threaded (`parallel_for`), its scratch is cached across calls,
+   and `QWEN_CONV_PROF=1` (per-layer im2col/gemm/bias timing) shows the conv2
+   GEMM dominating at ~2.4 TFLOPS on Accelerate - hardware speed. What is left
+   (serial bias adds, mel copies) is ~20 ms over a 25-minute file.
 4. **WebGPU encoder.** The decoder (prefill and generation) already runs on the
    GPU; mel and the audio encoder are still wasm and are now the largest single
    piece in the browser (3.9 s of an 11.4 s run on the 41s clip). It cannot

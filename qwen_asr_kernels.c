@@ -1932,6 +1932,12 @@ static size_t conv_cols_cap = 0;
  * 480x4320x800 - too narrow to keep the machine busy - and one dispatch per
  * chunk per layer. Batching widens N and cuts the dispatch count by the same
  * factor. */
+static double qwen_time_ms_dbg(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
 void qwen_conv2d_batch(float *out, const float *in, const float *weight,
                        const float *bias, int batch,
                        int c_in, int c_out, int h_in, int w_in,
@@ -1950,9 +1956,11 @@ void qwen_conv2d_batch(float *out, const float *in, const float *weight,
         if (!conv_cols_cap) return;
     }
 
+    double t_i0 = qwen_time_ms_dbg();
     im2col_task_t task = { in, conv_cols, batch, c_in, h_in, w_in, kh, kw,
                            stride, padding, h_out, w_out };
     parallel_for(im2col_worker, &task);
+    double t_i1 = qwen_time_ms_dbg();
 
     /* GEMM: weight[c_out, patch_size] @ cols[patch_size, batch*spatial_out] */
 #ifdef USE_BLAS
@@ -1964,6 +1972,7 @@ void qwen_conv2d_batch(float *out, const float *in, const float *weight,
     qwen_gemm_nn_generic(out, weight, conv_cols, c_out, patch_size, n_cols);
 #endif
 
+    double t_g1 = qwen_time_ms_dbg();
     if (bias) {
         for (int oc = 0; oc < c_out; oc++) {
             float b = bias[oc];
@@ -1971,6 +1980,10 @@ void qwen_conv2d_batch(float *out, const float *in, const float *weight,
             for (int s = 0; s < n_cols; s++) row[s] += b;
         }
     }
+    double t_b1 = qwen_time_ms_dbg();
+    if (getenv("QWEN_CONV_PROF"))
+        fprintf(stderr, "conv c_in=%d: im2col %.1f gemm %.1f bias %.1f ms\n",
+                c_in, t_i1 - t_i0, t_g1 - t_i1, t_b1 - t_g1);
 }
 
 void qwen_conv2d(float *out, const float *in, const float *weight, const float *bias,

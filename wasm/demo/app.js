@@ -21,6 +21,10 @@ let sampleBuf = 0;
 let sampleCap = 0;
 let poller = null;
 let gpu = null, encoder = null;
+/* Set when the wasm image was reduced because the GPU owns the transformer
+ * weights; a GPU failure then means reloading with the full image, since the
+ * CPU has nothing to decode with. */
+let gpuWeightSource = null, gpuResidentActive = false;
 /* Exposed so the harness can read hook counters without a rebuild. */
 if (typeof window !== "undefined") window.__asr = () => ({ gpu, encoder, Module });
 
@@ -217,6 +221,195 @@ async function fetchModelInto(url, total) {
   return ptr;
 }
 
+/* Stream the model into OPFS without touching wasm memory. */
+async function fetchModelToOpfs(url, total) {
+  const cached = await opfsHandle(total, false);
+  if (cached) {
+    try { if ((await cached.getFile()).size === total) return cached; } catch {}
+  }
+  const handle = await opfsHandle(total, true);
+  if (!handle) throw new Error("OPFS unavailable");
+  const writer = await handle.createWritable();
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  const reader = res.body.getReader();
+  let off = 0, lastReport = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    await writer.write(value);
+    off += value.length;
+    if (off - lastReport > 48 * 1024 * 1024) {
+      lastReport = off;
+      $("barfill").style.width = (off / total * 100).toFixed(1) + "%";
+      setStatus(`downloading model ${(off / 1e9).toFixed(2)} / ${(total / 1e9).toFixed(2)} GB`);
+      await tick();
+    }
+  }
+  await writer.close();
+  if (off !== total) throw new Error(`model truncated: ${off} of ${total}`);
+  log("model cached for next time");
+  return opfsHandle(total, false);
+}
+
+/* GPU-resident load: the transformer-layer weights never enter wasm memory.
+ *
+ * wasm memory cannot shrink, so the classic flow - materialize the whole
+ * 2.18 GB image in the heap, upload 1.72 GB of it to the GPU - holds both
+ * copies forever. Here the safetensors header is parsed in JS, a reduced
+ * image (embedding table, norms, encoder; ~0.66 GB) is built for wasm, and
+ * the decoder layers upload to the GPU straight from the cached file. */
+const DROP_RE = /^thinker\.model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate_up|down_proj))\.weight\.q8s?$/;
+
+/* Random-access source for the packed model: the OPFS cache when it can hold
+ * the file, else a JS ArrayBuffer held only until the GPU upload finishes -
+ * JS memory, unlike wasm memory, is returned when dropped. (Some embedded
+ * profiles cap OPFS below the model size; this machine's pane refuses writes
+ * past ~2.08 GB with a 2.18 GB model.) */
+async function acquireModelSource(url, total) {
+  try {
+    const handle = await fetchModelToOpfs(url, total);
+    const file = await handle.getFile();
+    if (file.size === total)
+      return { read: (o, n) => file.slice(o, o + n).arrayBuffer(), transient: null };
+  } catch (e) {
+    log(`OPFS cache unavailable (${e.message}); holding the model in JS memory during load`, "err");
+  }
+  /* One ArrayBuffer cannot hold the model (Chrome caps them near 2^31), so
+   * the transient copy is an array of 256 MB chunks. */
+  const CB = 256 << 20;
+  const chunks = [];
+  for (let o = 0; o < total; o += CB) chunks.push(new Uint8Array(Math.min(CB, total - o)));
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  const reader = res.body.getReader();
+  let off = 0, lastReport = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    let vo = 0;
+    while (vo < value.length) {
+      const ci = Math.floor((off + vo) / CB), co = (off + vo) % CB;
+      const n = Math.min(value.length - vo, CB - co);
+      chunks[ci].set(value.subarray(vo, vo + n), co);
+      vo += n;
+    }
+    off += value.length;
+    if (off - lastReport > 48 * 1024 * 1024) {
+      lastReport = off;
+      $("barfill").style.width = (off / total * 100).toFixed(1) + "%";
+      setStatus(`downloading model ${(off / 1e9).toFixed(2)} / ${(total / 1e9).toFixed(2)} GB`);
+      await tick();
+    }
+  }
+  if (off !== total) throw new Error(`model truncated: ${off} of ${total}`);
+  const read = (o, n) => {
+    const ci = Math.floor(o / CB), co = o % CB;
+    if (co + n <= CB) return Promise.resolve(chunks[ci].subarray(co, co + n));
+    const out = new Uint8Array(n);          /* spans a chunk boundary: assemble */
+    let done2 = 0;
+    while (done2 < n) {
+      const c = Math.floor((o + done2) / CB), cc = (o + done2) % CB;
+      const m = Math.min(n - done2, CB - cc);
+      out.set(chunks[c].subarray(cc, cc + m), done2);
+      done2 += m;
+    }
+    return Promise.resolve(out);
+  };
+  return { read, transient: chunks };
+}
+
+async function loadGpuResident(url, total, threads) {
+  const src = await acquireModelSource(url, total);
+  const read = src.read;
+
+  const asU8 = (b) => b instanceof Uint8Array ? b : new Uint8Array(b);
+  const h8 = asU8(await read(0, 8));
+  const hlen = Number(new DataView(h8.buffer, h8.byteOffset, 8).getBigUint64(0, true));
+  const header = JSON.parse(new TextDecoder().decode(asU8(await read(8, hlen))));
+  const dataBase = 8 + hlen;
+
+  /* Reduced image: same format, decoder-layer tensors left out. */
+  const kept = Object.entries(header)
+    .filter(([name]) => name !== "__metadata__" && !DROP_RE.test(name))
+    .sort((a, b) => a[1].data_offsets[0] - b[1].data_offsets[0]);
+  const newHeader = {};
+  let dataOff = 0;
+  for (const [name, t] of kept) {
+    const size = t.data_offsets[1] - t.data_offsets[0];
+    dataOff = Math.ceil(dataOff / 64) * 64;
+    newHeader[name] = { dtype: t.dtype, shape: t.shape, data_offsets: [dataOff, dataOff + size] };
+    dataOff += size;
+  }
+  let hjson = new TextEncoder().encode(JSON.stringify(newHeader));
+  const hpad = Math.ceil(hjson.length / 64) * 64;   /* keep the data 64-aligned */
+  const padded = new Uint8Array(hpad).fill(0x20);
+  padded.set(hjson);
+  hjson = padded;
+
+  const reducedLen = 8 + hjson.length + dataOff;
+  setStatus(`building the reduced image (${(reducedLen / 1e9).toFixed(2)} GB in wasm)...`);
+  const ptr = P(Module._qwen_wasm_alloc(reducedLen));
+  if (!ptr) throw new Error(`could not allocate ${reducedLen} bytes of wasm memory`);
+  const heap = Module.HEAPU8;
+  new DataView(heap.buffer, ptr, 8).setBigUint64(0, BigInt(hjson.length), true);
+  heap.set(hjson, ptr + 8);
+  let copied = 0, lastReport = 0;
+  for (const [name, t] of kept) {
+    const size = t.data_offsets[1] - t.data_offsets[0];
+    const srcOff = dataBase + t.data_offsets[0];
+    const dst = ptr + 8 + hjson.length + newHeader[name].data_offsets[0];
+    for (let off = 0; off < size; off += 64 << 20) {
+      const n = Math.min(64 << 20, size - off);
+      Module.HEAPU8.set(asU8(await read(srcOff + off, n)), dst + off);
+      copied += n;
+      if (copied - lastReport > 128 << 20) {
+        lastReport = copied;
+        $("barfill").style.width = (copied / dataOff * 100).toFixed(1) + "%";
+        await tick();
+      }
+    }
+  }
+  $("barfill").style.width = "100%";
+
+  /* Decoder weight source: entries in exactly the order the C descriptor
+   * table would emit them - layers 0..N x (q, k, v, o, gate_up, down), then
+   * the tied embedding. Offsets are absolute file positions. */
+  const abs = (t) => dataBase + t.data_offsets[0];
+  const len = (t) => t.data_offsets[1] - t.data_offsets[0];
+  const MATS = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                "self_attn.o_proj", "mlp.gate_up", "mlp.down_proj"];
+  let layers = 0;
+  while (header[`thinker.model.layers.${layers}.self_attn.q_proj.weight.q8`]) layers++;
+  if (!layers) throw new Error("no decoder layers in the model header");
+  const entries = [];
+  for (let l = 0; l < layers; l++) {
+    for (let kind = 0; kind < 6; kind++) {
+      const base = `thinker.model.layers.${l}.${MATS[kind]}.weight`;
+      const q = header[`${base}.q8`], sc = header[`${base}.q8s`];
+      if (!q || !sc) throw new Error(`missing ${base}.q8 in the model header`);
+      entries.push({ kind, layer: l, rows: q.shape[0], cols: q.shape[1],
+                     qoff: abs(q), soff: abs(sc) });
+    }
+  }
+  const emb = header["thinker.model.embed_tokens.weight.q8"];
+  const embS = header["thinker.model.embed_tokens.weight.q8s"];
+  if (!emb || !embS) throw new Error("missing embed_tokens.q8 in the model header");
+  entries.push({ kind: 6, layer: 0, rows: emb.shape[0], cols: emb.shape[1],
+                 qoff: abs(emb), soff: abs(embS) });
+
+  gpuWeightSource = { entries, read, transient: src.transient };
+
+  setStatus("attaching the reduced image...");
+  Module._qwen_wasm_set_gpu_resident(1);
+  const dir = cstr("/model");
+  const rc = Module._qwen_wasm_init(ptr, reducedLen, dir, threads, 0);
+  Module._qwen_wasm_release(dir);
+  if (rc !== 0) throw new Error("qwen_wasm_init failed on the reduced image");
+  gpuResidentActive = true;
+  log(`gpu-resident load: ${(reducedLen / 1e9).toFixed(2)} GB in wasm instead of ${(total / 1e9).toFixed(2)} GB`);
+}
+
 $("load").onclick = async () => {
   $("load").disabled = true;
   const t0 = performance.now();
@@ -238,25 +431,52 @@ $("load").onclick = async () => {
     const total = Number(head.headers.get("content-length"));
     if (!total) throw new Error("server did not report Content-Length for the model");
 
-    log(`fetching packed model, ${(total / 1e9).toFixed(2)} GB`);
-    const ptr = await fetchModelInto(`${MODEL_BASE}/qwen-asr-q8.bin`, total);
-
-    setStatus("attaching weights...");
     const threads = Number($("threads").value) || 8;
-    const dir = cstr("/model");
-    const rc = Module._qwen_wasm_init(ptr, total, dir, threads, 0);
-    Module._qwen_wasm_release(dir);
-    if (rc !== 0) throw new Error("qwen_wasm_init failed");
-
+    /* GPU backend: probe first, and if the GPU is real, keep the transformer
+     * weights out of wasm memory entirely. sessionStorage flag forces the
+     * classic full image after a mid-session GPU failure. */
+    let probe = null;
+    let loaded = false;
     if ($("backend").value === "gpu") {
-      const probe = await WebGPUDecoder.probe();
+      probe = await WebGPUDecoder.probe();
       if (!probe.ok) {
         log(`WebGPU unavailable (${probe.why}); falling back to the wasm decoder`, "err");
         $("backend").value = "cpu";
-      } else {
+      } else if (!sessionStorage.getItem("qwenFullImage")) {
+        try {
+          log(`fetching packed model, ${(total / 1e9).toFixed(2)} GB`);
+          await loadGpuResident(`${MODEL_BASE}/qwen-asr-q8.bin`, total, threads);
+          loaded = true;
+        } catch (e) {
+          log(`gpu-resident load failed (${e.message}); using the full image`, "err");
+          gpuWeightSource = null;
+          gpuResidentActive = false;
+        }
+      }
+    }
+
+    if (!loaded) {
+      log(`fetching packed model, ${(total / 1e9).toFixed(2)} GB`);
+      const ptr = await fetchModelInto(`${MODEL_BASE}/qwen-asr-q8.bin`, total);
+      setStatus("attaching weights...");
+      const dir = cstr("/model");
+      const rc = Module._qwen_wasm_init(ptr, total, dir, threads, 0);
+      Module._qwen_wasm_release(dir);
+      if (rc !== 0) throw new Error("qwen_wasm_init failed");
+    }
+
+    if ($("backend").value === "gpu") {
+      {
         setStatus("uploading weights to the GPU...");
         gpu = new WebGPUDecoder(Module);
+        if (gpuWeightSource) gpu.weightSource = gpuWeightSource;
         await gpu.init((m) => setStatus(m));
+        if (gpuWeightSource) {
+          /* The upload is done; drop the source so a transient JS copy of the
+           * model can be collected. */
+          gpu.weightSource = null;
+          gpuWeightSource = null;
+        }
         log(`GPU decoder ready (${(gpu.weightBytes / 1e9).toFixed(2)} GB resident on the GPU)`);
 
         /* The audio tower is optional: if it will not start, mel and the
@@ -342,6 +562,14 @@ $("load").onclick = async () => {
     setStatus(`ready — ${((performance.now() - t0) / 1000).toFixed(1)}s, ${threads} threads`);
     log("model ready");
   } catch (e) {
+    if (gpuResidentActive && !(gpu && gpu.ready)) {
+      /* wasm attached a reduced image but the GPU never came up: nothing can
+       * decode. Reload once with the full image (it is in the OPFS cache). */
+      log(`load failed after a reduced attach (${e.message}); reloading with the full image`, "err");
+      sessionStorage.setItem("qwenFullImage", "1");
+      location.reload();
+      return;
+    }
     log("error: " + e.message, "err");
     setStatus("failed");
     $("load").disabled = false;
@@ -442,6 +670,14 @@ async function runBatch(bytes, label) {
       /* A lost device is recoverable by giving up on the GPU, so do that and
        * finish the job rather than leaving the user with nothing. */
       if (gpu?.lost || encoder?.lost) {
+        if (gpuResidentActive) {
+          /* The CPU has no transformer weights to retry with; reload with the
+           * full image (it comes straight from the OPFS cache). */
+          log("GPU lost with gpu-resident weights; reloading with the full image", "err");
+          sessionStorage.setItem("qwenFullImage", "1");
+          location.reload();
+          return;
+        }
         log(`GPU unavailable (${gpu?.lost || encoder?.lost}); retrying on the cpu`, "err");
         gpu = null; encoder = null;
         Module.__gpuEncode = null;

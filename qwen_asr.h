@@ -166,6 +166,10 @@ typedef struct {
 
     /* Non-zero when the decoder layer weights are stored as Q8 blocks. */
     int quantized;
+    /* Non-zero when the transformer layer weights were deliberately not
+     * loaded (see qwen_gpu_resident): they live on a GPU that a decoder hook
+     * owns, and every CPU decode path refuses cleanly instead of running. */
+    int layers_absent;
     /* Non-zero when the tied embedding / LM head is also Q8. Tracked
      * separately because it feeds the input representation directly. */
     int embed_quantized;
@@ -197,6 +201,14 @@ typedef struct {
  * decides the token and 4 bits there is where quality goes first. */
 #define QWEN_WEIGHTS_Q4    3
 extern int qwen_weight_quant;
+
+/* When non-zero at load time, a packed model image is allowed to omit the
+ * decoder transformer-layer tensors. The browser sets this when the GPU owns
+ * those weights: they are uploaded straight from the cached model file, and
+ * materializing a second copy in wasm memory - which can never shrink - would
+ * hold ~1.5 GB for nothing. The embedding table, norms and encoder still load
+ * normally; CPU decode paths fail cleanly if reached. */
+extern int qwen_gpu_resident;
 
 /* ========================================================================
  * Token Callback (streaming output)

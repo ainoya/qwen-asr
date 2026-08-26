@@ -583,17 +583,20 @@ The pool is a hybrid spin/park barrier with work stealing
   verification path that must be exactly right. Revisit only if a real draft
   source appears (a distilled encoder-only head, or Token Map Drafting's
   n-gram tables, arXiv:2507.21522).
-- **The browser's double retention is the last big memory item.** The wasm
-  heap holds the whole 2.18 GB packed image forever (wasm memory cannot
-  shrink) while the GPU holds its own 1.83 GB of the same weights: ~4.3 GB
-  resident where ~2.6 GB would do. The fix is to never materialize GPU-owned
-  tensors in the wasm heap: parse the safetensors header in JS, upload
-  decoder-layer and encoder tensors to the GPU straight from OPFS file
-  slices, build a reduced image (embedding table + norms + small tensors,
-  ~0.4 GB) for wasm, and teach the C loaders to tolerate the absent tensors
-  behind a gpu-resident flag with CPU paths refusing cleanly (device-loss
-  fallback becomes a reload from OPFS, ~15 s). Sized at a day of careful
-  work; nothing else on the list touches it in value.
+- ~~**The browser's double retention**~~ Done for the decoder layers, the bulk
+  of it: with the GPU backend the demo parses the safetensors header in JS,
+  builds a reduced image without the transformer-layer tensors (0.68 GB in
+  wasm instead of 2.18 - wasm memory cannot shrink, so never materializing is
+  the only fix), and uploads those tensors to the GPU from a random-access
+  source. `qwen_gpu_resident` makes the C loader tolerate the absent tensors,
+  and every CPU decode path refuses cleanly; a GPU failure reloads once with
+  the full image (sessionStorage flag). The source is the OPFS cache when it
+  can hold the file - embedded panes have been seen refusing writes past
+  ~2.08 GB, below the 2.18 GB image - else a transient JS-side copy in 256 MB
+  chunks (one ArrayBuffer caps near 2^31) that is dropped after upload, which
+  JS memory, unlike wasm memory, actually returns. Encoder weights (0.32 GB)
+  still live in wasm so the CPU tower fallback keeps working; moving them too
+  is the remaining quarter of the win.
 
 Research note: published evaluations of llama.cpp quantization on ASR models
 report Q8_0 matching FP16 word error rate on a 1.7B model, while Q4_K raises

@@ -237,12 +237,25 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
                 { "mlp.gate_up.weight",      &l->gate_up_q8 },
                 { "mlp.down_proj.weight",    &l->down_q8 },
             };
+            int attached = 0;
             for (size_t k = 0; k < sizeof(q8) / sizeof(q8[0]); k++) {
                 snprintf(name, sizeof(name), "%s.%d.%s", lp, i, q8[k].suffix);
-                if (!attach_q8(ms, name, q8[k].dst)) {
+                if (attach_q8(ms, name, q8[k].dst)) {
+                    attached++;
+                } else if (!qwen_gpu_resident) {
                     fprintf(stderr, "decoder: packed model missing %s.q8\n", name);
                     return -1;
                 }
+            }
+            if (attached == 0 && qwen_gpu_resident) {
+                /* The image was reduced on purpose: these weights live on the
+                 * GPU and a decoder hook runs them. */
+                dec->layers_absent = 1;
+                continue;
+            }
+            if (attached != (int)(sizeof(q8) / sizeof(q8[0]))) {
+                fprintf(stderr, "decoder: layer %d is only partially present\n", i);
+                return -1;
             }
             /* A --pack-q4 image already stores four bits, with any channel
              * rescaling folded in when it was written, so there is nothing left
@@ -499,6 +512,14 @@ static int ensure_rope_cache(qwen_ctx_t *ctx, int required_pos, int head_dim, fl
  * ======================================================================== */
 
 void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_len) {
+    /* GPU-resident weights: the CPU has nothing to run these with. */
+    if (ctx->decoder.layers_absent) {
+        static int warned;
+        if (!warned++) fprintf(stderr,
+            "decoder: layer weights are GPU-resident; the CPU decode path is disabled\n");
+        return;
+    }
+
     qwen_decoder_t *dec = &ctx->decoder;
     const qwen_config_t *cfg = &ctx->config;
     int dim = cfg->dec_hidden;
@@ -640,6 +661,14 @@ static void ensure_dec_buffers(qwen_ctx_t *ctx) {
 }
 
 int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
+    /* GPU-resident weights: the CPU has nothing to run these with. */
+    if (ctx->decoder.layers_absent) {
+        static int warned;
+        if (!warned++) fprintf(stderr,
+            "decoder: layer weights are GPU-resident; the CPU decode path is disabled\n");
+        return QWEN_TOKEN_IM_END;
+    }
+
     qwen_decoder_t *dec = &ctx->decoder;
     const qwen_config_t *cfg = &ctx->config;
     int dim = cfg->dec_hidden;
@@ -803,6 +832,14 @@ static int kv_grow(qwen_ctx_t *ctx, qwen_kv_t *kv, int required) {
 
 int qwen_decoder_forward_batch(qwen_ctx_t *ctx, qwen_kv_t **kvs, int n,
                                const float *embeds, int *out_tokens) {
+    /* GPU-resident weights: the CPU has nothing to run these with. */
+    if (ctx->decoder.layers_absent) {
+        static int warned;
+        if (!warned++) fprintf(stderr,
+            "decoder: layer weights are GPU-resident; the CPU decode path is disabled\n");
+        return -1;
+    }
+
     if (n <= 0) return 0;
     if (n > QWEN_MAX_BATCH) return -1;
 
@@ -925,6 +962,14 @@ int qwen_decoder_forward_batch(qwen_ctx_t *ctx, qwen_kv_t **kvs, int n,
  * Every stream must be empty (len == 0); embeds[i] is [lens[i]][dec_hidden]. */
 int qwen_decoder_prefill_multi(qwen_ctx_t *ctx, qwen_kv_t **kvs,
                                const float *const *embeds, const int *lens, int n) {
+    /* GPU-resident weights: the CPU has nothing to run these with. */
+    if (ctx->decoder.layers_absent) {
+        static int warned;
+        if (!warned++) fprintf(stderr,
+            "decoder: layer weights are GPU-resident; the CPU decode path is disabled\n");
+        return -1;
+    }
+
     if (n <= 0) return 0;
     if (n == 1) {
         qwen_kv_bind(ctx, kvs[0]);

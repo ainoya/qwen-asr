@@ -21,6 +21,7 @@
 /* Global verbose flag */
 int qwen_verbose = 0;
 int qwen_weight_quant = QWEN_WEIGHTS_Q8_LM;
+int qwen_gpu_resident = 0;
 int qwen_monitor = 0;
 
 void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata) {

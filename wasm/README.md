@@ -227,10 +227,14 @@ Three deliberate choices bound what the GPU backend allocates:
 - **Weights are sharded** at 256 MB (see below), so the largest binding is a
   shard, not the 1.72 GB weight set.
 
-The elephant that remains: the wasm heap keeps the whole 2.18 GB model image
-even though the GPU holds its own copy of most of it, because wasm memory
-cannot shrink. The fix - uploading GPU-owned tensors straight from OPFS and
-giving wasm a reduced image - is designed but not built; see AGENT.md.
+And the big one: with the GPU backend the demo no longer materializes the
+decoder's transformer weights in wasm memory at all. The safetensors header is
+parsed in JS, wasm gets a reduced image - **0.68 GB instead of 2.18** - and
+the layer tensors upload to the GPU straight from the OPFS cache (or, where
+OPFS cannot hold the file, from a transient JS-side copy that is dropped once
+the upload finishes). Steady-state browser memory drops by ~1.5 GB. The C
+loader tolerates the reduced image behind `qwen_gpu_resident`, CPU decode
+paths refuse cleanly, and a GPU failure reloads once with the full image.
 
 ### A lost GPU device falls back instead of lying
 

@@ -1253,15 +1253,32 @@ export class WebGPUDecoder {
     this.eps = M._qwen_wasm_rms_eps();
     this.theta = M._qwen_wasm_rope_theta();
 
-    /* ---- weight tables ---- */
+    /* ---- weight tables ----
+     *
+     * Two sources: the C descriptor tables (weights resident in the wasm
+     * heap, the default), or an injected `weightSource` whose entries carry
+     * file offsets and an async reader - the gpu-resident load path, where
+     * the transformer weights never enter wasm memory at all and are
+     * uploaded straight from the cached model file. Entries must arrive in
+     * the same order the C table would emit them. */
     const MAXD = 8 * cfg.layers + 8;
     const dPtr = M._qwen_wasm_alloc(MAXD * 8 * 4) >>> 0;
-    const nQ = M._qwen_wasm_q8_desc(dPtr, MAXD);
-    if (nQ < 0) {
-      M._qwen_wasm_release(dPtr);
-      throw new Error("decoder is not Q8 quantized (use the packed model)");
+    let qEntries;
+    if (this.weightSource) {
+      qEntries = this.weightSource.entries;
+    } else {
+      const nQ = M._qwen_wasm_q8_desc(dPtr, MAXD);
+      if (nQ < 0) {
+        M._qwen_wasm_release(dPtr);
+        throw new Error("decoder is not Q8 quantized (use the packed model)");
+      }
+      const qd = new Uint32Array(M.HEAPU8.buffer, dPtr, nQ * 6).slice();
+      qEntries = [];
+      for (let i = 0; i < nQ; i++) {
+        const [kind, layer, rows, cols, qptr, sptr] = qd.subarray(i * 6, i * 6 + 6);
+        qEntries.push({ kind, layer, rows, cols, qptr, sptr });
+      }
     }
-    const qd = new Uint32Array(M.HEAPU8.buffer, dPtr, nQ * 6).slice();
     const nF = M._qwen_wasm_f32_desc(dPtr, MAXD * 2);
     if (nF < 0) {
       M._qwen_wasm_release(dPtr);
@@ -1301,8 +1318,8 @@ export class WebGPUDecoder {
       return sh;
     };
 
-    for (let i = 0; i < nQ; i++) {
-      const [kind, layer, rows, cols, qptr, sptr] = qd.subarray(i * 6, i * 6 + 6);
+    for (const ent of qEntries) {
+      const { kind, layer, rows, cols } = ent;
       const nq = rows * cols;
       const scaleBase = scaleFloats;
 
@@ -1319,15 +1336,19 @@ export class WebGPUDecoder {
             wordBase: sh.bytes / 4,
             rowBase: r0, rowCount: n,
             scaleBase: scaleBase + (r0 * cols) / 64,
-            qptr: qptr + r0 * cols, nq: n * cols,
+            qptr: ent.qptr != null ? ent.qptr + r0 * cols : undefined,
+            qoff: ent.qoff != null ? ent.qoff + r0 * cols : undefined,
+            nq: n * cols,
           });
           sh.bytes += n * cols;
         }
-        wmap.set(`${kind}:${layer}`, { rows, cols, scaleBase, sptr, nq, pieces });
+        wmap.set(`${kind}:${layer}`, { rows, cols, scaleBase,
+          sptr: ent.sptr, soff: ent.soff, nq, pieces });
       } else {
         const sh = openShard(nq);
         wmap.set(`${kind}:${layer}`, {
-          rows, cols, qptr, sptr, nq, scaleBase,
+          rows, cols, qptr: ent.qptr, qoff: ent.qoff,
+          sptr: ent.sptr, soff: ent.soff, nq, scaleBase,
           shard: shards.length - 1, wordBase: sh.bytes / 4,
         });
         sh.bytes += nq;
@@ -1411,21 +1432,35 @@ export class WebGPUDecoder {
     this.shardCount = shards.length;
 
     const CH = 64 << 20;
+    const src = this.weightSource;
     let done = 0, lastReport = 0;
-    const putQuant = (shard, wordBase, qptr, nq) => {
+    const putQuant = async (shard, wordBase, w, nq) => {
       for (let off = 0; off < nq; off += CH) {
         const n = Math.min(CH, nq - off);
-        device.queue.writeBuffer(this.bufQuants[shard], wordBase * 4 + off, M.HEAPU8, qptr + off, n);
+        if (src) {
+          const chunk = await src.read(w.qoff + off, n);
+          device.queue.writeBuffer(this.bufQuants[shard], wordBase * 4 + off,
+                                   new Uint8Array(chunk), 0, n);
+        } else {
+          device.queue.writeBuffer(this.bufQuants[shard], wordBase * 4 + off,
+                                   M.HEAPU8, w.qptr + off, n);
+        }
         done += n;
       }
     };
     for (const w of wmap.values()) {
       if (w.pieces) {
-        for (const p of w.pieces) putQuant(p.shard, p.wordBase, p.qptr, p.nq);
+        for (const p of w.pieces) await putQuant(p.shard, p.wordBase, p, p.nq);
       } else {
-        putQuant(w.shard, w.wordBase, w.qptr, w.nq);
+        await putQuant(w.shard, w.wordBase, w, w.nq);
       }
-      device.queue.writeBuffer(this.bufScale, w.scaleBase * 4, M.HEAPU8, w.sptr, (w.nq / 64) * 4);
+      const sBytes = (w.nq / 64) * 4;
+      if (src) {
+        device.queue.writeBuffer(this.bufScale, w.scaleBase * 4,
+                                 new Uint8Array(await src.read(w.soff, sBytes)), 0, sBytes);
+      } else {
+        device.queue.writeBuffer(this.bufScale, w.scaleBase * 4, M.HEAPU8, w.sptr, sBytes);
+      }
       if (done - lastReport > (256 << 20)) {
         lastReport = done;
         report(`uploading weights ${(done / 1e9).toFixed(2)} / ${(quantBytes / 1e9).toFixed(2)} GB`);

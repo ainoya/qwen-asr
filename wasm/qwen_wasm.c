@@ -991,3 +991,10 @@ void qwen_wasm_set_gpu_decoder(int on) {
     if (!g_ctx) return;
     qwen_set_decoder_hook(g_ctx, on ? gpu_decoder_hook : NULL, NULL);
 }
+
+/* Allow the model image to omit the decoder transformer layers; the GPU owns
+ * them and uploads straight from the cached file. Set before qwen_wasm_init. */
+EMSCRIPTEN_KEEPALIVE
+void qwen_wasm_set_gpu_resident(int on) {
+    qwen_gpu_resident = on ? 1 : 0;
+}

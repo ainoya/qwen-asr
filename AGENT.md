@@ -396,6 +396,39 @@ Useful when deciding where effort pays off:
 | decoder prefill | ~1.48 s | `sgemm` at ~1.4 TFLOPS, near the AMX ceiling |
 | token generation | ~4.1 s (24 ms/tok) | at the DRAM read bandwidth wall |
 
+### Long-Form Profile (M1 Pro, 1.7B packed Q8, 25 min of speech, `-S 30 --batch 4`)
+
+The table above is a 41 s clip decoded in one context. Real long-form work has a
+different shape, and this is the one to plan against. Total 93.2 s, 16.2x
+realtime, 2911 text tokens over 50 segments:
+
+| Phase | Time | Share | Bound by |
+|-------|------|-------|----------|
+| mel | 2.0 s | 2% | - |
+| encoder conv stem | 6.0 s | 6% | single-threaded `im2col` |
+| encoder transformer | 16.8 s | 18% | Accelerate `sgemm` |
+| decoder prefill | 41.2 s | 44% | `sgemm`, ~1.4 TFLOPS, at the AMX ceiling |
+| decoder generation | 27.2 s | 29% | DRAM read bandwidth |
+
+Prefill dominates because segmented decode prefills every segment's audio
+embeddings - about 15000 rows for 25 minutes - and that work is fixed by the
+architecture. Everything except the conv stem is already at a hardware ceiling,
+so the honest headroom here is roughly 5% (threading the conv stem) plus about
+3% (see the batching note below). Measure before assuming otherwise.
+
+**`--batch 4` is the right default and was re-measured to confirm it.** On this
+workload batch 4 takes 93.2 s, batch 8 112.3 s, batch 16 105.2 s. Larger batches
+do cut weight passes (990 -> 580 -> 335) but each pass costs more, because every
+stream carries its own KV cache and attention is per stream: a batch-8 pass
+measured 2.4x a batch-4 pass. Beyond 4 the batched decode is attention-bound,
+not weight-bound. The lockstep waste is real (990 passes for what 760 would
+cover) but refilling finished slots would add attention work in proportion, so
+the net is around 3%, not 30%.
+
+Beware contention when measuring any of this: an earlier reading of 311.7 s for
+the same run was another regression suite sharing the machine. Encoder time not
+matching across batch sizes is the tell, since it cannot depend on batch size.
+
 Known remaining opportunities, in rough value order:
 
 1. **f16 KV cache.** The cache is f32 today. At a 1500-token context it is

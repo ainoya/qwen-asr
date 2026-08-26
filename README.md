@@ -153,9 +153,19 @@ Japanese speech, then evaluated on the Japanese set:
 gives 0.187 and 0.40 gives 0.236, worse than not rescaling at all. `--awq-search`
 reports what each value buys in weighted error, and picked the same 0.25.
 
-It does not make four bits safe everywhere. The two English regression samples
-that collapse at four bits collapse just as hard with rescaling (normalized
-error 0.245 and 0.437 without, 0.265 and 0.437 with), so `q4` stays opt-in.
+It does not make four bits safe. **On long real-world recordings four bits
+collapses into repetition loops, with or without rescaling, and that makes it
+slower than Q8 as well as wrong.** On 25 minutes of real Japanese speech at
+`-S 30` it emitted 6933 text tokens where Q8 emitted 2716; 52% of its output was
+repeated 12-grams, with one block repeating 250 times. The whole file took 247 s
+against Q8's 142 s. `--batch 1` behaves the same, so it is not a batching
+artifact. The two English regression samples that fail at four bits fail just as
+hard with rescaling (normalized error 0.245 and 0.437 without, 0.265 and 0.437
+with).
+
+Short clips hide all of this - the table above is 18 clips of a few seconds
+each. If you turn `q4` on, check it against a long recording of your own before
+trusting it.
 
 To avoid carrying the statistics around at run time, bake them into a model
 image instead:

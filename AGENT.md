@@ -270,6 +270,15 @@ re-litigate these.
 - **Alpha is sharply peaked and 0.25 is the optimum.** Measured Japanese CER:
   0.15 -> 0.187, 0.25 -> 0.169, 0.40 -> 0.236. Going past the optimum is worse
   than not rescaling at all.
+- **Four bits collapses on real long-form audio, even with AWQ.** This is the
+  finding that decides it. On 25 minutes of real Japanese speech at `-S 30`, the
+  4-bit+AWQ image emitted 6933 text tokens where Q8 emitted 2716, and 52% of its
+  output was repeated 12-grams with one block repeating 250 times in a row (Q8:
+  0.1% and 1x). It is a loop, not drift. Net effect on the whole file: 247.5 s
+  against Q8's 142.1 s, so four bits is 1.74x *slower* as well as wrong. Not a
+  batching bug - `--batch 1` collapses identically (6933 vs 6896 tokens). Short
+  clean clips hide this completely: on the 18-sample Japanese set four bits looks
+  like a 1.29x win at 0.005 CER. Always check a long real recording.
 - **AWQ does not rescue the two English samples that break at four bits.**
   `15s_there_are_two_of_them_out_there` and `21s_hey_thats_us_were_doing_all_right`
   fail the suite at normalized error 0.245 and 0.437 without AWQ, and 0.265 and

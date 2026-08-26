@@ -84,12 +84,21 @@ function collectWavs(args) {
     if (rp) m._free(rp);
     m._qwen_wasm_release(sp);
 
+    /* The sibling .txt, where one exists, is the reference the native suite
+     * scores against. Exact agreement with the wasm decoder is not the bar:
+     * the two paths differ numerically and greedy decoding flips on near-tied
+     * logits, so what matters is that the GPU stays as close to the reference
+     * as the CPU does. */
+    const refFile = wav.replace(/\.wav$/, '.txt');
+    const ref = fs.existsSync(refFile) ? fs.readFileSync(refFile, 'utf8').trim() : null;
+
     index.samples.push({
       name,
       wav: path.relative(path.join(__dirname, 'demo'), wav).split(path.sep).join('/'),
       seq,
       audioSec: samples.length / 16000,
       text,
+      ref,
     });
     console.log(`  ${name}: seq=${seq}, ${(samples.length / 16000).toFixed(1)}s, ` +
                 `${(seq * dim * 4 / 1e6).toFixed(1)} MB embeddings`);

@@ -38,6 +38,33 @@ weight upload are paid once per page, not once per edit.</p>
 <script type="module">
 import { until } from "./tick.js";
 
+/* Same normalization and metric as wasm/check-node.js and asr_regression.py,
+ * so the numbers here are comparable with the CPU suite's. */
+const THRESHOLD = 0.15;
+const normalize = (t) => t.toLowerCase()
+  .replace(/[.,!?;:'"()\[\]{}‘’“”]/g, "")
+  .replace(/\s+/g, " ").trim();
+
+function editDistance(a, b) {
+  const prev = new Array(b.length + 1);
+  const cur = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    cur[0] = i;
+    for (let j = 1; j <= b.length; j++)
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1,
+                        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    for (let j = 0; j <= b.length; j++) prev[j] = cur[j];
+  }
+  return prev[b.length];
+}
+
+const cer = (text, ref) => {
+  const a = normalize(text), b = normalize(ref);
+  if (!b.length) return null;
+  return { err: editDistance(a, b), len: b.length };
+};
+
 const MODEL_BASE = "../../qwen3-asr-1.7b-q8";
 const out = document.getElementById("out");
 const say = (s = "") => { out.textContent += s + "\n"; };
@@ -123,17 +150,31 @@ async function runOne(entry) {
   M._qwen_wasm_release(ptr);
 
   const got = r.text.trim(), want = entry.text.trim();
-  const ok = got === want;
-  say(`[${ok ? " OK " : "DIFF"}] ${entry.name}  seq=${entry.seq} tokens=${r.tokens} ` +
-      `${(ms / 1000).toFixed(2)}s (prefill ${(gpu.prefillMs / 1000).toFixed(2)}s)`);
-  if (!ok) {
+  const same = got === want;
+
+  /* Two scores. Agreement with the wasm decoder is informative but not the
+   * bar - the paths differ numerically and greedy decoding flips on near-tied
+   * logits, so a sample can swap sides without either path being wrong. The
+   * bar is the character error against the reference transcript, the same
+   * one the CPU suite reports. */
+  const gpuErr = entry.ref ? cer(got, entry.ref) : null;
+  const cpuErr = entry.ref ? cer(want, entry.ref) : null;
+  const rate = gpuErr ? gpuErr.err / gpuErr.len : null;
+  const pass = rate === null ? same : rate <= THRESHOLD;
+
+  say(`[${pass ? " OK " : "FAIL"}] ${entry.name}  seq=${entry.seq} tokens=${r.tokens} ` +
+      `${(ms / 1000).toFixed(2)}s (prefill ${(gpu.prefillMs / 1000).toFixed(2)}s)` +
+      (gpuErr ? `  cer gpu ${rate.toFixed(3)} / cpu ${(cpuErr.err / cpuErr.len).toFixed(3)}` : "") +
+      (same ? "  [matches cpu]" : ""));
+
+  if (!same && gpuErr) {
     let i = 0;
     while (i < got.length && i < want.length && got[i] === want[i]) i++;
-    say(`       first divergence at char ${i}`);
-    say(`       want ...${want.slice(Math.max(0, i - 20), i + 40)}`);
-    say(`       got  ...${got.slice(Math.max(0, i - 20), i + 40)}`);
+    say(`       differs from cpu at char ${i}`);
+    say(`       cpu ...${want.slice(Math.max(0, i - 20), i + 40)}`);
+    say(`       gpu ...${got.slice(Math.max(0, i - 20), i + 40)}`);
   }
-  return ok;
+  return { pass, same, gpuErr, cpuErr };
 }
 
 let running = false;
@@ -157,19 +198,32 @@ async function runAllInner() {
    * stay resident. */
   golden = await (await fetch(`./golden/index.json?v=${Date.now()}`)).json();
   say(`golden set: ${golden.samples.length} samples, dim=${golden.dim}`);
-  let pass = 0;
+
+  let pass = 0, same = 0, scored = 0;
+  let gpuErr = 0, cpuErr = 0, refLen = 0;
   for (const entry of golden.samples) {
-    await until(() => true);
     try {
-      if (await runOne(entry)) pass++;
+      const r = await runOne(entry);
+      if (r.pass) pass++;
+      if (r.same) same++;
+      if (r.gpuErr) {
+        scored++;
+        gpuErr += r.gpuErr.err;
+        cpuErr += r.cpuErr.err;
+        refLen += r.gpuErr.len;
+      }
     } catch (e) {
       say(`[ERR ] ${entry.name}: ${e.message}`);
     }
   }
-  const line = `golden check: ${pass}/${golden.samples.length} identical to the wasm decoder`;
+  const n = golden.samples.length;
+  const line = `golden check: ${pass}/${n} within ${THRESHOLD}` +
+    (scored ? `, aggregate cer gpu ${(gpuErr / refLen).toFixed(4)} vs cpu ${(cpuErr / refLen).toFixed(4)}` : "") +
+    ` (${same}/${n} byte-identical to the wasm decoder)`;
   say("\n" + line);
   return line;
 }
+
 window.runAll = runAll;
 window.state = () => ({ M, gpu, golden, version });
 

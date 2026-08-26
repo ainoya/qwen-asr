@@ -475,7 +475,6 @@ void qwen_q8_matvec_m_neon(float *y, int ldy, const int8_t *qx, const float *sx,
 #endif
 }
 
-#endif /* __ARM_NEON */
 
 /* 4-bit weights: one 16-byte load unpacks into two int8x16 vectors, so the
  * weight traffic halves while the SDOT count stays the same. That is the whole
@@ -602,3 +601,5 @@ void qwen_q4_matvec_m_neon(float *y, int ldy, const int8_t *qx, const float *sx,
                             sx + (size_t)r * nb, W, ws, in_dim, rows);
 #endif
 }
+
+#endif /* __ARM_NEON */

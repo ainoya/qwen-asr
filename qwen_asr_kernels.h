@@ -90,6 +90,22 @@ void qwen_set_q8_batch_max(int n);
  * block, byte j holds value j in its low nibble and value j+32 in its high
  * nibble. Values are stored biased by 8, so a raw nibble of 0..15 means
  * -8..7 and the dot product needs no correction term. */
+/* Per-input-channel activation magnitude, summed over forward passes.
+ *
+ * Weight quantization error only matters in proportion to the activation it
+ * multiplies: a channel the model barely drives can be rounded hard, while a
+ * channel carrying large values needs its precision. Both AWQ-style scaling
+ * and any per-layer precision choice need this measured on real audio, so the
+ * accumulator hangs off the weight matrix and fills in during ordinary
+ * transcription runs. Sums (not means) are stored so dumps from separate runs
+ * merge by addition. */
+typedef struct {
+    double *absmean;  /* [cols] sum of |x|        */
+    double *sqmean;   /* [cols] sum of x*x        */
+    float  *absmax;   /* [cols] largest |x| seen  */
+    double  rows;     /* activation rows observed */
+} qwen_act_stats_t;
+
 typedef struct {
     int8_t *q;        /* [rows * cols] int8, or [rows * cols / 2] nibbles */
     float  *scales;   /* [rows * cols / QWEN_Q8_BLOCK]           */
@@ -97,10 +113,19 @@ typedef struct {
     int cols;         /* must be a multiple of QWEN_Q8_BLOCK     */
     int owns;         /* 0 when q/scales point into a mapped model file */
     int bits;         /* 4, or anything else for 8               */
+    qwen_act_stats_t *stats;  /* non-NULL only while calibrating     */
 } qwen_q8_mat_t;
 
 /* True when the matrix is stored as nibbles. */
 #define QWEN_IS_Q4(m) ((m)->bits == 4)
+
+/* Start/stop accumulating input activation statistics for this matrix. */
+int  qwen_act_stats_attach(qwen_q8_mat_t *m);
+void qwen_act_stats_free(qwen_q8_mat_t *m);
+
+/* Fold seq_len rows of [seq_len][m->cols] activations into the accumulator.
+ * A no-op when no accumulator is attached, which is every normal run. */
+void qwen_act_stats_observe(const qwen_q8_mat_t *m, const float *x, int seq_len);
 
 /* Point a matrix at pre-quantized data owned by someone else (a packed model
  * file). qwen_q8_free() will not release it. */

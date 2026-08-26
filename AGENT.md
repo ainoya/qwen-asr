@@ -212,6 +212,36 @@ node wasm/stream-node.js qwen3-asr-1.7b-q8 samples/jfk.wav 8
 kernel bugs — an inverted `wasm_v128_bitselect` in the activation quantizer got
 through everything else and made one sample emit nothing at all.
 
+## Quantization Calibration Workflow
+
+Deciding what a weight matrix can afford - which layers tolerate four bits, or
+how to rescale channels before quantizing - needs the activation each matrix
+actually multiplies, measured on representative audio. Guessing from the weights
+alone misranks: activation weighting moved the verdict by 15.7% on average and
+75.8% at worst.
+
+```bash
+tools/prep-calib.sh <recordings-dir> <out-dir> 30 45   # 16 kHz mono clips
+./qwen_asr -d qwen3-asr-1.7b -i all.wav -S 30 --calib-out act.qacs
+./qwen_asr -d qwen3-asr-1.7b --calib-rank act.qacs > rank.tsv
+```
+
+`--calib-out` attaches a per-input-channel accumulator to all 169 quantized
+decoder matrices and dumps it after the run; sums are stored rather than means
+so dumps from separate runs merge by addition. `--calib-rank` needs no audio: it
+reports, per matrix, the relative output error four bits would cost, the same
+figure unweighted, and the activation outlier ratio.
+
+Notes:
+- Calibration needs audio only. No transcripts, and 25 minutes is plenty.
+- Concatenating the clips into one file and running `-S 30` is the cheap way to
+  cover the set: one model load, one dump, no merge step.
+- `--calib-out` makes the run slower (the accumulator is serial by design, to
+  keep it free of per-thread partials). Never use it for timing.
+- If the recordings are private, keep them and every derived file out of the
+  repository. `tools/prep-calib.sh` takes the source directory as an argument
+  precisely so no such path is ever committed.
+
 ## Regression Workflow
 
 Primary suite:

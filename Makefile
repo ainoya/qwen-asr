@@ -9,7 +9,7 @@ LDFLAGS = -lm -lpthread
 UNAME_S := $(shell uname -s)
 
 # Source files
-SRCS = qwen_asr.c qwen_asr_kernels.c qwen_asr_kernels_generic.c qwen_asr_kernels_neon.c qwen_asr_kernels_avx.c qwen_asr_kernels_wasm.c qwen_asr_audio.c qwen_asr_encoder.c qwen_asr_decoder.c qwen_asr_tokenizer.c qwen_asr_safetensors.c qwen_asr_pack.c
+SRCS = qwen_asr.c qwen_asr_kernels.c qwen_asr_kernels_generic.c qwen_asr_kernels_neon.c qwen_asr_kernels_avx.c qwen_asr_kernels_wasm.c qwen_asr_audio.c qwen_asr_encoder.c qwen_asr_decoder.c qwen_asr_tokenizer.c qwen_asr_safetensors.c qwen_asr_pack.c qwen_asr_calib.c
 OBJS = $(SRCS:.c=.o)
 MAIN = main.c
 TARGET = qwen_asr
@@ -119,4 +119,5 @@ qwen_asr_decoder.o: qwen_asr_decoder.c qwen_asr.h qwen_asr_kernels.h qwen_asr_sa
 qwen_asr_tokenizer.o: qwen_asr_tokenizer.c qwen_asr_tokenizer.h
 qwen_asr_safetensors.o: qwen_asr_safetensors.c qwen_asr_safetensors.h
 qwen_asr_pack.o: qwen_asr_pack.c qwen_asr.h qwen_asr_kernels.h qwen_asr_safetensors.h
+qwen_asr_calib.o: qwen_asr_calib.c qwen_asr.h qwen_asr_kernels.h
 main.o: main.c qwen_asr.h qwen_asr_kernels.h

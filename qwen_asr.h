@@ -418,6 +418,20 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
 /* Decoder prefill (multiple tokens) */
 void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_len);
 
+/* ---- Quantization calibration ----
+ *
+ * qwen_calib_begin() attaches a per-input-channel activation accumulator to
+ * every quantized decoder matrix; ordinary transcription then fills it in.
+ * qwen_calib_write() dumps it. The dump stores sums rather than means so that
+ * runs over separate audio files merge by addition. Returns 0 on success. */
+int qwen_calib_begin(qwen_ctx_t *ctx);
+int qwen_calib_write(const qwen_ctx_t *ctx, const char *path);
+
+/* Rank every quantized matrix by the output error four bits would cost it,
+ * weighted by the activations recorded in `path`. Writes a TSV table to
+ * stdout. Reads the weights as currently loaded, so run it on a Q8 model. */
+int qwen_calib_rank(const qwen_ctx_t *ctx, const char *path);
+
 /* ---------------------------------------------------------------------------
  * Batched decoding
  *

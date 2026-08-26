@@ -893,6 +893,7 @@ size_t qwen_q8_bytes(const qwen_q8_mat_t *m) {
 
 void qwen_q8_free(qwen_q8_mat_t *m) {
     if (!m) return;
+    qwen_act_stats_free(m);
     if (m->owns) {
         free(m->q);
         free(m->scales);
@@ -903,6 +904,51 @@ void qwen_q8_free(qwen_q8_mat_t *m) {
     m->owns = 0;
 }
 
+/* ---- Activation statistics for quantization calibration ---- */
+
+int qwen_act_stats_attach(qwen_q8_mat_t *m) {
+    if (!m || m->stats) return 0;
+    qwen_act_stats_t *s = (qwen_act_stats_t *)calloc(1, sizeof(*s));
+    if (!s) return -1;
+    s->absmean = (double *)calloc((size_t)m->cols, sizeof(double));
+    s->sqmean  = (double *)calloc((size_t)m->cols, sizeof(double));
+    s->absmax  = (float  *)calloc((size_t)m->cols, sizeof(float));
+    if (!s->absmean || !s->sqmean || !s->absmax) {
+        free(s->absmean); free(s->sqmean); free(s->absmax); free(s);
+        return -1;
+    }
+    m->stats = s;
+    return 0;
+}
+
+void qwen_act_stats_free(qwen_q8_mat_t *m) {
+    if (!m || !m->stats) return;
+    free(m->stats->absmean);
+    free(m->stats->sqmean);
+    free(m->stats->absmax);
+    free(m->stats);
+    m->stats = NULL;
+}
+
+void qwen_act_stats_observe(const qwen_q8_mat_t *m, const float *x, int seq_len) {
+    qwen_act_stats_t *s = m->stats;
+    if (!s || !x || seq_len <= 0) return;
+    int cols = m->cols;
+    /* Serial on the calling thread. Calibration runs are not timed, and this
+     * keeps the accumulator free of per-thread partials. */
+    for (int r = 0; r < seq_len; r++) {
+        const float *row = x + (size_t)r * cols;
+        for (int c = 0; c < cols; c++) {
+            float v = row[c];
+            float a = fabsf(v);
+            s->absmean[c] += a;
+            s->sqmean[c]  += (double)v * (double)v;
+            if (a > s->absmax[c]) s->absmax[c] = a;
+        }
+    }
+    s->rows += seq_len;
+}
+
 void qwen_q8_attach(qwen_q8_mat_t *m, int8_t *q, float *scales, int rows, int cols) {
     m->q = q;
     m->scales = scales;
@@ -910,6 +956,7 @@ void qwen_q8_attach(qwen_q8_mat_t *m, int8_t *q, float *scales, int rows, int co
     m->cols = cols;
     m->owns = 0;
     m->bits = 8;
+    m->stats = NULL;
 }
 
 void qwen_wmat_free(qwen_wmat_t *w) {
@@ -989,6 +1036,7 @@ static int q8_alloc(qwen_q8_mat_t *m, int rows, int cols) {
     m->cols = cols;
     m->owns = 1;
     m->bits = 8;
+    m->stats = NULL;
     return 0;
 }
 
@@ -1027,6 +1075,7 @@ static int q4_alloc(qwen_q8_mat_t *m, int rows, int cols) {
     m->cols = cols;
     m->owns = 1;
     m->bits = 4;
+    m->stats = NULL;
     if (!m->q || !m->scales) { qwen_q8_free(m); return -1; }
     return 0;
 }
@@ -1441,6 +1490,8 @@ void qwen_linear_w(float *y, const float *x, const qwen_wmat_t *W,
 
 void qwen_linear_nobias_q8(float *y, const float *x, const qwen_q8_mat_t *W,
                            int seq_len) {
+    if (W->stats) qwen_act_stats_observe(W, x, seq_len);
+
     /* Short sequences (streaming chunks, the token right after a prefill) are
      * badly served by the panel path: it moves ~9 bytes per weight where a
      * batched matvec moves 1.06. Crossover measured near 500 rows on M1 Pro
@@ -1526,6 +1577,10 @@ static void q8_qkv_worker(int tid, int n_threads, void *arg) {
 void qwen_linear_nobias_q8_qkv(float *q, float *k, float *v, const float *x,
                                const qwen_q8_mat_t *Wq, const qwen_q8_mat_t *Wk,
                                const qwen_q8_mat_t *Wv) {
+    if (Wq->stats) qwen_act_stats_observe(Wq, x, 1);
+    if (Wk->stats) qwen_act_stats_observe(Wk, x, 1);
+    if (Wv->stats) qwen_act_stats_observe(Wv, x, 1);
+
     if (q8_act_prepare(x, Wq->cols) != 0) return;
 
     q8_qkv_task_t task;
@@ -1577,6 +1632,7 @@ static void q8_argmax_worker(int tid, int n_threads, void *arg) {
 }
 
 int qwen_argmax_matvec_q8(const float *x, const qwen_q8_mat_t *W) {
+    if (W->stats) qwen_act_stats_observe(W, x, 1);
     if (q8_act_prepare(x, W->cols) != 0) return 0;
 
     q8_argmax_task_t task;

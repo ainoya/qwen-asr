@@ -109,6 +109,10 @@ static void usage(const char *prog) {
     fprintf(stderr, "                 with -i + --stream, uses non-interactive final refinement\n");
     fprintf(stderr, "  --pack-q8 <out>  Write a pre-quantized single-file model image and exit\n");
     fprintf(stderr, "                   (used by the wasm/browser build; see README)\n");
+    fprintf(stderr, "  --calib-out <f>  Record per-channel activation magnitudes to <f>\n");
+    fprintf(stderr, "                   while transcribing (for quantization calibration)\n");
+    fprintf(stderr, "  --calib-rank <f> Rank matrices by the error 4-bit weights would\n");
+    fprintf(stderr, "                   cost, using the statistics in <f>, and exit\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
 
@@ -131,6 +135,8 @@ int main(int argc, char **argv) {
     int skip_silence = 0;
     int emit_tokens = 1;
     const char *pack_out = NULL;
+    const char *calib_out = NULL;
+    const char *calib_rank = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -184,6 +190,10 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--pack-q8") == 0 && i + 1 < argc) {
             pack_out = argv[++i];
+        } else if (strcmp(argv[i], "--calib-out") == 0 && i + 1 < argc) {
+            calib_out = argv[++i];
+        } else if (strcmp(argv[i], "--calib-rank") == 0 && i + 1 < argc) {
+            calib_rank = argv[++i];
         } else if (strcmp(argv[i], "--stdin") == 0) {
             use_stdin = 1;
         } else if (strcmp(argv[i], "--monitor") == 0) {
@@ -211,7 +221,8 @@ int main(int argc, char **argv) {
         return qwen_pack_q8(model_dir, pack_out) == 0 ? 0 : 1;
     }
 
-    if (!model_dir || (!input_wav && !use_stdin)) {
+    /* Ranking reads the weights and a statistics dump; it needs no audio. */
+    if (!model_dir || (!input_wav && !use_stdin && !calib_rank)) {
         usage(argv[0]);
         return 1;
     }
@@ -239,6 +250,19 @@ int main(int argc, char **argv) {
     qwen_ctx_t *ctx = qwen_load(model_dir);
     if (!ctx) {
         fprintf(stderr, "Failed to load model from %s\n", model_dir);
+        return 1;
+    }
+
+    if (calib_rank) {
+        int rank_rc = qwen_calib_rank(ctx, calib_rank);
+        qwen_free(ctx);
+        return rank_rc == 0 ? 0 : 1;
+    }
+
+    /* Measuring activations makes the run slower and is only meaningful over
+     * the whole transcription, so attach before any audio is fed. */
+    if (calib_out && qwen_calib_begin(ctx) != 0) {
+        qwen_free(ctx);
         return 1;
     }
 
@@ -334,6 +358,9 @@ int main(int argc, char **argv) {
         }
     }
 
+    int rc = 0;
+    if (calib_out && qwen_calib_write(ctx, calib_out) != 0) rc = 1;
+
     qwen_free(ctx);
-    return 0;
+    return rc;
 }

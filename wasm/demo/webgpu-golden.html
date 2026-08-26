@@ -86,7 +86,8 @@ function cstr(s) {
 async function reload() {
   const { WebGPUDecoder } = await import(`./webgpu-decoder.js?v=${++version}`);
   gpu = new WebGPUDecoder(M);
-  window.__gpu = gpu;   /* console access for the profiler */
+  window.__gpu = gpu;
+  window.__M = M;   /* console access for the profiler */
   await gpu.init(() => {});
   say(`reloaded webgpu-decoder.js (v${version})`);
   return gpu;

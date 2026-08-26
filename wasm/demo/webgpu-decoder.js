@@ -766,7 +766,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
 
   let half = hd / 2u;
-  let tbase = u32(P.fb) + sq * hd;
+  /* P.pos is the first absolute position of this batch of rows - zero for a
+   * from-scratch prefill, the retained-prefix length for a suffix prefill. */
+  let tbase = u32(P.fb) + (P.pos + sq) * hd;
   for (var d = 0u; d < half; d = d + 1u) {
     let c = norms[tbase + d * 2u];
     let sn = norms[tbase + d * 2u + 1u];
@@ -790,8 +792,212 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let d = gid.x;
   if (d >= P.cols) { return; }
   for (var p = 0u; p < P.b; p = p + 1u) {
-    kv[P.scaleBase + p * P.cols + d] = act[(P.c + d) * P.a + p];
-    kv[P.wordBase + p * P.cols + d] = act[(P.d + d) * P.a + p];
+    kv[P.scaleBase + (P.pos + p) * P.cols + d] = act[(P.c + d) * P.a + p];
+    kv[P.wordBase + (P.pos + p) * P.cols + d] = act[(P.d + d) * P.a + p];
+  }
+}
+`;
+
+/* ==================================================================
+ * Suffix-prefill attention: K and V come from the cache, not the arena.
+ *
+ * A streaming chunk re-prefills only the rows past the unchanged prefix, and
+ * those rows must attend to everything - the retained positions live in the
+ * KV cache and the new ones were just stored there by the kvstore pass, so
+ * reading the cache serves both uniformly. The from-scratch path keeps its
+ * arena-sourced kernels untouched (and byte-identical).
+ *
+ * Score rows are [head][localRow] with column stride P.n = padded total
+ * length; causality is j <= P.pos + s.
+ * ================================================================== */
+
+/* q staged per workgroup, one subgroup per key - the generation score pass
+ * shape, with a third grid axis for the suffix row. */
+const PRE_SCORES_KV_SG_WGSL = "enable subgroups;\n" + HEADER + `
+var<workgroup> qv : array<f32, 128>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>,
+        @builtin(subgroup_invocation_id) sglane : u32,
+        @builtin(subgroup_size) sgsz : u32) {
+  let h = wid.y;
+  let sq = wid.z;
+  if (lid.x < P.d) { qv[lid.x] = act[(P.c + h * P.d + lid.x) * P.a + sq]; }
+  workgroupBarrier();
+
+  let iAbs = P.pos + sq;
+  let keysPer = 256u / sgsz;
+  let j = wid.x * keysPer + lid.x / sgsz;
+  let live = j <= iAbs;
+  var acc : f32 = 0.0;
+  if (live) {
+    let kb = P.wordBase + j * P.cols + (h / P.rows) * P.d;
+    var d0 : u32 = sglane * 4u;
+    loop {
+      if (d0 >= P.d) { break; }
+      acc = acc + qv[d0]      * kv[kb + d0]
+                + qv[d0 + 1u] * kv[kb + d0 + 1u]
+                + qv[d0 + 2u] * kv[kb + d0 + 2u]
+                + qv[d0 + 3u] * kv[kb + d0 + 3u];
+      d0 = d0 + sgsz * 4u;
+    }
+  }
+  let total = subgroupAdd(acc);
+  if (sglane == 0u && live) {
+    scratch[P.scaleBase + (h * P.b + sq) * P.n + j] = total * P.fa;
+  }
+}
+`;
+
+/* Portable fallback: one thread per (key, suffix row, head). */
+const PRE_SCORES_KV_WGSL = HEADER + `
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let j = gid.x;
+  let sq = gid.y;
+  let h = gid.z;
+  let iAbs = P.pos + sq;
+  if (sq >= P.b || j > iAbs) { return; }
+  let kb = P.wordBase + j * P.cols + (h / P.rows) * P.d;
+  var acc : f32 = 0.0;
+  for (var d = 0u; d < P.d; d = d + 1u) {
+    acc = acc + act[(P.c + h * P.d + d) * P.a + sq] * kv[kb + d];
+  }
+  scratch[P.scaleBase + (h * P.b + sq) * P.n + j] = acc * P.fa;
+}
+`;
+
+/* Softmax over each suffix row's causal prefix, P.pos + row + 1 long. */
+const PRE_SOFTMAX_KV_WGSL = HEADER + `
+const WG : u32 = 128u;
+var<workgroup> rm : array<f32, WG>;
+var<workgroup> rs : array<f32, WG>;
+
+@compute @workgroup_size(WG)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  let sq = wid.x;
+  let h = wid.y;
+  if (sq >= P.b) { return; }
+  let base = P.scaleBase + (h * P.b + sq) * P.n;
+  let len = P.pos + sq + 1u;
+
+  var m : f32 = -3.0e38;
+  var t : u32 = lid.x;
+  loop {
+    if (t >= len) { break; }
+    m = max(m, scratch[base + t]);
+    t = t + WG;
+  }
+  rm[lid.x] = m;
+  workgroupBarrier();
+  var st : u32 = WG / 2u;
+  loop {
+    if (st == 0u) { break; }
+    if (lid.x < st) { rm[lid.x] = max(rm[lid.x], rm[lid.x + st]); }
+    workgroupBarrier();
+    st = st / 2u;
+  }
+  let mx = rm[0];
+
+  var sum : f32 = 0.0;
+  t = lid.x;
+  loop {
+    if (t >= len) { break; }
+    let e = exp(scratch[base + t] - mx);
+    scratch[base + t] = e;
+    sum = sum + e;
+    t = t + WG;
+  }
+  rs[lid.x] = sum;
+  workgroupBarrier();
+  st = WG / 2u;
+  loop {
+    if (st == 0u) { break; }
+    if (lid.x < st) { rs[lid.x] = rs[lid.x] + rs[lid.x + st]; }
+    workgroupBarrier();
+    st = st / 2u;
+  }
+  let inv = 1.0 / max(rs[0], 1.0e-30);
+  t = lid.x;
+  loop {
+    if (t >= len) { break; }
+    scratch[base + t] = scratch[base + t] * inv;
+    t = t + WG;
+  }
+}
+`;
+
+/* The causal V GEMM with V tiles gathered from the cache's [pos][kvDim]
+ * layout - coalesced along the dim axis there, against the key axis in the
+ * arena-sourced twin. Causality is j <= P.pos + s. */
+const PRE_APPLY_KV_WGSL = HEADER + `
+const TD : u32 = 32u;
+const TQ : u32 = 32u;
+const TJ : u32 = 16u;
+var<workgroup> vt : array<f32, 512>;    // TJ x TD
+var<workgroup> ptile : array<f32, 512>; // TJ x TQ
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  let q0 = wid.x * TQ;
+  let d0 = wid.y * TD;
+  let h = wid.z;
+  let tid = lid.y * 16u + lid.x;
+  let vb = P.wordBase + (h / P.rows) * P.d + d0;
+  let sbase = P.scaleBase + h * P.b * P.n;
+
+  let td = lid.y * 2u;
+  let tq = lid.x * 2u;
+  var a00 : f32 = 0.0; var a01 : f32 = 0.0;
+  var a10 : f32 = 0.0; var a11 : f32 = 0.0;
+
+  let kvTotal = P.pos + P.b;
+  let jmax = min(P.pos + q0 + TQ, kvTotal);
+  var j0 : u32 = 0u;
+  loop {
+    if (j0 >= jmax) { break; }
+
+    /* V tile: TJ x TD, consecutive threads on consecutive dims. */
+    for (var t = 0u; t < 2u; t = t + 1u) {
+      let idx = tid + t * 256u;
+      let jj = idx / TD;
+      let dd = idx % TD;
+      vt[idx] = select(0.0, kv[vb + (j0 + jj) * P.cols + dd], j0 + jj < kvTotal);
+    }
+    for (var t = 0u; t < 2u; t = t + 1u) {
+      let idx = tid + t * 256u;
+      let jj = idx / TQ;
+      let qq = idx % TQ;
+      let sq = q0 + qq;
+      let j = j0 + jj;
+      ptile[idx] = select(0.0, scratch[sbase + sq * P.n + j],
+                          sq < P.b && j <= P.pos + sq);
+    }
+    workgroupBarrier();
+
+    for (var jj = 0u; jj < TJ; jj = jj + 1u) {
+      let v0 = vt[jj * TD + td];
+      let v1 = vt[jj * TD + td + 1u];
+      let p0v = ptile[jj * TQ + tq];
+      let p1v = ptile[jj * TQ + tq + 1u];
+      a00 = a00 + v0 * p0v; a01 = a01 + v0 * p1v;
+      a10 = a10 + v1 * p0v; a11 = a11 + v1 * p1v;
+    }
+    workgroupBarrier();
+    j0 = j0 + TJ;
+  }
+
+  let orow = (P.yOff + h * P.d + d0 + td) * P.a + q0 + tq;
+  if (q0 + tq < P.b) {
+    act[orow] = a00;
+    act[orow + P.a] = a10;
+  }
+  if (q0 + tq + 1u < P.b) {
+    act[orow + 1u] = a01;
+    act[orow + P.a + 1u] = a11;
   }
 }
 `;
@@ -1354,7 +1560,11 @@ export class WebGPUDecoder {
       preQkRope: mk(PRE_QKROPE_WGSL, "preQkRope"),
       preKvStore: mk(PRE_KVSTORE_WGSL, "preKvStore"),
       preScores: mk(PRE_SCORES_WGSL, "preScores"),
+      preScoresKv: this.hasSubgroups ? mk(PRE_SCORES_KV_SG_WGSL, "preScoresKv_sg")
+                                     : mk(PRE_SCORES_KV_WGSL, "preScoresKv"),
       preSoftmax: mk(PRE_SOFTMAX_WGSL, "preSoftmax"),
+      preSoftmaxKv: mk(PRE_SOFTMAX_KV_WGSL, "preSoftmaxKv"),
+      preApplyKv: mk(PRE_APPLY_KV_WGSL, "preApplyKv"),
       preApply: mk(PRE_APPLY_WGSL, "preApply"),
       preSwiglu: mk(PRE_SWIGLU_WGSL, "preSwiglu"),
       preExtract: mk(PRE_EXTRACT_WGSL, "preExtract"),
@@ -1463,7 +1673,16 @@ export class WebGPUDecoder {
   /* KV cache + scratch for a context, seeded with the prompt state from wasm. */
   prepareContext(kvLen, maxNew, opts = {}) {
     const { cfg, device, M } = this;
-    const maxSeq = kvLen + maxNew + 8;
+    const suffix = opts.prefillBase != null;
+    /* A suffix prefill extends a live cache, so the layer stride - and with it
+     * every layer's base offset - must not move underneath it. Keep the
+     * current layout while it is big enough, and grow in coarse steps so a
+     * stream is not re-laying the cache out every chunk. */
+    let maxSeq = kvLen + maxNew + 8;
+    if (suffix) {
+      maxSeq = Math.ceil(maxSeq / 768) * 768;
+      if (this.bufKV && this.maxSeq >= maxSeq) maxSeq = this.maxSeq;
+    }
     const seqPad = opts.prefillSeq ? Math.ceil(opts.prefillSeq / 64) * 64 : 0;
     this.seqPad = seqPad;
     this.preSeq = opts.prefillSeq || 0;
@@ -1493,9 +1712,24 @@ export class WebGPUDecoder {
     const perLayer = maxSeq * cfg.kvDim;
     const kvFloats = 2 * cfg.layers * perLayer;
 
-    if (!this.bufKV || this.kvCap < kvFloats) {
-      if (this.bufKV) this.bufKV.destroy();
-      this.bufKV = device.createBuffer({ size: kvFloats * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    if (!this.bufKV || this.kvCap < kvFloats || (suffix && perLayer !== this.perLayer)) {
+      const old = this.bufKV;
+      this.bufKV = device.createBuffer({ size: kvFloats * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+      /* Growing under a suffix prefill re-lays the cache out: every layer's
+       * region moves, so the retained positions are copied across. */
+      if (old && suffix && this.perLayer) {
+        const enc = device.createCommandEncoder();
+        const bytes = Math.min(this.perLayer, perLayer) * 4;
+        for (let l = 0; l < cfg.layers; l++) {
+          enc.copyBufferToBuffer(old, l * this.perLayer * 4,
+                                 this.bufKV, l * perLayer * 4, bytes);
+          enc.copyBufferToBuffer(old, (this.vDelta + l * this.perLayer) * 4,
+                                 this.bufKV, (cfg.layers * perLayer + l * perLayer) * 4, bytes);
+        }
+        device.queue.submit([enc.finish()]);
+      }
+      if (old) old.destroy();
       this.kvCap = kvFloats;
       this._bind = null;
     }
@@ -1507,8 +1741,12 @@ export class WebGPUDecoder {
     this.scoreBase = cfg.vocab;
     this.attnSlices = 8;
     this.partialBase = cfg.vocab + cfg.heads * maxSeq;
-    /* Prefill scores need heads x seq x seq and reuse the same arena. */
-    const preScores = seqPad ? cfg.heads * seqPad * seqPad : 0;
+    /* Prefill scores need heads x rows x columns and reuse the same arena:
+     * square for a from-scratch prefill, nNew x paddedTotal for a suffix. */
+    this.preBase = suffix ? opts.prefillBase : null;
+    this.preTotalPad = suffix
+      ? Math.ceil((opts.prefillBase + this.preSeq) / 64) * 64 : seqPad;
+    const preScores = seqPad ? cfg.heads * seqPad * this.preTotalPad : 0;
     const need = Math.max(this.partialBase + this.attnSlices * cfg.heads * cfg.headDim,
                           preScores);
     if (this.scratchCap !== need) {
@@ -1650,27 +1888,43 @@ export class WebGPUDecoder {
         L.qkv = push({ shard: wqkv.shard, wordBase: wqkv.wordBase, scaleBase: wqkv.scaleBase,
                        rows: cfg.qDim + 2 * cfg.kvDim, cols: cfg.hidden,
                        a: sp, n: seq, xOff: PT.xn, yOff: PT.qkv });
+        const p0 = this.preBase || 0;
         L.qkrope = push({
           a: sp, b: seq, c: this.PTR.qkv, d: cfg.headDim,
-          n: cfg.heads, rows: cfg.kvHeads,
+          n: cfg.heads, rows: cfg.kvHeads, pos: p0,
           wordBase: this.PTR.qkv + cfg.qDim,
           xOff: nb(N_QNORM, l), yOff: nb(N_KNORM, l),
           fa: eps, fb: this.ropeBase,
         });
         L.kvstore = push({
-          a: sp, b: seq, cols: cfg.kvDim,
+          a: sp, b: seq, cols: cfg.kvDim, pos: p0,
           c: this.PTR.qkv + cfg.qDim, d: this.PTR.qkv + cfg.qDim + cfg.kvDim,
           scaleBase: kBase, wordBase: this.vDelta + kBase,
         });
-        L.scores = push({
-          a: sp, b: seq, c: this.PTR.qkv, d: cfg.headDim, rows: cfg.headsPerKv,
-          wordBase: this.PTR.qkv + cfg.qDim, scaleBase: 0, n: sp, fa: scale,
-        });
-        L.softmax = push({ b: seq, scaleBase: 0, n: sp });
-        L.apply = push({
-          a: sp, b: seq, c: this.PTR.qkv + cfg.qDim + cfg.kvDim, d: cfg.headDim,
-          rows: cfg.headsPerKv, yOff: this.PTR.attn, scaleBase: 0, n: sp,
-        });
+        if (this.preBase != null) {
+          /* Suffix attention reads K and V from the cache. */
+          L.scores = push({
+            a: sp, b: seq, c: this.PTR.qkv, d: cfg.headDim, rows: cfg.headsPerKv,
+            cols: cfg.kvDim, pos: p0, wordBase: kBase,
+            scaleBase: 0, n: this.preTotalPad, fa: scale,
+          });
+          L.softmax = push({ b: seq, pos: p0, scaleBase: 0, n: this.preTotalPad });
+          L.apply = push({
+            a: sp, b: seq, d: cfg.headDim, rows: cfg.headsPerKv,
+            cols: cfg.kvDim, pos: p0, wordBase: this.vDelta + kBase,
+            yOff: this.PTR.attn, scaleBase: 0, n: this.preTotalPad,
+          });
+        } else {
+          L.scores = push({
+            a: sp, b: seq, c: this.PTR.qkv, d: cfg.headDim, rows: cfg.headsPerKv,
+            wordBase: this.PTR.qkv + cfg.qDim, scaleBase: 0, n: sp, fa: scale,
+          });
+          L.softmax = push({ b: seq, scaleBase: 0, n: sp });
+          L.apply = push({
+            a: sp, b: seq, c: this.PTR.qkv + cfg.qDim + cfg.kvDim, d: cfg.headDim,
+            rows: cfg.headsPerKv, yOff: this.PTR.attn, scaleBase: 0, n: sp,
+          });
+        }
         const wo = w(W_O, l);
         L.o = push({ shard: wo.shard, wordBase: wo.wordBase, scaleBase: wo.scaleBase, rows: wo.rows,
                      cols: wo.cols, a: sp, n: seq, xOff: PT.attn, yOff: PT.x, pos: 1 });
@@ -1792,10 +2046,20 @@ export class WebGPUDecoder {
       ph("pre.qkrope"); use(pipe.preQkRope, L.qkrope);
       pass.dispatchWorkgroups(sBlocks, cfg.heads + cfg.kvHeads);
       ph("pre.kvstore"); use(pipe.preKvStore, L.kvstore); pass.dispatchWorkgroups(up(cfg.kvDim, 64));
-      ph("pre.scores"); use(pipe.preScores, L.scores); pass.dispatchWorkgroups(sBlocks, seq, cfg.heads);
-      ph("pre.softmax"); use(pipe.preSoftmax, L.softmax); pass.dispatchWorkgroups(seq, cfg.heads);
-      ph("pre.apply"); use(pipe.preApply, L.apply);
-      pass.dispatchWorkgroups(up(seq, 32), up(cfg.headDim, 32), cfg.heads);
+      if (this.preBase != null) {
+        const kvTotal = this.preBase + seq;
+        ph("pre.scores"); use(pipe.preScoresKv, L.scores);
+        if (this.hasSubgroups) { pass.dispatchWorkgroups(up(kvTotal, 8), cfg.heads, seq); }
+        else { pass.dispatchWorkgroups(up(kvTotal, 64), seq, cfg.heads); }
+        ph("pre.softmax"); use(pipe.preSoftmaxKv, L.softmax); pass.dispatchWorkgroups(seq, cfg.heads);
+        ph("pre.apply"); use(pipe.preApplyKv, L.apply);
+        pass.dispatchWorkgroups(up(seq, 32), up(cfg.headDim, 32), cfg.heads);
+      } else {
+        ph("pre.scores"); use(pipe.preScores, L.scores); pass.dispatchWorkgroups(sBlocks, seq, cfg.heads);
+        ph("pre.softmax"); use(pipe.preSoftmax, L.softmax); pass.dispatchWorkgroups(seq, cfg.heads);
+        ph("pre.apply"); use(pipe.preApply, L.apply);
+        pass.dispatchWorkgroups(up(seq, 32), up(cfg.headDim, 32), cfg.heads);
+      }
       ph("pre.mm.o"); use(pipe.preMatmul, L.o); pass.dispatchWorkgroups(sBlocks, up(cfg.hidden, 128));
       ph("pre.rms"); use(pipe.preRms, L.rms2); pass.dispatchWorkgroups(sBlocks);
       ph("pre.mm.gu"); use(pipe.preMatmul, L.gu); pass.dispatchWorkgroups(sBlocks, up(2 * cfg.inter, 128));
@@ -1996,6 +2260,44 @@ export class WebGPUDecoder {
     for (let d = 0; d < cfg.hidden; d++) {
       for (let s2 = 0; s2 < seq; s2++) col[s2] = src[s2 * cfg.hidden + d];
       if (seq < sp) col.fill(0, seq);
+      device.queue.writeBuffer(this.bufAct, (this.PT.x + d * sp) * 4, col);
+    }
+
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    this.encodePrefill(pass);
+    pass.end();
+    enc.copyBufferToBuffer(this.bufTok, 0, this.bufTokRead, 0, 4);
+    device.queue.submit([enc.finish()]);
+    await this.bufTokRead.mapAsync(GPUMapMode.READ, 0, 4);
+    const first = new Uint32Array(this.bufTokRead.getMappedRange(0, 4).slice(0))[0];
+    this.bufTokRead.unmap();
+    this.prefillMs = performance.now() - t0;
+
+    return this.generate(first, seq, maxNew, onPiece, { keepContext: true });
+  }
+
+  /* Prefill only the rows past `p0` - the retained prefix's KV is already in
+   * the cache from an earlier call on this decoder - then generate. This is
+   * the streaming path: each chunk extends the audio, the caller finds the
+   * longest unchanged embedding prefix, and only the tail is re-prefilled.
+   * `embedsPtr` still points at the *full* [seq][hidden] embeddings; only
+   * columns p0.. are uploaded. */
+  async prefillSuffixAndGenerate(embedsPtr, seq, p0, maxNew, onPiece) {
+    if (this.lost) throw new Error(`GPU device lost (${this.lost})`);
+    if (p0 <= 0) return this.prefillAndGenerate(embedsPtr, seq, maxNew, onPiece);
+    const { device, cfg, M } = this;
+    const t0 = performance.now();
+    const nNew = seq - p0;
+    if (nNew < 1) throw new Error("suffix prefill needs at least one new row");
+    this.prepareContext(seq, maxNew, { prefillSeq: nNew, prefillBase: p0 });
+
+    const sp = this.seqPad;
+    const src = new Float32Array(M.HEAPF32.buffer, embedsPtr, seq * cfg.hidden);
+    const col = new Float32Array(sp);
+    for (let d = 0; d < cfg.hidden; d++) {
+      for (let s2 = 0; s2 < nNew; s2++) col[s2] = src[(p0 + s2) * cfg.hidden + d];
+      if (nNew < sp) col.fill(0, nNew);
       device.queue.writeBuffer(this.bufAct, (this.PT.x + d * sp) * 4, col);
     }
 

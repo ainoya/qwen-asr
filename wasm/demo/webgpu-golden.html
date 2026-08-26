@@ -159,6 +159,7 @@ async function towerEmbeds(entry) {
   return { ptr: P(M._qwen_wasm_embeds_ptr()), seq, encMs: encoder.runMs, owned: false };
 }
 
+window.__runOne = (name, tower) => runOne(golden.samples.find(s => s.name === name), tower);
 async function runOne(entry, tower = false) {
   const maxNew = Number(document.getElementById("maxnew").value) || 640;
   let ptr, seq, encMs = 0, owned = true;

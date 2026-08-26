@@ -878,21 +878,98 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
  *   a = seqPad, b = seq, c = vT offset, d = headDim, rows = headsPerKv
  *   yOff = attnT offset, scaleBase = score base, n = score stride
  */
+/* Weighted V sum as a causal tiled GEMM: out[d][q] = sum_j V[d][j] P[q][j].
+ *
+ * Three shapes of this kernel failed before this one, all on the same lesson:
+ *
+ *   - lanes along d: a warp's V loads sit a seqPad stride apart. 929 ms.
+ *   - the same with the j loop reordered per thread: what matters is the set
+ *     of addresses one warp instruction gathers, not per-thread order. 911 ms.
+ *   - lanes along j with one query per workgroup: coalesced at last, but with
+ *     no reuse each workgroup streams the head's whole V - the pass re-reads
+ *     V once per query, 68 GB over the layers at seq 549. 734 ms.
+ *
+ * So it is a GEMM and it wants both tiles staged: 32 dims x 32 queries per
+ * workgroup, V and P tiles in shared memory, every load coalesced along j,
+ * V read ceil(seq/32) times total instead of seq times. Causality is the tile
+ * loader zeroing P entries with j > i, and the j loop stopping at each query
+ * tile's own diagonal - the triangle is skipped, not masked away. Profiled
+ * 929 ms -> 60 ms at seq 549.
+ *   scaleBase = score base, c = V base row, rows = headsPerKv (see caller)
+ */
 const PRE_APPLY_WGSL = HEADER + `
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid : vec3<u32>,
-        @builtin(workgroup_id) wid : vec3<u32>) {
-  let d = gid.x;
-  let i = wid.y;
+const TD : u32 = 32u;
+const TQ : u32 = 32u;
+const TJ : u32 = 16u;
+var<workgroup> vt : array<f32, 512>;   // TD x TJ
+var<workgroup> ptile : array<f32, 512>; // TJ x TQ
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  let q0 = wid.x * TQ;
+  let d0 = wid.y * TD;
   let h = wid.z;
-  if (d >= P.d || i >= P.b) { return; }
-  let base = P.scaleBase + (h * P.n + i) * P.n;
-  let vb = P.c + (h / P.rows) * P.d + d;
-  var acc : f32 = 0.0;
-  for (var j = 0u; j <= i; j = j + 1u) {
-    acc = acc + scratch[base + j] * act[vb * P.a + j];
+  let tid = lid.y * 16u + lid.x;
+  let base = P.scaleBase + h * P.n * P.n;
+  let vrow = P.c + (h / P.rows) * P.d + d0;
+
+  /* Each thread owns a 2x2 block of the 32x32 output tile. */
+  let td = lid.y * 2u;
+  let tq = lid.x * 2u;
+  var a00 : f32 = 0.0; var a01 : f32 = 0.0;
+  var a10 : f32 = 0.0; var a11 : f32 = 0.0;
+
+  /* Causality bounds the j range by the last query in this tile. */
+  let jmax = min(q0 + TQ, P.b);
+  var j0 : u32 = 0u;
+  loop {
+    if (j0 >= jmax) { break; }
+
+    /* V tile: TD x TJ, two values per thread, coalesced along j. */
+    for (var t = 0u; t < 2u; t = t + 1u) {
+      let idx = tid + t * 256u;
+      let rr = idx / TJ;
+      let jj = idx % TJ;
+      /* The tail tile reaches into seq padding, which is never written by the
+       * matmuls and may hold a previous, longer run's values. The P tile is
+       * zero there, but 0 * garbage must still be a well-behaved zero. */
+      vt[idx] = select(0.0, act[(vrow + rr) * P.a + j0 + jj], j0 + jj < P.b);
+    }
+    /* P tile: TJ x TQ, zero where j overruns the query's causal prefix or
+     * the sequence. Stored transposed so the inner loop reads it row-wise. */
+    for (var t = 0u; t < 2u; t = t + 1u) {
+      let idx = tid + t * 256u;
+      let jj = idx / TQ;
+      let qq = idx % TQ;
+      let i = q0 + qq;
+      let j = j0 + jj;
+      ptile[idx] = select(0.0, scratch[base + i * P.n + j],
+                          i < P.b && j <= i);
+    }
+    workgroupBarrier();
+
+    for (var jj = 0u; jj < TJ; jj = jj + 1u) {
+      let v0 = vt[(td) * TJ + jj];
+      let v1 = vt[(td + 1u) * TJ + jj];
+      let p0 = ptile[jj * TQ + tq];
+      let p1 = ptile[jj * TQ + tq + 1u];
+      a00 = a00 + v0 * p0; a01 = a01 + v0 * p1;
+      a10 = a10 + v1 * p0; a11 = a11 + v1 * p1;
+    }
+    workgroupBarrier();
+    j0 = j0 + TJ;
   }
-  act[(P.yOff + h * P.d + d) * P.a + i] = acc;
+
+  let orow = (P.yOff + h * P.d + d0 + td) * P.a + q0 + tq;
+  if (q0 + tq < P.b) {
+    act[orow] = a00;
+    act[orow + P.a] = a10;
+  }
+  if (q0 + tq + 1u < P.b) {
+    act[orow + 1u] = a01;
+    act[orow + P.a + 1u] = a11;
+  }
 }
 `;
 
@@ -1687,8 +1764,9 @@ export class WebGPUDecoder {
 
   /* One prefill pass over the whole prompt. Leaves the KV cache filled and the
    * final hidden state of the last position in the generation slot. */
-  encodePrefill(pass) {
+  encodePrefill(pass, phase) {
     const { cfg, pipe } = this;
+    const ph = (label) => { if (phase) pass = phase(label); };
     const use = (p, slot) => {
       pass.setPipeline(p);
       pass.setBindGroup(0, this.bindGroup(this.slotShard[slot] | 0), [slot * PARAM_STRIDE]);
@@ -1699,24 +1777,24 @@ export class WebGPUDecoder {
 
     for (let l = 0; l < cfg.layers; l++) {
       const L = this.off.pre.layer[l];
-      use(pipe.preRms, L.rms1); pass.dispatchWorkgroups(sBlocks);
-      use(pipe.preMatmul, L.qkv);
+      ph("pre.rms"); use(pipe.preRms, L.rms1); pass.dispatchWorkgroups(sBlocks);
+      ph("pre.mm.qkv"); use(pipe.preMatmul, L.qkv);
       pass.dispatchWorkgroups(sBlocks, up(cfg.qDim + 2 * cfg.kvDim, 128));
-      use(pipe.preQkRope, L.qkrope);
+      ph("pre.qkrope"); use(pipe.preQkRope, L.qkrope);
       pass.dispatchWorkgroups(sBlocks, cfg.heads + cfg.kvHeads);
-      use(pipe.preKvStore, L.kvstore); pass.dispatchWorkgroups(up(cfg.kvDim, 64));
-      use(pipe.preScores, L.scores); pass.dispatchWorkgroups(sBlocks, seq, cfg.heads);
-      use(pipe.preSoftmax, L.softmax); pass.dispatchWorkgroups(seq, cfg.heads);
-      use(pipe.preApply, L.apply);
-      pass.dispatchWorkgroups(up(cfg.headDim, 64), seq, cfg.heads);
-      use(pipe.preMatmul, L.o); pass.dispatchWorkgroups(sBlocks, up(cfg.hidden, 128));
-      use(pipe.preRms, L.rms2); pass.dispatchWorkgroups(sBlocks);
-      use(pipe.preMatmul, L.gu); pass.dispatchWorkgroups(sBlocks, up(2 * cfg.inter, 128));
-      use(pipe.preSwiglu, L.swiglu); pass.dispatchWorkgroups(sBlocks, cfg.inter);
-      use(pipe.preMatmul, L.down); pass.dispatchWorkgroups(sBlocks, up(cfg.hidden, 128));
+      ph("pre.kvstore"); use(pipe.preKvStore, L.kvstore); pass.dispatchWorkgroups(up(cfg.kvDim, 64));
+      ph("pre.scores"); use(pipe.preScores, L.scores); pass.dispatchWorkgroups(sBlocks, seq, cfg.heads);
+      ph("pre.softmax"); use(pipe.preSoftmax, L.softmax); pass.dispatchWorkgroups(seq, cfg.heads);
+      ph("pre.apply"); use(pipe.preApply, L.apply);
+      pass.dispatchWorkgroups(up(seq, 32), up(cfg.headDim, 32), cfg.heads);
+      ph("pre.mm.o"); use(pipe.preMatmul, L.o); pass.dispatchWorkgroups(sBlocks, up(cfg.hidden, 128));
+      ph("pre.rms"); use(pipe.preRms, L.rms2); pass.dispatchWorkgroups(sBlocks);
+      ph("pre.mm.gu"); use(pipe.preMatmul, L.gu); pass.dispatchWorkgroups(sBlocks, up(2 * cfg.inter, 128));
+      ph("pre.swiglu"); use(pipe.preSwiglu, L.swiglu); pass.dispatchWorkgroups(sBlocks, cfg.inter);
+      ph("pre.mm.down"); use(pipe.preMatmul, L.down); pass.dispatchWorkgroups(sBlocks, up(cfg.hidden, 128));
     }
 
-    use(pipe.preExtract, this.off.pre.extract);
+    ph("pre.extract"); use(pipe.preExtract, this.off.pre.extract);
     pass.dispatchWorkgroups(up(cfg.hidden, 64));
 
     /* Final norm + LM head on the extracted column gives the first token. */
@@ -1725,11 +1803,57 @@ export class WebGPUDecoder {
       use(pipe.quantAct, this.off.qfinal); pass.dispatchWorkgroups(cfg.hidden / 64);
     }
     const rowGrid = (rows) => rows <= this.maxDim ? [rows, 1] : [this.maxDim, up(rows, this.maxDim)];
+    ph("pre.logits");
     for (const slot of this.off.logits) {
       use(pipe.logits, slot);
       pass.dispatchWorkgroups(...rowGrid(this.slotRows(slot)));
     }
     use(pipe.argmax, this.off.argmax); pass.dispatchWorkgroups(1);
+  }
+
+  /* Per-kernel GPU time for the prefill pass; see profileStep. Needs a
+   * prefill-capable context (prepareContext with prefillSeq) already set up
+   * and the transposed embeddings uploaded - so call it right after a
+   * prefillAndGenerate, which leaves both in place. */
+  async profilePrefill() {
+    if (!this.hasTimestamps) throw new Error("timestamp-query not available");
+    const { device } = this;
+    const MAXQ = 2048;
+    const qs = device.createQuerySet({ type: "timestamp", count: MAXQ });
+    const qbuf = device.createBuffer({
+      size: MAXQ * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+    const rbuf = device.createBuffer({
+      size: MAXQ * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = device.createCommandEncoder();
+    const spans = [];
+    let cur = null, qi = 0;
+    const phase = (label) => {
+      if (cur) cur.end();
+      if (qi + 2 > MAXQ) throw new Error("profile: query set too small");
+      spans.push([label, qi]);
+      cur = enc.beginComputePass({ timestampWrites: {
+        querySet: qs, beginningOfPassWriteIndex: qi, endOfPassWriteIndex: qi + 1 } });
+      qi += 2;
+      return cur;
+    };
+    this.encodePrefill(phase("pre.head"), phase);
+    cur.end();
+    enc.resolveQuerySet(qs, 0, qi, qbuf, 0);
+    enc.copyBufferToBuffer(qbuf, 0, rbuf, 0, qi * 8);
+    device.queue.submit([enc.finish()]);
+    await rbuf.mapAsync(GPUMapMode.READ, 0, qi * 8);
+    const t = new BigUint64Array(rbuf.getMappedRange(0, qi * 8).slice(0));
+    rbuf.unmap();
+    qs.destroy(); qbuf.destroy(); rbuf.destroy();
+    const totals = new Map();
+    for (const [label, i] of spans)
+      totals.set(label, (totals.get(label) || 0) + Number(t[i + 1] - t[i]));
+    const rows = [...totals.entries()].map(([label, ns]) => [label, ns / 1e6])
+      .sort((a, b) => b[1] - a[1]);
+    const total = rows.reduce((a, [, ms]) => a + ms, 0);
+    return { seq: this.preSeq, totalMs: total,
+             rows: rows.map(([label, ms]) =>
+               ({ label, ms: +ms.toFixed(2), pct: +(100 * ms / total).toFixed(1) })) };
   }
 
   /* `phase(label)` - when given - is called at each kernel boundary and must

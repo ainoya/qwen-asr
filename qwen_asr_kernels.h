@@ -175,6 +175,11 @@ int qwen_q4_from_bf16_interleave2(qwen_q8_mat_t *m, const uint16_t *A,
 /* Total bytes held by a quantized matrix (for reporting). */
 size_t qwen_q8_bytes(const qwen_q8_mat_t *m);
 
+/* Quantize a row of `cols` f32 values to 4-bit blocks and dequantize it back,
+ * in place. For the calibration tooling, so that what it measures is the
+ * rounding the kernels actually perform. */
+void qwen_q4_roundtrip_row(float *w, int cols);
+
 /* Dequantize one row into f32 (used for token embedding lookup). */
 void qwen_q8_row_to_f32(float *dst, const qwen_q8_mat_t *m, int row);
 

@@ -432,6 +432,10 @@ int qwen_calib_write(const qwen_ctx_t *ctx, const char *path);
  * stdout. Reads the weights as currently loaded, so run it on a Q8 model. */
 int qwen_calib_rank(const qwen_ctx_t *ctx, const char *path);
 
+/* Search the AWQ channel-scaling exponent per group of matrices that share an
+ * input, and report what it saves. Analysis only - it changes no weights. */
+int qwen_awq_search(const qwen_ctx_t *ctx, const char *path);
+
 /* ---------------------------------------------------------------------------
  * Batched decoding
  *

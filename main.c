@@ -137,6 +137,7 @@ int main(int argc, char **argv) {
     const char *pack_out = NULL;
     const char *calib_out = NULL;
     const char *calib_rank = NULL;
+    const char *awq_search = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -194,6 +195,8 @@ int main(int argc, char **argv) {
             calib_out = argv[++i];
         } else if (strcmp(argv[i], "--calib-rank") == 0 && i + 1 < argc) {
             calib_rank = argv[++i];
+        } else if (strcmp(argv[i], "--awq-search") == 0 && i + 1 < argc) {
+            awq_search = argv[++i];
         } else if (strcmp(argv[i], "--stdin") == 0) {
             use_stdin = 1;
         } else if (strcmp(argv[i], "--monitor") == 0) {
@@ -222,7 +225,7 @@ int main(int argc, char **argv) {
     }
 
     /* Ranking reads the weights and a statistics dump; it needs no audio. */
-    if (!model_dir || (!input_wav && !use_stdin && !calib_rank)) {
+    if (!model_dir || (!input_wav && !use_stdin && !calib_rank && !awq_search)) {
         usage(argv[0]);
         return 1;
     }
@@ -253,8 +256,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (calib_rank) {
-        int rank_rc = qwen_calib_rank(ctx, calib_rank);
+    if (calib_rank || awq_search) {
+        int rank_rc = calib_rank ? qwen_calib_rank(ctx, calib_rank)
+                                 : qwen_awq_search(ctx, awq_search);
         qwen_free(ctx);
         return rank_rc == 0 ? 0 : 1;
     }

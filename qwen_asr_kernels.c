@@ -1102,6 +1102,25 @@ static void q4_pack_block(int8_t *dst, float *scale_out, const float *w) {
     }
 }
 
+/* Quantize a row to 4-bit blocks and dequantize it straight back.
+ *
+ * Exists so the calibration tooling measures the rounding the kernels really
+ * do rather than its own reimplementation of it - the whole point of that
+ * tooling is to predict what quantizing will cost. */
+void qwen_q4_roundtrip_row(float *w, int cols) {
+    int nb = cols / QWEN_Q8_BLOCK;
+    for (int b = 0; b < nb; b++) {
+        float *blk = w + b * QWEN_Q8_BLOCK;
+        int8_t packed[Q4_HALF];
+        float scale;
+        q4_pack_block(packed, &scale, blk);
+        for (int j = 0; j < Q4_HALF; j++) {
+            blk[j]            = (float)(((packed[j] & 0x0F)) - 8) * scale;
+            blk[j + Q4_HALF]  = (float)(((packed[j] >> 4) & 0x0F) - 8) * scale;
+        }
+    }
+}
+
 int qwen_q4_from_q8(qwen_q8_mat_t *dst, const qwen_q8_mat_t *src) {
     if (!src->q || QWEN_IS_Q4(src)) return -1;
     if (q4_alloc(dst, src->rows, src->cols) != 0) return -1;

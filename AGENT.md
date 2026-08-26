@@ -242,6 +242,31 @@ Notes:
   repository. `tools/prep-calib.sh` takes the source directory as an argument
   precisely so no such path is ever committed.
 
+### What Calibration Has Already Ruled Out
+
+Measured on the 1.7B model with 25 minutes of real Japanese speech. Do not
+re-litigate these.
+
+- **Per-layer mixed precision does not work here.** The ranking correctly
+  identifies the V projections as the most 4-bit-sensitive matrix kind (mean
+  relative output error 0.147 against 0.105 for O), and they are cheap to
+  exempt - 28 MB of the 820 MB four bits saves. Exempting them moved Japanese
+  CER 0.2060 -> 0.2093, i.e. nowhere, and the English suite still failed the
+  same 2 of 22 samples. Agreement with the Q8 output did improve (differential
+  CER 0.1288 -> 0.1130, byte-identical 6% -> 17%), which is the tell: the
+  weighted L2 metric tracks how far the logits moved, and at this error
+  magnitude that is not what decides the transcript. Shaving 3% off a 12%
+  relative error changes nothing.
+- **The L2 error metric is therefore a ranking tool, not a quality predictor.**
+  Use it to compare candidate quantizations, never to claim a CER.
+- **AWQ has a measured ceiling of ~18% here.** `--awq-search` puts the overall
+  weighted error at 0.122 -> 0.100 with a global alpha of 0.25, which wins in
+  107 of 113 groups (so a per-group alpha table buys nothing). Gains concentrate
+  on the down projections (mean 19%) and q/k/v (16%); O gains 5%. That closes
+  under a fifth of the distance from Q4 back to Q8, so it does not make four
+  bits quality-neutral - which matches the official Qwen3-ASR INT4 AWQ release
+  losing ~18% relative WER.
+
 ## Regression Workflow
 
 Primary suite:

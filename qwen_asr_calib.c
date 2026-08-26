@@ -143,11 +143,12 @@ typedef struct {
     char name[QWEN_CALIB_NAME];
     uint32_t cols;
     double rows;
+    double *absmean;
     double *sqmean;
 } calib_entry_t;
 
 static void calib_entries_free(calib_entry_t *v, int n) {
-    for (int i = 0; i < n; i++) free(v[i].sqmean);
+    for (int i = 0; i < n; i++) { free(v[i].absmean); free(v[i].sqmean); }
     free(v);
 }
 
@@ -184,12 +185,11 @@ static calib_entry_t *calib_read(const char *path, int *n_out) {
             break;
         e->name[QWEN_CALIB_NAME - 1] = '\0';
         e->sqmean = (double *)malloc((size_t)e->cols * sizeof(double));
-        double *absmean = (double *)malloc((size_t)e->cols * sizeof(double));
-        if (!e->sqmean || !absmean) { free(absmean); break; }
-        /* absmean and absmax are read past; only the energy is used here. */
-        int ok = fread(absmean, sizeof(double), e->cols, f) == e->cols
+        e->absmean = (double *)malloc((size_t)e->cols * sizeof(double));
+        if (!e->sqmean || !e->absmean) break;
+        /* absmax is read past: nothing here needs the single loudest sample. */
+        int ok = fread(e->absmean, sizeof(double), e->cols, f) == e->cols
               && fread(e->sqmean, sizeof(double), e->cols, f) == e->cols;
-        free(absmean);
         if (!ok || fseek(f, (long)e->cols * (long)sizeof(float), SEEK_CUR) != 0)
             break;
         n++;
@@ -290,5 +290,177 @@ int qwen_calib_rank(const qwen_ctx_t *ctx, const char *path) {
     }
     free(actw); free(r8); free(r4);
     calib_entries_free(stats, n_stats);
+    return rc;
+}
+
+/* ========================================================================
+ * AWQ-style channel rescaling: does it buy anything here?
+ *
+ * The idea (Lin et al., "AWQ: Activation-aware Weight Quantization") is that a
+ * weight column feeding a loud activation channel deserves more of the
+ * quantization grid than one feeding a quiet channel. Scaling column c of W up
+ * by s[c] and dividing x[c] by the same s leaves the product unchanged, but it
+ * changes what the block quantizer sees: the loud column now sits higher in its
+ * block, and its error, once divided back down by s[c], shrinks. The cost lands
+ * on the quiet columns sharing that block, which is the trade being bought.
+ *
+ * s[c] = (mean|x_c| / geomean) ^ alpha, so alpha=0 is plain quantization. This
+ * searches alpha and reports what it saves, per group of matrices that share an
+ * input - q/k/v see the same layernorm output, so they must share one s vector,
+ * which means one alpha for the group rather than per matrix.
+ *
+ * Deliberately measure-before-build: applying this at inference means folding
+ * 1/s into the preceding norm (for q/k/v and gate/up) and dividing explicitly
+ * (for o and down), which is only worth writing if the error actually falls.
+ * ======================================================================== */
+
+/* Matrices that share an input, and therefore must share one scale vector. */
+typedef struct {
+    const char *tag;
+    const char *members[3];
+    int n;
+} awq_group_t;
+
+static double awq_geomean(const double *a, int n) {
+    double acc = 0;
+    int used = 0;
+    for (int c = 0; c < n; c++) {
+        if (a[c] <= 0) continue;
+        acc += log(a[c]);
+        used++;
+    }
+    return used ? exp(acc / used) : 1.0;
+}
+
+/* Weighted relative error of quantizing `mats` to four bits after scaling
+ * their columns by s. Writes the error and the reference signal energy. */
+static int awq_group_error(qwen_q8_mat_t **mats, int n_mats,
+                           const double *actw, const double *s,
+                           float *w8, float *scaled,
+                           double *err_out, double *sig_out) {
+    double err = 0, sig = 0;
+    for (int i = 0; i < n_mats; i++) {
+        qwen_q8_mat_t *m = mats[i];
+        for (int r = 0; r < m->rows; r++) {
+            qwen_q8_row_to_f32(w8, m, r);
+            for (int c = 0; c < m->cols; c++) scaled[c] = w8[c] * (float)s[c];
+            qwen_q4_roundtrip_row(scaled, m->cols);
+            for (int c = 0; c < m->cols; c++) {
+                /* Undo the scaling: this is the weight the model effectively
+                 * multiplies once x has been divided by s. */
+                double back = (double)scaled[c] / s[c];
+                double d = back - (double)w8[c];
+                err += d * d * actw[c];
+                sig += (double)w8[c] * (double)w8[c] * actw[c];
+            }
+        }
+    }
+    *err_out = err;
+    *sig_out = sig;
+    return 0;
+}
+
+int qwen_awq_search(const qwen_ctx_t *ctx, const char *path) {
+    int n_stats = 0;
+    calib_entry_t *stats = calib_read(path, &n_stats);
+    if (!stats) return -1;
+
+    qwen_q8_mat_t *mats[QWEN_CALIB_MAX];
+    static char names[QWEN_CALIB_MAX][QWEN_CALIB_NAME];
+    int n = calib_matrices(ctx, mats, names, QWEN_CALIB_MAX);
+
+    static const double alphas[] = { 0.0, 0.25, 0.5, 0.75, 1.0 };
+    const int n_alpha = (int)(sizeof(alphas) / sizeof(alphas[0]));
+
+    /* q, k and v share the layernorm output; gate and up are already one
+     * matrix. o and down each stand alone. */
+    awq_group_t groups[] = {
+        { "qkv",     { "q", "k", "v" }, 3 },
+        { "o",       { "o" },           1 },
+        { "gate_up", { "gate_up" },     1 },
+        { "down",    { "down" },        1 },
+    };
+
+    printf("group\tcols\talpha\terr_a0\terr_best\tgain_pct\n");
+
+    double *actw = NULL, *s = NULL, *a = NULL;
+    float *w8 = NULL, *scaled = NULL;
+    size_t cap = 0;
+    double tot_a0 = 0, tot_best = 0, tot_sig = 0;
+    int rc = 0;
+
+    for (int layer = 0; layer <= ctx->config.dec_layers && rc == 0; layer++) {
+        int is_head = (layer == ctx->config.dec_layers);
+        int n_groups = is_head ? 1 : (int)(sizeof(groups) / sizeof(groups[0]));
+
+        for (int g = 0; g < n_groups && rc == 0; g++) {
+            qwen_q8_mat_t *gm[3];
+            int n_gm = 0;
+            char label[QWEN_CALIB_NAME];
+            const calib_entry_t *st = NULL;
+
+            if (is_head) {
+                snprintf(label, sizeof(label), "lm_head");
+                for (int i = 0; i < n; i++)
+                    if (strcmp(names[i], "lm_head") == 0) gm[n_gm++] = mats[i];
+                st = calib_find(stats, n_stats, "lm_head");
+            } else {
+                snprintf(label, sizeof(label), "L%02d.%s", layer, groups[g].tag);
+                for (int k = 0; k < groups[g].n; k++) {
+                    char want[QWEN_CALIB_NAME];
+                    snprintf(want, sizeof(want), "L%02d.%s", layer, groups[g].members[k]);
+                    for (int i = 0; i < n; i++)
+                        if (strcmp(names[i], want) == 0) gm[n_gm++] = mats[i];
+                    if (!st) st = calib_find(stats, n_stats, want);
+                }
+            }
+            if (n_gm == 0 || !st || st->rows <= 0) continue;
+
+            if ((size_t)st->cols > cap) {
+                cap = st->cols;
+                free(actw); free(s); free(a); free(w8); free(scaled);
+                actw = (double *)malloc(cap * sizeof(double));
+                s = (double *)malloc(cap * sizeof(double));
+                a = (double *)malloc(cap * sizeof(double));
+                w8 = (float *)malloc(cap * sizeof(float));
+                scaled = (float *)malloc(cap * sizeof(float));
+                if (!actw || !s || !a || !w8 || !scaled) { rc = -1; break; }
+            }
+            for (uint32_t c = 0; c < st->cols; c++) {
+                actw[c] = st->sqmean[c] / st->rows;
+                a[c] = st->absmean[c] / st->rows;
+            }
+            double gmean = awq_geomean(a, (int)st->cols);
+
+            double best_err = 0, best_alpha = 0, err_a0 = 0, sig = 0;
+            for (int ai = 0; ai < n_alpha; ai++) {
+                for (uint32_t c = 0; c < st->cols; c++) {
+                    double ratio = a[c] > 0 ? a[c] / gmean : 1.0;
+                    /* An empty channel would otherwise scale to zero and take
+                     * its whole block's resolution with it. */
+                    if (ratio < 1e-3) ratio = 1e-3;
+                    s[c] = pow(ratio, alphas[ai]);
+                }
+                double err = 0, sg = 0;
+                awq_group_error(gm, n_gm, actw, s, w8, scaled, &err, &sg);
+                if (ai == 0) { err_a0 = err; best_err = err; sig = sg; }
+                else if (err < best_err) { best_err = err; best_alpha = alphas[ai]; }
+            }
+            tot_a0 += err_a0;
+            tot_best += best_err;
+            tot_sig += sig;
+            printf("%s\t%u\t%.2f\t%.5f\t%.5f\t%.1f\n", label, st->cols, best_alpha,
+                   sig > 0 ? sqrt(err_a0 / sig) : 0.0,
+                   sig > 0 ? sqrt(best_err / sig) : 0.0,
+                   err_a0 > 0 ? 100.0 * (1.0 - sqrt(best_err / err_a0)) : 0.0);
+            fflush(stdout);
+        }
+    }
+    free(actw); free(s); free(a); free(w8); free(scaled);
+    calib_entries_free(stats, n_stats);
+    if (rc == 0 && tot_sig > 0)
+        fprintf(stderr, "awq: overall relative error %.5f -> %.5f (%.1f%% better)\n",
+                sqrt(tot_a0 / tot_sig), sqrt(tot_best / tot_sig),
+                100.0 * (1.0 - sqrt(tot_best / tot_a0)));
     return rc;
 }

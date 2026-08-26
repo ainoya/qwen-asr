@@ -185,6 +185,33 @@ at dispatch, as an invalid command buffer.
   is only 2048 threads and dominated the step at long contexts: 42 ms/token at a
   1170-token context against 26.5 after splitting into 8 slices plus a merge.
 
+### Streaming decodes on the GPU too
+
+Streaming used to decode in wasm even with a GPU decoder resident, because the
+GPU decoder could only prefill from an empty cache. It now supports **suffix
+prefill** - extending retained KV with just the rows past the unchanged
+embedding prefix, which is exactly the shape of the streaming loop's work -
+and the C loop hands each chunk to the GPU through a decoder hook
+(`qwen_set_decoder_hook`; rollback and commit logic stay in C, and any hook
+failure falls back to the wasm decoder for that chunk).
+
+Correctness: a three-stage split prefill (the streaming shape) reproduces the
+one-shot transcript byte for byte on all 23 golden samples. Speed, measured in
+a *hidden* tab - the worst case, a visible tab only improves it:
+
+| clip | wasm streaming decode | GPU streaming decode |
+|------|----------------------|----------------------|
+| jfk 11 s | 62.1 s inference (0.18x realtime) | **5.2 s (2.1x)** |
+| ja_bench 41 s | (untested, worse) | **22.7 s (1.81x)**, ~0.8 s/chunk |
+
+Two lessons from wiring it, both invisible until measured: wasm pointers
+cross EM_ASM as signed ints and the packed model pushes the heap past 2 GB,
+so every pointer needs `>>> 0` on arrival; and `stream_finish()`'s
+pthread_join on the main thread deadlocks the very GPU hooks the stream
+thread is waiting on - the final chunk sat through its whole 30 s timeout.
+Finish is split into signal-EOF / poll / collect so the main thread stays
+free.
+
 ### A lost GPU device falls back instead of lying
 
 `device.lost` was not watched at all. A driver reset, the OS switching GPUs or

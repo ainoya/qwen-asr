@@ -516,6 +516,15 @@ Things that were learned the hard way and should not be re-litigated:
   fallbacks kept: matvec row sums 1.35x, the generation score pass 6x, the
   encoder attention 1.9x. Apple's subgroup size is exactly 32; kernels that
   assume workgroup == one subgroup check `sgExact32`.
+- **Streaming decodes through a hook** (`qwen_set_decoder_hook`): one call
+  gets the full embeddings, the unchanged-prefix length and the token budget,
+  and must return the generated ids. The GPU decoder implements it with suffix
+  prefill (`prefillSuffixAndGenerate`) - KV-sourced attention kernels extend
+  the retained cache instead of restarting. Verified by three-stage split
+  prefills matching one-shot transcripts byte-for-byte on all 23 goldens.
+  wasm-side hazards, both hit: EM_ASM passes pointers as signed ints (heap >
+  2 GB needs `>>> 0`), and joining the stream thread from the main thread
+  deadlocks the hooks it is waiting on - finish is split into EOF/poll/join.
 - **Generation steps are batched 8 per submit** - the token id stays in a GPU
   buffer, each step copies its id out, one mapAsync returns all eight. This cut
   ~8 ms/token of per-step submit/readback overhead to 1-2. An EOS inside a

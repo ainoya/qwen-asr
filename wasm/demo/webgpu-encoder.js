@@ -628,12 +628,26 @@ export class WebGPUEncoder {
    * int8 quants, their f32 scales, and the plain f32 vectors. */
   async loadWeights(report) {
     const M = this.M;
-    const MAXD = 1024;
-    const dPtr = M._qwen_wasm_alloc(MAXD * 8 * 4) >>> 0;
-    const n = M._qwen_wasm_enc_desc(dPtr, MAXD);
-    if (n < 0) { M._qwen_wasm_release(dPtr); throw new Error("encoder weights unavailable"); }
-    const d = new Uint32Array(M.HEAPU8.buffer, dPtr, n * 8).slice();
-    M._qwen_wasm_release(dPtr);
+    /* Either the C descriptor table (weights in the wasm heap) or an injected
+     * weightSource whose records carry file offsets and an async reader; see
+     * webgpu-decoder.js. Records must arrive in the C emission order. */
+    let recs;
+    if (this.weightSource) {
+      recs = this.weightSource.entries;
+    } else {
+      const MAXD = 1024;
+      const dPtr = M._qwen_wasm_alloc(MAXD * 8 * 4) >>> 0;
+      const n = M._qwen_wasm_enc_desc(dPtr, MAXD);
+      if (n < 0) { M._qwen_wasm_release(dPtr); throw new Error("encoder weights unavailable"); }
+      const d = new Uint32Array(M.HEAPU8.buffer, dPtr, n * 8).slice();
+      M._qwen_wasm_release(dPtr);
+      recs = [];
+      for (let i = 0; i < n; i++) {
+        const e = d.subarray(i * 8, i * 8 + 8);
+        recs.push({ kind: e[0], layer: e[1], rows: e[2], cols: e[3],
+                    qPtr: e[4], sPtr: e[5], fPtr: e[6], count: e[7] });
+      }
+    }
 
     /* Same shard budget as the decoder, and for the same reason: one binding
      * holding all 313 MB needs a limit tier that not every device offers. No
@@ -645,11 +659,8 @@ export class WebGPUEncoder {
     const entries = [];
     /* The conv-out projection has no bias, but the GEMM always adds one, so
      * reserve a run of zeros for it rather than branching in the shader. */
-    for (let i = 0; i < n; i++) {
-      const e = d.subarray(i * 8, i * 8 + 8);
-      const rec = { kind: e[0], layer: e[1], rows: e[2], cols: e[3],
-                    qPtr: e[4], sPtr: e[5], fPtr: e[6], count: e[7] };
-      if (rec.qPtr) {
+    for (const rec of recs) {
+      if (rec.qPtr || rec.qoff != null) {
         if (rec.cols % 64 !== 0) throw new Error(`kind ${rec.kind}: cols ${rec.cols} not a multiple of 64`);
         const nq = rec.rows * rec.cols;
         let sh = shards[shards.length - 1];
@@ -663,7 +674,7 @@ export class WebGPUEncoder {
         sh.bytes += nq;
         qBytes += nq;
         sFloats += rec.rows * (rec.cols / 64);
-      } else if (rec.fPtr && rec.count) {
+      } else if ((rec.fPtr || rec.foff != null) && rec.count) {
         rec.vecBase = vFloats;
         vFloats += rec.count;
       } else {
@@ -684,14 +695,27 @@ export class WebGPUEncoder {
     this.bufVecs = this.device.createBuffer({ size: Math.max(4, vFloats * 4), usage });
     this.weightBytes = qBytes + sFloats * 4 + vFloats * 4;
 
+    const src = this.weightSource;
+    const put = async (buf, dstOff, off, len) => {
+      const chunk = await src.read(off, len);
+      const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+      this.device.queue.writeBuffer(buf, dstOff, u8, 0, len);
+    };
     for (const rec of entries) {
-      if (rec.qPtr) {
+      if (rec.qPtr || rec.qoff != null) {
         const qn = rec.rows * rec.cols;
-        this.device.queue.writeBuffer(this.bufQuants[rec.shard], rec.wordBase * 4,
-          M.HEAPU8.buffer, rec.qPtr, qn);
         const sn = rec.rows * (rec.cols / 64);
-        this.device.queue.writeBuffer(this.bufScales, rec.scaleBase * 4,
-          M.HEAPU8.buffer, rec.sPtr, sn * 4);
+        if (src) {
+          await put(this.bufQuants[rec.shard], rec.wordBase * 4, rec.qoff, qn);
+          await put(this.bufScales, rec.scaleBase * 4, rec.soff, sn * 4);
+        } else {
+          this.device.queue.writeBuffer(this.bufQuants[rec.shard], rec.wordBase * 4,
+            M.HEAPU8.buffer, rec.qPtr, qn);
+          this.device.queue.writeBuffer(this.bufScales, rec.scaleBase * 4,
+            M.HEAPU8.buffer, rec.sPtr, sn * 4);
+        }
+      } else if (src) {
+        await put(this.bufVecs, rec.vecBase * 4, rec.foff, rec.count * 4);
       } else {
         this.device.queue.writeBuffer(this.bufVecs, rec.vecBase * 4,
           M.HEAPU8.buffer, rec.fPtr, rec.count * 4);

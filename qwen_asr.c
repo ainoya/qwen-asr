@@ -168,7 +168,17 @@ static int detect_config(qwen_ctx_t *ctx) {
         test = multi_safetensors_find(ms,
             "thinker.audio_tower.layers.18.self_attn.q_proj.weight.q8", NULL);
 
-    if (test) {
+    /* A gpu-resident reduced image (see qwen_gpu_resident) carries no audio
+     * tower at all, so the probe above proves nothing there. The decoder
+     * norms survive every image, and their width names the variant. */
+    int is_17b = test != NULL;
+    if (!test) {
+        const safetensor_t *norm = multi_safetensors_find(ms,
+            "thinker.model.layers.0.input_layernorm.weight", NULL);
+        if (norm && norm->ndim >= 1 && norm->shape[0] == 2048) is_17b = 1;
+    }
+
+    if (is_17b) {
         /* 1.7B model */
         cfg->enc_d_model = 1024;
         cfg->enc_layers = 24;

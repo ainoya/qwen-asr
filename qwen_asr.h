@@ -124,6 +124,11 @@ typedef struct {
     float *proj1_bias;         /* [d_model] */
     qwen_wmat_t proj2_weight;       /* [output_dim, d_model] */
     float *proj2_bias;         /* [output_dim] */
+
+    /* Non-zero when the tower weights were deliberately not loaded (see
+     * qwen_gpu_resident): the GPU owns them, an encoder hook runs them, and
+     * the CPU forward refuses cleanly instead of running on nothing. */
+    int weights_absent;
 } qwen_encoder_t;
 
 /* ========================================================================

@@ -107,6 +107,12 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
     /* Conv2D stem (small, f32) */
     snprintf(name, sizeof(name), "%sconv2d1.weight", ENC_PREFIX);
     enc->conv1_weight = load_f32(ms, name);
+    if (!enc->conv1_weight && qwen_gpu_resident) {
+        /* Reduced image: the whole tower lives on the GPU and arrives through
+         * the encoder hook; nothing here to load, nothing here to run. */
+        enc->weights_absent = 1;
+        return 0;
+    }
     snprintf(name, sizeof(name), "%sconv2d1.bias", ENC_PREFIX);
     enc->conv1_bias = load_f32(ms, name);
     snprintf(name, sizeof(name), "%sconv2d2.weight", ENC_PREFIX);
@@ -237,6 +243,14 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
             return out;
         }
         free(out);
+    }
+
+    if (ctx->encoder.weights_absent) {
+        static int warned;
+        if (!warned++) fprintf(stderr,
+            "encoder: tower weights are GPU-resident and the hook failed; "
+            "no CPU fallback is possible\n");
+        return NULL;
     }
 
     const qwen_config_t *cfg = &ctx->config;

@@ -597,9 +597,14 @@ The pool is a hybrid spin/park barrier with work stealing
   can hold the file - embedded panes have been seen refusing writes past
   ~2.08 GB, below the 2.18 GB image - else a transient JS-side copy in 256 MB
   chunks (one ArrayBuffer caps near 2^31) that is dropped after upload, which
-  JS memory, unlike wasm memory, actually returns. Encoder weights (0.32 GB)
-  still live in wasm so the CPU tower fallback keeps working; moving them too
-  is the remaining quarter of the win.
+  JS memory, unlike wasm memory, actually returns. The encoder went the same
+  way afterwards - 0.33 GB in wasm, everything but the embedding table and
+  norms on the GPU - which surfaced the one real bug of the exercise: variant
+  detection probed only `audio_tower.layers.18`, so an image with no audio
+  tower silently detected as 0.6B and every decoder dimension halved into
+  garbage. Detection now falls back to the decoder norm width (2048 vs 1024),
+  which survives every image. The CPU tower fallback is gone in this mode;
+  tower init failure reloads with the full image like a decoder failure does.
 
 Research note: published evaluations of llama.cpp quantization on ASR models
 report Q8_0 matching FP16 word error rate on a 1.7B model, while Q4_K raises

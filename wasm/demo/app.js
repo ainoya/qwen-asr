@@ -259,7 +259,7 @@ async function fetchModelToOpfs(url, total) {
  * copies forever. Here the safetensors header is parsed in JS, a reduced
  * image (embedding table, norms, encoder; ~0.66 GB) is built for wasm, and
  * the decoder layers upload to the GPU straight from the cached file. */
-const DROP_RE = /^thinker\.model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate_up|down_proj))\.weight\.q8s?$/;
+const DROP_RE = /^thinker\.model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate_up|down_proj))\.weight\.q8s?$|^thinker\.audio_tower\./;
 
 /* Random-access source for the packed model: the OPFS cache when it can hold
  * the file, else a JS ArrayBuffer held only until the GPU upload finishes -
@@ -398,7 +398,52 @@ async function loadGpuResident(url, total, threads) {
   entries.push({ kind: 6, layer: 0, rows: emb.shape[0], cols: emb.shape[1],
                  qoff: abs(emb), soff: abs(embS) });
 
-  gpuWeightSource = { entries, read, transient: src.transient };
+  /* Encoder records, in the C emission order (see qwen_wasm_enc_desc).
+   * Kinds are positional: vec entries carry a count, mats carry rows/cols. */
+  const T = "thinker.audio_tower.";
+  const need = (n) => {
+    const t = header[n];
+    if (!t) throw new Error(`missing ${n} in the model header`);
+    return t;
+  };
+  const numel = (t) => t.shape.reduce((a, b) => a * b, 1);
+  let ek = 0;
+  const encEntries = [];
+  const vec = (name) => { const t = need(name);
+    encEntries.push({ kind: ek++, layer: 0, count: numel(t), foff: abs(t) }); };
+  const mat = (name) => { const q = need(name + ".q8"), sc = need(name + ".q8s");
+    encEntries.push({ kind: ek++, layer: 0, rows: q.shape[0], cols: q.shape[1],
+                      qoff: abs(q), soff: abs(sc) }); };
+  vec(T + "conv2d1.weight"); vec(T + "conv2d1.bias");
+  vec(T + "conv2d2.weight"); vec(T + "conv2d2.bias");
+  vec(T + "conv2d3.weight"); vec(T + "conv2d3.bias");
+  mat(T + "conv_out.weight");
+  let encLayers = 0;
+  while (header[`${T}layers.${encLayers}.self_attn.q_proj.weight.q8`]) encLayers++;
+  if (!encLayers) throw new Error("no encoder layers in the model header");
+  for (let l = 0; l < encLayers; l++) {
+    const L = `${T}layers.${l}.`;
+    ek = 7;   /* per-layer kinds restart at E_ATTN_NORM_W */
+    const lv = (name) => { const t = need(name);
+      encEntries.push({ kind: ek++, layer: l, count: numel(t), foff: abs(t) }); };
+    const lm = (name) => { const q = need(name + ".q8"), sc = need(name + ".q8s");
+      encEntries.push({ kind: ek++, layer: l, rows: q.shape[0], cols: q.shape[1],
+                        qoff: abs(q), soff: abs(sc) }); };
+    lv(L + "self_attn_layer_norm.weight"); lv(L + "self_attn_layer_norm.bias");
+    lm(L + "self_attn.q_proj.weight"); lv(L + "self_attn.q_proj.bias");
+    lm(L + "self_attn.k_proj.weight"); lv(L + "self_attn.k_proj.bias");
+    lm(L + "self_attn.v_proj.weight"); lv(L + "self_attn.v_proj.bias");
+    lm(L + "self_attn.out_proj.weight"); lv(L + "self_attn.out_proj.bias");
+    lv(L + "final_layer_norm.weight"); lv(L + "final_layer_norm.bias");
+    lm(L + "fc1.weight"); lv(L + "fc1.bias");
+    lm(L + "fc2.weight"); lv(L + "fc2.bias");
+  }
+  ek = 23;
+  vec(T + "ln_post.weight"); vec(T + "ln_post.bias");
+  mat(T + "proj1.weight"); vec(T + "proj1.bias");
+  mat(T + "proj2.weight"); vec(T + "proj2.bias");
+
+  gpuWeightSource = { entries, encEntries, read, transient: src.transient };
 
   setStatus("attaching the reduced image...");
   Module._qwen_wasm_set_gpu_resident(1);
@@ -471,12 +516,7 @@ $("load").onclick = async () => {
         gpu = new WebGPUDecoder(Module);
         if (gpuWeightSource) gpu.weightSource = gpuWeightSource;
         await gpu.init((m) => setStatus(m));
-        if (gpuWeightSource) {
-          /* The upload is done; drop the source so a transient JS copy of the
-           * model can be collected. */
-          gpu.weightSource = null;
-          gpuWeightSource = null;
-        }
+        gpu.weightSource = null;
         log(`GPU decoder ready (${(gpu.weightBytes / 1e9).toFixed(2)} GB resident on the GPU)`);
 
         /* The audio tower is optional: if it will not start, mel and the
@@ -484,7 +524,10 @@ $("load").onclick = async () => {
         try {
           setStatus("uploading the audio tower to the GPU...");
           const e = new WebGPUEncoder(Module);
+          if (gpuWeightSource) e.weightSource =
+            { entries: gpuWeightSource.encEntries, read: gpuWeightSource.read };
           await e.init(() => {});
+          e.weightSource = null;
           encoder = e;
           log(`GPU audio tower ready (${(e.weightBytes / 1e6).toFixed(0)} MB)`);
 
@@ -514,8 +557,18 @@ $("load").onclick = async () => {
             }
           };
         } catch (err) {
+          if (gpuResidentActive) {
+            /* The reduced image has no tower weights for a CPU fallback. */
+            log(`GPU tower failed on a reduced image (${err.message}); reloading with the full image`, "err");
+            sessionStorage.setItem("qwenFullImage", "1");
+            location.reload();
+            return;
+          }
           log(`GPU audio tower unavailable (${err.message}); mel and the encoder stay on the cpu`, "err");
         }
+        /* Both uploads done: drop the source so a transient JS copy of the
+         * model can be collected. */
+        gpuWeightSource = null;
 
         /* Streaming decode: one call covers the suffix prefill against the
          * KV the GPU already holds from the previous chunk, plus the whole
@@ -556,6 +609,7 @@ $("load").onclick = async () => {
     }
 
     ready = true;
+    window.__gpu = gpu; window.__enc = encoder; window.__M = Module;  /* debug */
     sendSettings();
     for (const id of ["file", "sample-ja", "sample-en", "mic", "simstream"])
       $(id).disabled = false;

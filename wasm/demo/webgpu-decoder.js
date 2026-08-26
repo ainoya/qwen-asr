@@ -23,6 +23,13 @@ const N_INPUT = 0, N_POST_ATTN = 1, N_QNORM = 2, N_KNORM = 3, N_FINAL = 4;
 const PARAM_STRIDE = 256;   // >= minUniformBufferOffsetAlignment
 const PARAM_FIELDS = 16;
 
+/* Generation steps encoded per submit. One step per submit spends more time in
+ * submit + mapAsync than the 15 ms the GPU needs for the step itself once the
+ * kernels are fast; batching K steps amortizes that round trip. The token id
+ * already stays on the GPU between steps, so chaining costs nothing - the only
+ * price is that an end-of-text inside a batch wastes the steps after it. */
+const STEP_REGIONS = 8;
+
 /* ------------------------------------------------------------------ shaders */
 
 const HEADER = `
@@ -138,6 +145,50 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
   }
 }
 `;
+
+/* Subgroup variant of the row-sum reduction.
+ *
+ * The tree reduction above costs log2(WG) shared-memory rounds with a barrier
+ * each. subgroupAdd does the intra-subgroup part in hardware, leaving one
+ * barrier to combine the per-subgroup partials - and none at all when the
+ * workgroup is a single subgroup. Google's origin-trial numbers for exactly
+ * this shape (matrix-vector reductions) were 2.3-2.9x on some devices; here it
+ * mostly trims the fixed cost per row, since the kernel is near the bandwidth
+ * floor. Apple's subgroup size is 32; the fallback array is sized for the
+ * spec minimum of 4 so the shader stays valid anywhere. */
+const MATVEC_SG_BODY = `
+const WG : u32 = $WG$u;
+var<workgroup> red : array<f32, WG / 4u>;
+
+@compute @workgroup_size(WG)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>,
+        @builtin(subgroup_invocation_id) sglane : u32,
+        @builtin(subgroup_size) sgsz : u32) {
+  let row = wid.x + wid.y * P.d;
+  if (row >= P.rows) { return; }
+  let nwords = P.cols / 4u;
+  let part = subgroupAdd($ROWFN$);
+  var total : f32;
+  if (WG == 32u && sgsz == 32u) {
+    total = part;
+  } else {
+    if (sglane == 0u) { red[lid.x / sgsz] = part; }
+    workgroupBarrier();
+    let nsg = (WG + sgsz - 1u) / sgsz;
+    var t : f32 = 0.0;
+    for (var i : u32 = 0u; i < nsg; i = i + 1u) { t = t + red[i]; }
+    total = t;
+  }
+  if (lid.x == 0u) { $STORE$ }
+}
+`;
+
+const MATVEC_SG_WGSL = "enable subgroups;\n" + HEADER + MATVEC_SG_BODY
+  .replace("$STORE$", "let o = P.yOff + row;\n" +
+    "    if (P.pos == 1u) { act[o] = act[o] + total; } else { act[o] = total; }");
+const LOGITS_SG_WGSL = "enable subgroups;\n" + HEADER + MATVEC_SG_BODY
+  .replace("$STORE$", "scratch[P.c + row] = total;");
 
 /* Same reduction, but the result goes to scratch as a logit. */
 const LOGITS_WGSL = HEADER + `
@@ -276,6 +327,53 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     acc = acc + act[qb + d] * kv[kb + d];
   }
   scratch[P.yOff + h * P.c + j] = acc * P.fa;
+}
+`;
+
+/* Subgroup rewrite of the score pass.
+ *
+ * The kernel above runs one thread per (head, key) with a 128-long scalar
+ * loop: at a 523-token context that is 8k threads on a GPU that wants
+ * hundreds of thousands, and it profiled at 21% of the whole step - ten times
+ * its share of the bytes. Here a workgroup covers one head and eight keys: the
+ * head's q vector is staged in workgroup memory once, each subgroup owns one
+ * key, and each lane contributes a vec4 of the dot, folded with subgroupAdd.
+ *   dispatch: (ceil(n/8), heads) workgroups of 256
+ */
+const ATTN_SCORES_SG_WGSL = "enable subgroups;\n" + HEADER + `
+var<workgroup> qv : array<f32, 128>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>,
+        @builtin(subgroup_invocation_id) sglane : u32,
+        @builtin(subgroup_size) sgsz : u32) {
+  let h = wid.y;
+  if (lid.x < P.d) { qv[lid.x] = act[P.a + h * P.d + lid.x]; }
+  workgroupBarrier();
+
+  /* One subgroup per key; sgsz lanes cover d in vec4 strides. The tail
+   * subgroups of the last workgroup fall past the context and contribute
+   * nothing - guarded rather than returned, because subgroupAdd must be
+   * reached from uniform control flow. */
+  let keysPer = 256u / sgsz;
+  let j = wid.x * keysPer + lid.x / sgsz;
+  let live = j < P.n;
+  var acc : f32 = 0.0;
+  if (live) {
+    let kb = P.scaleBase + j * P.cols + (h / P.b) * P.d;
+    var d0 : u32 = sglane * 4u;
+    loop {
+      if (d0 >= P.d) { break; }
+      acc = acc + qv[d0]      * kv[kb + d0]
+                + qv[d0 + 1u] * kv[kb + d0 + 1u]
+                + qv[d0 + 2u] * kv[kb + d0 + 2u]
+                + qv[d0 + 3u] * kv[kb + d0 + 3u];
+      d0 = d0 + sgsz * 4u;
+    }
+  }
+  let total = subgroupAdd(acc);
+  if (sglane == 0u && live) { scratch[P.yOff + h * P.c + j] = total * P.fa; }
 }
 `;
 
@@ -966,12 +1064,21 @@ export class WebGPUDecoder {
                       `storage bindings at ${(lim.maxStorageBufferBindingSize / 1e6).toFixed(0)} MB`);
     }
 
+    /* Optional features, taken when the adapter has them: subgroups for the
+     * matvec reductions, timestamps for the per-kernel profiler. shader-f16 is
+     * requested so experiments can use it without a second device. */
+    const wantFeatures = ["subgroups", "shader-f16", "timestamp-query"]
+      .filter((f) => adapter.features.has(f));
     const device = await adapter.requestDevice({
+      requiredFeatures: wantFeatures,
       requiredLimits: {
         maxBufferSize: wantBinding,
         maxStorageBufferBindingSize: wantBinding,
       },
     });
+    this.hasSubgroups = wantFeatures.includes("subgroups");
+    this.hasTimestamps = wantFeatures.includes("timestamp-query");
+    this.hasF16 = wantFeatures.includes("shader-f16");
     this.device = device;
     this.maxDim = device.limits.maxComputeWorkgroupsPerDimension;
     this.adapterInfo = adapter.info || {};
@@ -1094,7 +1201,8 @@ export class WebGPUDecoder {
       size: this.tokWords * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
-    this.bufTokRead = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    this.bufTokRead = device.createBuffer({ size: STEP_REGIONS * 4,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
 
     /* ---- pipelines ---- */
     const layout = this.pipelineLayout();
@@ -1115,15 +1223,28 @@ export class WebGPUDecoder {
                    "nwords, P.a, P.b, lid.x, WG)";
     const ROW_F32 = "q8rowF(P.wordBase + row * nwords, P.scaleBase + row * (P.cols / 64u), " +
                     "nwords, P.xOff, lid.x, WG)";
+    /* Two reduction families: the portable shared-memory tree, and the
+     * subgroup one where the feature exists. Both are kept so they can be
+     * compared on the same audio (setSubgroups). */
     this.matvecPipes = { q8: {}, f32: {} };
     this.logitsPipes = { q8: {}, f32: {} };
+    this.matvecPipesTree = { q8: {}, f32: {} };
+    this.logitsPipesTree = { q8: {}, f32: {} };
     for (const [mode, rowfn] of [["q8", ROW_Q8], ["f32", ROW_F32]]) {
       for (const wg of [32, 64, 128, 256]) {
         const sub = (code) => code.replace("$WG$", String(wg)).replace("$ROWFN$", rowfn);
-        this.matvecPipes[mode][wg] = mk(sub(MATVEC_WGSL), `matvec_${mode}_${wg}`);
-        this.logitsPipes[mode][wg] = mk(sub(LOGITS_WGSL), `logits_${mode}_${wg}`);
+        this.matvecPipesTree[mode][wg] = mk(sub(MATVEC_WGSL), `matvec_${mode}_${wg}`);
+        this.logitsPipesTree[mode][wg] = mk(sub(LOGITS_WGSL), `logits_${mode}_${wg}`);
+        if (this.hasSubgroups) {
+          this.matvecPipes[mode][wg] = mk(sub(MATVEC_SG_WGSL), `matvec_sg_${mode}_${wg}`);
+          this.logitsPipes[mode][wg] = mk(sub(LOGITS_SG_WGSL), `logits_sg_${mode}_${wg}`);
+        } else {
+          this.matvecPipes[mode][wg] = this.matvecPipesTree[mode][wg];
+          this.logitsPipes[mode][wg] = this.logitsPipesTree[mode][wg];
+        }
       }
     }
+    this.useSubgroups = this.hasSubgroups;
     this.matvecWidth = 64;
     /* f32 activations by default: one dispatch fewer per matvec (measured 25.6
      * against 30.5 ms/token) and closer to the bf16 reference. The int8 mode
@@ -1135,7 +1256,8 @@ export class WebGPUDecoder {
       logits: this.logitsPipes.f32[64],
       rmsnorm: mk(RMSNORM_WGSL, "rmsnorm"),
       qkrope: mk(QKROPE_WGSL, "qkrope"),
-      scores: mk(ATTN_SCORES_WGSL, "scores"),
+      scores: this.hasSubgroups ? mk(ATTN_SCORES_SG_WGSL, "scores_sg")
+                                : mk(ATTN_SCORES_WGSL, "scores"),
       softmax: mk(ATTN_SOFTMAX_WGSL, "softmax"),
       apply: mk(ATTN_APPLY_WGSL, "apply"),
       merge: mk(ATTN_MERGE_WGSL, "merge"),
@@ -1186,8 +1308,17 @@ export class WebGPUDecoder {
 
   applyMode() {
     const mode = this.quantizeActivations ? "q8" : "f32";
-    this.pipe.matvec = this.matvecPipes[mode][this.matvecWidth];
-    this.pipe.logits = this.logitsPipes[mode][this.matvecWidth];
+    const mv = this.useSubgroups ? this.matvecPipes : this.matvecPipesTree;
+    const lg = this.useSubgroups ? this.logitsPipes : this.logitsPipesTree;
+    this.pipe.matvec = mv[mode][this.matvecWidth];
+    this.pipe.logits = lg[mode][this.matvecWidth];
+  }
+
+  /* Flip between the subgroup and shared-memory-tree reductions (A/B). */
+  setSubgroups(on) {
+    this.useSubgroups = !!on && this.hasSubgroups;
+    this.applyMode();
+    return this.useSubgroups;
   }
 
   /* [pos][d] -> (cos, sin) interleaved, matching the decoder's NeoX layout. */
@@ -1478,7 +1609,10 @@ export class WebGPUDecoder {
     const bytes = slots.length * PARAM_STRIDE;
     if (!this.bufParams || this.paramBytes !== bytes) {
       if (this.bufParams) this.bufParams.destroy();
-      this.bufParams = this.device.createBuffer({ size: bytes, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      /* One region per batched step; prefill and single-step paths use region
+       * 0 and never see the others. */
+      this.bufParams = this.device.createBuffer({ size: bytes * STEP_REGIONS,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       this.paramBytes = bytes;
       this._bind = null;
     }
@@ -1505,6 +1639,12 @@ export class WebGPUDecoder {
   }
 
   setStepParams(pos) {
+    this.patchStepSlots(pos);
+    this.device.queue.writeBuffer(this.bufParams, 0, this.host);
+    this.kvLen = pos + 1;
+  }
+
+  patchStepSlots(pos) {
     const { cfg, A } = this;
     const kvLen = pos + 1;
     const scale = 1 / Math.sqrt(cfg.headDim);
@@ -1535,8 +1675,14 @@ export class WebGPUDecoder {
         a: this.partialBase, fa: this.attnSlices,
       });
     }
-    this.device.queue.writeBuffer(this.bufParams, 0, this.host);
     this.kvLen = kvLen;
+  }
+
+  /* Patch the step slots for `pos` and upload into params region `region`.
+   * Leaves this.kvLen at pos + 1; the encode loop re-sets it per step. */
+  writeStepRegion(pos, region) {
+    this.patchStepSlots(pos);
+    this.device.queue.writeBuffer(this.bufParams, region * this.paramBytes, this.host);
   }
 
   /* One prefill pass over the whole prompt. Leaves the KV cache filled and the
@@ -1586,51 +1732,120 @@ export class WebGPUDecoder {
     use(pipe.argmax, this.off.argmax); pass.dispatchWorkgroups(1);
   }
 
-  encodeStep(pass) {
+  /* `phase(label)` - when given - is called at each kernel boundary and must
+   * return the pass to encode the next kernels into. The profiler uses it to
+   * put every kernel kind in its own timestamped pass; normal generation
+   * passes no callback and everything lands in the single pass it was given. */
+  encodeStep(pass, phase, regionBase = 0) {
     const { cfg, pipe, maxDim } = this;
+    const ph = (label) => { if (phase) pass = phase(label); };
     const use = (p, slot) => {
       pass.setPipeline(p);
-      pass.setBindGroup(0, this.bindGroup(this.slotShard[slot] | 0), [slot * PARAM_STRIDE]);
+      pass.setBindGroup(0, this.bindGroup(this.slotShard[slot] | 0),
+                        [regionBase + slot * PARAM_STRIDE]);
     };
+    const dw = (...a) => pass.dispatchWorkgroups(...a);
     const up = (a, b) => Math.ceil(a / b);
     const rowGrid = (rows) => rows <= maxDim ? [rows, 1] : [maxDim, up(rows, maxDim)];
 
     /* Every embedding shard is dispatched; only the one holding the token's
      * row writes anything. */
+    ph("embed");
     for (const slot of this.off.embed) {
       use(pipe.embed, slot);
-      pass.dispatchWorkgroups(up(cfg.hidden / 4, 64));
+      dw(up(cfg.hidden / 4, 64));
     }
 
     for (let l = 0; l < cfg.layers; l++) {
       const L = this.off.layer[l];
-      use(pipe.rmsnorm, L.rms1); pass.dispatchWorkgroups(1);
-      if (this.quantizeActivations) { use(pipe.quantAct, L.qxn); pass.dispatchWorkgroups(cfg.hidden / 64); }
-      use(pipe.matvec, L.qkv);
-      pass.dispatchWorkgroups(...rowGrid(cfg.qDim + 2 * cfg.kvDim));
-      use(pipe.qkrope, L.qkrope); pass.dispatchWorkgroups(cfg.heads + cfg.kvHeads);
-      use(pipe.scores, L.scores); pass.dispatchWorkgroups(up(this.kvLen, 64), cfg.heads);
-      use(pipe.softmax, L.softmax); pass.dispatchWorkgroups(cfg.heads);
-      use(pipe.apply, L.apply);
-      pass.dispatchWorkgroups(up(cfg.headDim, 64), cfg.heads, this.attnSlices);
-      use(pipe.merge, L.merge); pass.dispatchWorkgroups(up(cfg.headDim, 64), cfg.heads);
-      if (this.quantizeActivations) { use(pipe.quantAct, L.qattn); pass.dispatchWorkgroups(cfg.qDim / 64); }
-      use(pipe.matvec, L.o); pass.dispatchWorkgroups(...rowGrid(cfg.hidden));
-      use(pipe.rmsnorm, L.rms2); pass.dispatchWorkgroups(1);
-      if (this.quantizeActivations) { use(pipe.quantAct, L.qxn2); pass.dispatchWorkgroups(cfg.hidden / 64); }
-      use(pipe.matvec, L.gu); pass.dispatchWorkgroups(...rowGrid(2 * cfg.inter));
-      use(pipe.swiglu, L.swiglu); pass.dispatchWorkgroups(up(cfg.inter, 256));
-      if (this.quantizeActivations) { use(pipe.quantAct, L.qg); pass.dispatchWorkgroups(cfg.inter / 64); }
-      use(pipe.matvec, L.down); pass.dispatchWorkgroups(...rowGrid(cfg.hidden));
+      ph("rmsnorm"); use(pipe.rmsnorm, L.rms1); dw(1);
+      if (this.quantizeActivations) { ph("quantAct"); use(pipe.quantAct, L.qxn); dw(cfg.hidden / 64); }
+      ph("matvec.qkv"); use(pipe.matvec, L.qkv);
+      dw(...rowGrid(cfg.qDim + 2 * cfg.kvDim));
+      ph("qkrope"); use(pipe.qkrope, L.qkrope); dw(cfg.heads + cfg.kvHeads);
+      ph("attn.scores"); use(pipe.scores, L.scores);
+      if (this.hasSubgroups) { dw(up(this.kvLen, 8), cfg.heads); }
+      else { dw(up(this.kvLen, 64), cfg.heads); }
+      ph("attn.softmax"); use(pipe.softmax, L.softmax); dw(cfg.heads);
+      ph("attn.apply"); use(pipe.apply, L.apply);
+      dw(up(cfg.headDim, 64), cfg.heads, this.attnSlices);
+      ph("attn.merge"); use(pipe.merge, L.merge); dw(up(cfg.headDim, 64), cfg.heads);
+      if (this.quantizeActivations) { ph("quantAct"); use(pipe.quantAct, L.qattn); dw(cfg.qDim / 64); }
+      ph("matvec.o"); use(pipe.matvec, L.o); dw(...rowGrid(cfg.hidden));
+      ph("rmsnorm"); use(pipe.rmsnorm, L.rms2); dw(1);
+      if (this.quantizeActivations) { ph("quantAct"); use(pipe.quantAct, L.qxn2); dw(cfg.hidden / 64); }
+      ph("matvec.gu"); use(pipe.matvec, L.gu); dw(...rowGrid(2 * cfg.inter));
+      ph("swiglu"); use(pipe.swiglu, L.swiglu); dw(up(cfg.inter, 256));
+      if (this.quantizeActivations) { ph("quantAct"); use(pipe.quantAct, L.qg); dw(cfg.inter / 64); }
+      ph("matvec.down"); use(pipe.matvec, L.down); dw(...rowGrid(cfg.hidden));
     }
 
-    use(pipe.rmsnorm, this.off.rmsFinal); pass.dispatchWorkgroups(1);
-    if (this.quantizeActivations) { use(pipe.quantAct, this.off.qfinal); pass.dispatchWorkgroups(cfg.hidden / 64); }
+    ph("rmsnorm"); use(pipe.rmsnorm, this.off.rmsFinal); dw(1);
+    if (this.quantizeActivations) { ph("quantAct"); use(pipe.quantAct, this.off.qfinal); dw(cfg.hidden / 64); }
+    ph("logits");
     for (const slot of this.off.logits) {
       use(pipe.logits, slot);
-      pass.dispatchWorkgroups(...rowGrid(this.slotRows(slot)));
+      dw(...rowGrid(this.slotRows(slot)));
     }
-    use(pipe.argmax, this.off.argmax); pass.dispatchWorkgroups(1);
+    ph("argmax"); use(pipe.argmax, this.off.argmax); dw(1);
+  }
+
+  /* Per-kernel GPU time for one generation step, from timestamp queries.
+   *
+   * Wall clocks are useless here: a background tab throttles the event loop,
+   * not the GPU, so only on-GPU timestamps say where a step actually goes.
+   * Every kernel kind gets its own pass, which adds pass-transition overhead -
+   * the shares are trustworthy, the inflated total is not. Call it after a
+   * generate() so a context and a token id are in place. */
+  async profileStep(reps = 10) {
+    if (this.lost) throw new Error(`GPU device lost (${this.lost})`);
+    if (!this.hasTimestamps) throw new Error("timestamp-query not available");
+    const { device } = this;
+    const MAXQ = 2048;
+    const qs = device.createQuerySet({ type: "timestamp", count: MAXQ });
+    const qbuf = device.createBuffer({
+      size: MAXQ * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+    const rbuf = device.createBuffer({
+      size: MAXQ * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+
+    const totals = new Map();
+    for (let rep = 0; rep < reps; rep++) {
+      this.setStepParams(this.kvLen);
+      const enc = device.createCommandEncoder();
+      const spans = [];
+      let cur = null, qi = 0;
+      const phase = (label) => {
+        if (cur) cur.end();
+        if (qi + 2 > MAXQ) throw new Error("profile: query set too small");
+        spans.push([label, qi]);
+        cur = enc.beginComputePass({ timestampWrites: {
+          querySet: qs, beginningOfPassWriteIndex: qi, endOfPassWriteIndex: qi + 1 } });
+        qi += 2;
+        return cur;
+      };
+      this.encodeStep(phase("embed"), phase);
+      cur.end();
+      enc.resolveQuerySet(qs, 0, qi, qbuf, 0);
+      enc.copyBufferToBuffer(qbuf, 0, rbuf, 0, qi * 8);
+      device.queue.submit([enc.finish()]);
+      await rbuf.mapAsync(GPUMapMode.READ, 0, qi * 8);
+      const t = new BigUint64Array(rbuf.getMappedRange(0, qi * 8).slice(0));
+      rbuf.unmap();
+      for (const [label, i] of spans) {
+        const ns = Number(t[i + 1] - t[i]);
+        totals.set(label, (totals.get(label) || 0) + ns);
+      }
+    }
+    qs.destroy(); qbuf.destroy(); rbuf.destroy();
+
+    const rows = [...totals.entries()]
+      .map(([label, ns]) => [label, ns / reps / 1e6])
+      .sort((a, b) => b[1] - a[1]);
+    const total = rows.reduce((a, [, ms]) => a + ms, 0);
+    return { kvLen: this.kvLen, reps,
+             totalMs: total,
+             rows: rows.map(([label, ms]) =>
+               ({ label, ms: +ms.toFixed(3), pct: +(100 * ms / total).toFixed(1) })) };
   }
 
   /* Prefill on the GPU from wasm-built embeddings, then generate.
@@ -1705,25 +1920,38 @@ export class WebGPUDecoder {
     const ids = [firstToken];
     let pos = kvLen;
     let n = 1;
-    for (let step = 0; step < maxNew; step++) {
-      this.setStepParams(pos);
+    let stop = false;
+    for (let step = 0; step < maxNew && !stop; ) {
+      /* K chained steps per submit. Every step's argmax leaves the next token
+       * id in bufTok on the GPU, so the chain needs no readback; each step
+       * copies its id out and one mapAsync at the end returns all K. An
+       * end-of-text inside the batch just discards the steps after it. */
+      const K = Math.min(STEP_REGIONS, maxNew - step);
+      for (let k = 0; k < K; k++) this.writeStepRegion(pos + k, k);
 
       const enc = device.createCommandEncoder();
-      const pass = enc.beginComputePass();
-      this.encodeStep(pass);
-      pass.end();
-      enc.copyBufferToBuffer(this.bufTok, 0, this.bufTokRead, 0, 4);
+      for (let k = 0; k < K; k++) {
+        this.kvLen = pos + k + 1;    /* scores/apply dispatch geometry */
+        const pass = enc.beginComputePass();
+        this.encodeStep(pass, null, k * this.paramBytes);
+        pass.end();
+        enc.copyBufferToBuffer(this.bufTok, 0, this.bufTokRead, k * 4, 4);
+      }
       device.queue.submit([enc.finish()]);
 
-      await this.bufTokRead.mapAsync(GPUMapMode.READ, 0, 4);
-      const id = new Uint32Array(this.bufTokRead.getMappedRange(0, 4).slice(0))[0];
+      await this.bufTokRead.mapAsync(GPUMapMode.READ, 0, K * 4);
+      const got = new Uint32Array(this.bufTokRead.getMappedRange(0, K * 4).slice(0));
       this.bufTokRead.unmap();
 
-      ids.push(id);
-      n++;
-      pos++;
-      if (id === cfg.imEnd || id === cfg.endOfText) break;
-      emit(id);
+      for (let k = 0; k < K; k++) {
+        const id = got[k];
+        ids.push(id);
+        n++;
+        pos++;
+        step++;
+        if (id === cfg.imEnd || id === cfg.endOfText) { stop = true; break; }
+        emit(id);
+      }
     }
     return { text, tokens: n, ids };
   }

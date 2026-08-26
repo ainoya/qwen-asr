@@ -14,6 +14,10 @@
  * transcript the wasm decoder produces from them. The harness feeds the
  * embeddings straight to the GPU decoder and diffs the text.
  *
+ * With --enc it also taps the audio tower: the conv stem's output, which is
+ * the boundary between the tower's two very different halves, so a GPU port
+ * can be checked one half at a time. That costs another f32 file per sample.
+ *
  * Output goes to wasm/demo/golden/, which the demo server already serves.
  */
 const fs = require('fs');
@@ -43,6 +47,9 @@ function collectWavs(args) {
   let threads = 8;
   const ti = argv.indexOf('--threads');
   if (ti >= 0) { threads = Number(argv[ti + 1]) || 8; argv.splice(ti, 2); }
+  const ei = argv.indexOf('--enc');
+  const wantEnc = ei >= 0;
+  if (wantEnc) argv.splice(ei, 1);
 
   const dir = argv.shift() || 'qwen3-asr-1.7b-q8';
   const wavs = collectWavs(argv.length ? argv : ['samples']);
@@ -57,8 +64,25 @@ function collectWavs(args) {
   const dim = new DataView(m.HEAPU8.buffer).getInt32(shPtr + 4, true);
   m._qwen_wasm_release(shPtr);
 
+  let encDim = 0, encOutDim = 0;
+  if (wantEnc) {
+    const ePtr = P(m._qwen_wasm_alloc(16 * 4));
+    if (m._qwen_wasm_enc_shape(ePtr) < 0) throw new Error('encoder shape unavailable');
+    const dv = new DataView(m.HEAPU8.buffer);
+    encDim = dv.getInt32(ePtr, true);
+    encOutDim = dv.getInt32(ePtr + 5 * 4, true);
+    m._qwen_wasm_release(ePtr);
+    m._qwen_wasm_enc_tap_set(1);
+    console.log(`encoder tap on, d_model=${encDim}, output_dim=${encOutDim}`);
+  }
+
   fs.mkdirSync(OUT_DIR, { recursive: true });
-  const index = { model: path.basename(dir), dim, samples: [] };
+  const index = {
+    model: path.basename(dir), dim,
+    encDim: encDim || undefined,
+    encOutDim: encOutDim || undefined,
+    samples: [],
+  };
 
   for (const wav of wavs) {
     const name = path.basename(wav, '.wav');
@@ -75,6 +99,24 @@ function collectWavs(args) {
     /* Copy out before anything else can reuse the buffer. */
     const emb = new Float32Array(m.HEAPF32.subarray(embPtr / 4, embPtr / 4 + seq * dim));
     fs.writeFileSync(path.join(OUT_DIR, `${name}.f32`), Buffer.from(emb.buffer));
+
+    let encTokens = 0, melFrames = 0;
+    if (wantEnc) {
+      encTokens = m._qwen_wasm_enc_tap_tokens();
+      melFrames = m._qwen_wasm_enc_tap_frames();
+      const convPtr = P(m._qwen_wasm_enc_tap_ptr());
+      const outPtr = P(m._qwen_wasm_enc_tap_out());
+      const melPtr = P(m._qwen_wasm_enc_tap_mel());
+      if (!encTokens || !convPtr || !outPtr || !melPtr)
+        throw new Error(`${name}: encoder tap empty`);
+      const slice = (p, n) => new Float32Array(m.HEAPF32.subarray(p / 4, p / 4 + n));
+      fs.writeFileSync(path.join(OUT_DIR, `${name}.mel.f32`),
+                       Buffer.from(slice(melPtr, 128 * melFrames).buffer));
+      fs.writeFileSync(path.join(OUT_DIR, `${name}.conv.f32`),
+                       Buffer.from(slice(convPtr, encTokens * encDim).buffer));
+      fs.writeFileSync(path.join(OUT_DIR, `${name}.encout.f32`),
+                       Buffer.from(slice(outPtr, encTokens * encOutDim).buffer));
+    }
 
     /* Reference transcript from the wasm decoder on the same audio. */
     if (m._qwen_wasm_batch_start(sp, samples.length) !== 0) throw new Error(`${name}: batch start`);
@@ -99,9 +141,12 @@ function collectWavs(args) {
       audioSec: samples.length / 16000,
       text,
       ref,
+      encTokens: wantEnc ? encTokens : undefined,
+      melFrames: wantEnc ? melFrames : undefined,
     });
     console.log(`  ${name}: seq=${seq}, ${(samples.length / 16000).toFixed(1)}s, ` +
-                `${(seq * dim * 4 / 1e6).toFixed(1)} MB embeddings`);
+                `${(seq * dim * 4 / 1e6).toFixed(1)} MB embeddings` +
+                (wantEnc ? `, tap mel 128x${melFrames} conv ${encTokens}x${encDim} out ${encTokens}x${encOutDim}` : ''));
   }
 
   fs.writeFileSync(path.join(OUT_DIR, 'index.json'), JSON.stringify(index, null, 2));

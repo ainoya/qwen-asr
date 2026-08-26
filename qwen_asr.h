@@ -420,6 +420,27 @@ int qwen_decoder_forward_batch(qwen_ctx_t *ctx, qwen_kv_t **kvs, int n,
 /* Decoder forward (single token, uses KV cache, returns greedy token) */
 int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed);
 
+/* Test hook for the WebGPU encoder harness.
+ *
+ * The audio tower is two very different halves - a Conv2D stem and a stack of
+ * transformer layers - and porting them to the GPU one at a time needs
+ * references for the boundaries between them. When qwen_enc_tap is non-zero,
+ * qwen_encoder_forward() leaves copies of:
+ *
+ *   qwen_enc_tap_mel   [128][qwen_enc_tap_frames]  its mel input
+ *   qwen_enc_tap_conv  [qwen_enc_tap_tokens][enc_d_model]
+ *                      the stem's output, after the projection and position
+ *                      embeddings and before the first transformer layer
+ *   qwen_enc_tap_out   [qwen_enc_tap_tokens][enc_output_dim]  its own return
+ *
+ * The buffers are owned by the encoder and replaced on the next call. */
+extern int qwen_enc_tap;
+extern float *qwen_enc_tap_mel;
+extern int qwen_enc_tap_frames;
+extern float *qwen_enc_tap_conv;
+extern float *qwen_enc_tap_out;
+extern int qwen_enc_tap_tokens;
+
 /* Global verbose flag */
 extern int qwen_verbose;
 

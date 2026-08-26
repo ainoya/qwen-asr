@@ -408,6 +408,149 @@ EMSCRIPTEN_KEEPALIVE float *qwen_wasm_embeds_ptr(void) { return g_emb; }
 EMSCRIPTEN_KEEPALIVE double qwen_wasm_embeds_mel_ms(void) { return g_emb_mel_ms; }
 EMSCRIPTEN_KEEPALIVE double qwen_wasm_embeds_enc_ms(void) { return g_emb_enc_ms; }
 
+
+/* ---- Audio encoder: shape, weights and the conv-stem tap ----
+ *
+ * The decoder's descriptors above split by representation because every
+ * decoder matrix is Q8 and every norm is f32. The encoder mixes them: the
+ * conv stem's kernels are plain f32, the linear layers are Q8 in a packed
+ * model and f32 in an unpacked one, and every linear has a bias. One table
+ * with room for both representations keeps the JS side from having to guess.
+ *
+ * Entry layout (ENC_DESC_STRIDE words):
+ *   [0] kind   [1] layer   [2] rows   [3] cols
+ *   [4] int8 pointer, or 0 when the matrix is f32
+ *   [5] scales pointer, or 0
+ *   [6] f32 pointer (the matrix when not Q8, or the vector for norms/biases)
+ *   [7] element count for the f32 vector kinds
+ */
+enum {
+    QWEN_E_CONV1 = 0, QWEN_E_CONV1_B,
+    QWEN_E_CONV2, QWEN_E_CONV2_B,
+    QWEN_E_CONV3, QWEN_E_CONV3_B,
+    QWEN_E_CONV_OUT,
+    QWEN_E_ATTN_NORM_W, QWEN_E_ATTN_NORM_B,
+    QWEN_E_Q, QWEN_E_Q_B,
+    QWEN_E_K, QWEN_E_K_B,
+    QWEN_E_V, QWEN_E_V_B,
+    QWEN_E_O, QWEN_E_O_B,
+    QWEN_E_FFN_NORM_W, QWEN_E_FFN_NORM_B,
+    QWEN_E_FC1, QWEN_E_FC1_B,
+    QWEN_E_FC2, QWEN_E_FC2_B,
+    QWEN_E_LN_POST_W, QWEN_E_LN_POST_B,
+    QWEN_E_PROJ1, QWEN_E_PROJ1_B,
+    QWEN_E_PROJ2, QWEN_E_PROJ2_B,
+};
+
+#define ENC_DESC_STRIDE 8
+
+EMSCRIPTEN_KEEPALIVE
+int qwen_wasm_enc_shape(int *out) {
+    if (!g_ctx) return -1;
+    const qwen_config_t *cfg = &g_ctx->config;
+    out[0] = cfg->enc_d_model;
+    out[1] = cfg->enc_layers;
+    out[2] = cfg->enc_heads;
+    out[3] = cfg->enc_head_dim;
+    out[4] = cfg->enc_ffn_dim;
+    out[5] = cfg->enc_output_dim;
+    out[6] = cfg->enc_n_window;
+    out[7] = cfg->enc_n_window_infer;
+    out[8] = cfg->enc_chunk_size;
+    out[9] = cfg->enc_conv_proj_dim;
+    out[10] = QWEN_CONV_HIDDEN;
+    return 11;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int qwen_wasm_enc_desc(unsigned int *out, int max_entries) {
+    if (!g_ctx) return -1;
+    const qwen_config_t *cfg = &g_ctx->config;
+    const qwen_encoder_t *enc = &g_ctx->encoder;
+    int n = 0;
+
+    #define ENC_SLOT()                                                         \
+        (n >= max_entries ? NULL : (out + (size_t)(n) * ENC_DESC_STRIDE))
+
+    /* A weight matrix, in whichever representation the model provided. */
+    #define ENC_MAT(kind_, layer_, w_) do {                                    \
+        const qwen_wmat_t *w = (w_);                                           \
+        unsigned int *e = ENC_SLOT();                                          \
+        if (!e) return -1;                                                     \
+        e[0] = (unsigned int)(kind_);                                          \
+        e[1] = (unsigned int)(layer_);                                         \
+        e[2] = (unsigned int)w->rows;                                          \
+        e[3] = (unsigned int)w->cols;                                          \
+        e[4] = (unsigned int)(uintptr_t)w->q8.q;                               \
+        e[5] = (unsigned int)(uintptr_t)w->q8.scales;                          \
+        e[6] = (unsigned int)(uintptr_t)w->f32;                                \
+        e[7] = 0;                                                              \
+        if (!e[4] && !e[6]) return -1;                                         \
+        n++;                                                                   \
+    } while (0)
+
+    /* A plain f32 run: conv kernel, bias or norm vector. */
+    #define ENC_VEC(kind_, layer_, count_, ptr_) do {                          \
+        unsigned int *e = ENC_SLOT();                                          \
+        if (!e || !(ptr_)) return -1;                                          \
+        e[0] = (unsigned int)(kind_);                                          \
+        e[1] = (unsigned int)(layer_);                                         \
+        e[2] = 0; e[3] = 0; e[4] = 0; e[5] = 0;                                \
+        e[6] = (unsigned int)(uintptr_t)(ptr_);                                \
+        e[7] = (unsigned int)(count_);                                         \
+        n++;                                                                   \
+    } while (0)
+
+    const int CH = QWEN_CONV_HIDDEN;
+    ENC_VEC(QWEN_E_CONV1,   0, CH * 1 * 3 * 3, enc->conv1_weight);
+    ENC_VEC(QWEN_E_CONV1_B, 0, CH,             enc->conv1_bias);
+    ENC_VEC(QWEN_E_CONV2,   0, CH * CH * 3 * 3, enc->conv2_weight);
+    ENC_VEC(QWEN_E_CONV2_B, 0, CH,              enc->conv2_bias);
+    ENC_VEC(QWEN_E_CONV3,   0, CH * CH * 3 * 3, enc->conv3_weight);
+    ENC_VEC(QWEN_E_CONV3_B, 0, CH,              enc->conv3_bias);
+    ENC_MAT(QWEN_E_CONV_OUT, 0, &enc->conv_out_weight);
+
+    for (int l = 0; l < cfg->enc_layers; l++) {
+        const qwen_enc_layer_t *lay = &enc->layers[l];
+        ENC_VEC(QWEN_E_ATTN_NORM_W, l, cfg->enc_d_model, lay->attn_norm_weight);
+        ENC_VEC(QWEN_E_ATTN_NORM_B, l, cfg->enc_d_model, lay->attn_norm_bias);
+        ENC_MAT(QWEN_E_Q, l, &lay->wq_weight);
+        ENC_VEC(QWEN_E_Q_B, l, cfg->enc_d_model, lay->wq_bias);
+        ENC_MAT(QWEN_E_K, l, &lay->wk_weight);
+        ENC_VEC(QWEN_E_K_B, l, cfg->enc_d_model, lay->wk_bias);
+        ENC_MAT(QWEN_E_V, l, &lay->wv_weight);
+        ENC_VEC(QWEN_E_V_B, l, cfg->enc_d_model, lay->wv_bias);
+        ENC_MAT(QWEN_E_O, l, &lay->wo_weight);
+        ENC_VEC(QWEN_E_O_B, l, cfg->enc_d_model, lay->wo_bias);
+        ENC_VEC(QWEN_E_FFN_NORM_W, l, cfg->enc_d_model, lay->ffn_norm_weight);
+        ENC_VEC(QWEN_E_FFN_NORM_B, l, cfg->enc_d_model, lay->ffn_norm_bias);
+        ENC_MAT(QWEN_E_FC1, l, &lay->fc1_weight);
+        ENC_VEC(QWEN_E_FC1_B, l, cfg->enc_ffn_dim, lay->fc1_bias);
+        ENC_MAT(QWEN_E_FC2, l, &lay->fc2_weight);
+        ENC_VEC(QWEN_E_FC2_B, l, cfg->enc_d_model, lay->fc2_bias);
+    }
+
+    ENC_VEC(QWEN_E_LN_POST_W, 0, cfg->enc_d_model, enc->ln_post_weight);
+    ENC_VEC(QWEN_E_LN_POST_B, 0, cfg->enc_d_model, enc->ln_post_bias);
+    ENC_MAT(QWEN_E_PROJ1, 0, &enc->proj1_weight);
+    ENC_VEC(QWEN_E_PROJ1_B, 0, cfg->enc_d_model, enc->proj1_bias);
+    ENC_MAT(QWEN_E_PROJ2, 0, &enc->proj2_weight);
+    ENC_VEC(QWEN_E_PROJ2_B, 0, cfg->enc_output_dim, enc->proj2_bias);
+
+    #undef ENC_MAT
+    #undef ENC_VEC
+    #undef ENC_SLOT
+    return n;
+}
+
+/* Conv-stem tap; see qwen_enc_tap in qwen_asr.h. */
+EMSCRIPTEN_KEEPALIVE void qwen_wasm_enc_tap_set(int on) { qwen_enc_tap = on ? 1 : 0; }
+EMSCRIPTEN_KEEPALIVE float *qwen_wasm_enc_tap_mel(void) { return qwen_enc_tap_mel; }
+EMSCRIPTEN_KEEPALIVE int qwen_wasm_enc_tap_frames(void) { return qwen_enc_tap_frames; }
+EMSCRIPTEN_KEEPALIVE float *qwen_wasm_enc_tap_ptr(void) { return qwen_enc_tap_conv; }
+EMSCRIPTEN_KEEPALIVE float *qwen_wasm_enc_tap_out(void) { return qwen_enc_tap_out; }
+EMSCRIPTEN_KEEPALIVE int qwen_wasm_enc_tap_tokens(void) { return qwen_enc_tap_tokens; }
+
 /* ---- CPU prefill, so the GPU only has to run generation ----
  *
  * Mel, encoder and decoder prefill stay on the CPU: prefill is a batched GEMM

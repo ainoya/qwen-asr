@@ -207,6 +207,20 @@ static double enc_now_ms(void) {
     return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
 }
 
+int qwen_enc_tap = 0;
+float *qwen_enc_tap_mel = NULL;
+int qwen_enc_tap_frames = 0;
+float *qwen_enc_tap_conv = NULL;
+float *qwen_enc_tap_out = NULL;
+int qwen_enc_tap_tokens = 0;
+
+/* Replace *dst with a fresh copy of n floats. */
+static void enc_tap_store(float **dst, const float *src, size_t n) {
+    free(*dst);
+    *dst = (float *)malloc(n * sizeof(float));
+    if (*dst) memcpy(*dst, src, n * sizeof(float));
+}
+
 float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
                              int *out_seq_len) {
     double enc_t0 = enc_now_ms();
@@ -367,6 +381,13 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     }
     free(pe);
 
+    if (qwen_enc_tap) {
+        enc_tap_store(&qwen_enc_tap_mel, mel, (size_t)128 * mel_frames);
+        qwen_enc_tap_frames = qwen_enc_tap_mel ? mel_frames : 0;
+        enc_tap_store(&qwen_enc_tap_conv, x, (size_t)total_tokens * d_model);
+        qwen_enc_tap_tokens = qwen_enc_tap_conv ? total_tokens : 0;
+    }
+
     qwen_enc_conv_ms = enc_now_ms() - enc_t0;
     enc_t0 = enc_now_ms();
 
@@ -442,6 +463,9 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     free(attn_out); free(proj_out);
     free(ffn_mid); free(ffn_out);
     free(window_starts);
+
+    if (qwen_enc_tap && qwen_enc_tap_tokens)
+        enc_tap_store(&qwen_enc_tap_out, enc_output, (size_t)total_tokens * output_dim);
 
     qwen_enc_layers_ms = enc_now_ms() - enc_t0;
     if (qwen_verbose >= 2)

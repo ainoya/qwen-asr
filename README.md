@@ -1,5 +1,11 @@
 # Qwen3-ASR Pure C Implementation
 
+> **This is a fork** of [antirez/qwen-asr](https://github.com/antirez/qwen-asr)
+> extending the engine with a WebAssembly port, a full WebGPU backend, a
+> browser playground ([try it](https://ainoya.github.io/qwen-asr/)) and
+> quantization tooling. See [docs/EXTENSIONS.md](docs/EXTENSIONS.md) for a
+> detailed account of what was added and measured.
+
 This is a C implementation of the inference pipeline for [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) speech-to-text models (both 0.6B and 1.7B). It has zero external dependencies beyond the C standard library and a BLAS implementation (Accelerate on macOS, OpenBLAS on Linux). Tokens stream to stdout as they are generated. The implementation runs at speed multiple of the file length even in very modest hardware, like low end Intel or AMD processor.
 
 **Important**: this implementation explicitly **avoids implementing support for MPS**. Transcription systems are very important pieces of infrastructure, and are often run on remote Linux servers. Adding the MPS target would focus the efforts too much on Apple hardware, so for now I'm skipping it. The code runs very well anyway on Apple hardware (NEON optimized). Please, **don't send pull requests** about this feature, fork the code instead, in order to add MPS support. I'll add it much later when the other optimizations are already mature.

@@ -1,3 +1,4 @@
+import { freshHeap } from "./heap.js";
 /*
  * webgpu-encoder.js - Qwen3-ASR audio tower on the GPU.
  *
@@ -561,7 +562,7 @@ export class WebGPUEncoder {
 
     const shPtr = M._qwen_wasm_alloc(16 * 4) >>> 0;
     if (M._qwen_wasm_enc_shape(shPtr) < 0) throw new Error("encoder shape unavailable");
-    const sh = new Int32Array(M.HEAPU8.buffer, shPtr, 16).slice();
+    const sh = new Int32Array(freshHeap(M).HEAPU8.buffer, shPtr, 16).slice();
     M._qwen_wasm_release(shPtr);
     this.dModel = sh[0];
     this.layers = sh[1];
@@ -639,7 +640,7 @@ export class WebGPUEncoder {
       const dPtr = M._qwen_wasm_alloc(MAXD * 8 * 4) >>> 0;
       const n = M._qwen_wasm_enc_desc(dPtr, MAXD);
       if (n < 0) { M._qwen_wasm_release(dPtr); throw new Error("encoder weights unavailable"); }
-      const d = new Uint32Array(M.HEAPU8.buffer, dPtr, n * 8).slice();
+      const d = new Uint32Array(freshHeap(M).HEAPU8.buffer, dPtr, n * 8).slice();
       M._qwen_wasm_release(dPtr);
       recs = [];
       for (let i = 0; i < n; i++) {
@@ -710,15 +711,15 @@ export class WebGPUEncoder {
           await put(this.bufScales, rec.scaleBase * 4, rec.soff, sn * 4);
         } else {
           this.device.queue.writeBuffer(this.bufQuants[rec.shard], rec.wordBase * 4,
-            M.HEAPU8.buffer, rec.qPtr, qn);
+            freshHeap(M).HEAPU8.buffer, rec.qPtr, qn);
           this.device.queue.writeBuffer(this.bufScales, rec.scaleBase * 4,
-            M.HEAPU8.buffer, rec.sPtr, sn * 4);
+            freshHeap(M).HEAPU8.buffer, rec.sPtr, sn * 4);
         }
       } else if (src) {
         await put(this.bufVecs, rec.vecBase * 4, rec.foff, rec.count * 4);
       } else {
         this.device.queue.writeBuffer(this.bufVecs, rec.vecBase * 4,
-          M.HEAPU8.buffer, rec.fPtr, rec.count * 4);
+          freshHeap(M).HEAPU8.buffer, rec.fPtr, rec.count * 4);
       }
     }
     await this.device.queue.onSubmittedWorkDone();
@@ -1056,7 +1057,7 @@ export class WebGPUEncoder {
    * up in one write - they share the conv scratch but not their input, since
    * the whole stem is queued as a single command buffer. */
   uploadMel(melPtr, melFrames, plan) {
-    const src = new Float32Array(this.M.HEAPU8.buffer, melPtr >>> 0, 128 * melFrames);
+    const src = new Float32Array(freshHeap(this.M).HEAPU8.buffer, melPtr >>> 0, 128 * melFrames);
     let total = 0;
     for (const g of plan.groups) { g.melOff = total; total += g.batch * 128 * g.width; }
     const dst = new Float32Array(total);
@@ -1109,7 +1110,7 @@ export class WebGPUEncoder {
   /* Upload the conv stem's output, transposed into [d_model][seqPad]. */
   uploadInput(ptr, tokens) {
     const d = this.dModel, sp = this.seqPad;
-    const src = new Float32Array(this.M.HEAPU8.buffer, ptr >>> 0, tokens * d);
+    const src = new Float32Array(freshHeap(this.M).HEAPU8.buffer, ptr >>> 0, tokens * d);
     const dst = new Float32Array(d * sp);
     for (let t = 0; t < tokens; t++) {
       const base = t * d;

@@ -1,3 +1,4 @@
+import { freshHeap } from "./heap.js";
 /*
  * webgpu-decoder.js - Qwen3-ASR token generation on the GPU.
  *
@@ -1413,7 +1414,7 @@ export class WebGPUDecoder {
     /* ---- shape ---- */
     const shPtr = M._qwen_wasm_alloc(10 * 4) >>> 0;
     if (M._qwen_wasm_model_shape(shPtr) < 0) throw new Error("model shape unavailable");
-    const sh = new Int32Array(M.HEAPU8.buffer, shPtr, 10).slice();
+    const sh = new Int32Array(freshHeap(M).HEAPU8.buffer, shPtr, 10).slice();
     M._qwen_wasm_release(shPtr);
     const cfg = {
       layers: sh[0], hidden: sh[1], heads: sh[2], kvHeads: sh[3], headDim: sh[4],
@@ -1445,7 +1446,7 @@ export class WebGPUDecoder {
         M._qwen_wasm_release(dPtr);
         throw new Error("decoder is not Q8 quantized (use the packed model)");
       }
-      const qd = new Uint32Array(M.HEAPU8.buffer, dPtr, nQ * 6).slice();
+      const qd = new Uint32Array(freshHeap(M).HEAPU8.buffer, dPtr, nQ * 6).slice();
       qEntries = [];
       for (let i = 0; i < nQ; i++) {
         const [kind, layer, rows, cols, qptr, sptr] = qd.subarray(i * 6, i * 6 + 6);
@@ -1457,7 +1458,7 @@ export class WebGPUDecoder {
       M._qwen_wasm_release(dPtr);
       throw new Error("norm weights unavailable");
     }
-    const fd = new Uint32Array(M.HEAPU8.buffer, dPtr, nF * 4).slice();
+    const fd = new Uint32Array(freshHeap(M).HEAPU8.buffer, dPtr, nF * 4).slice();
     M._qwen_wasm_release(dPtr);
 
     /* Weights are packed into shards rather than one buffer.
@@ -1616,7 +1617,7 @@ export class WebGPUDecoder {
                                    new Uint8Array(chunk), 0, n);
         } else {
           device.queue.writeBuffer(this.bufQuants[shard], wordBase * 4 + off,
-                                   M.HEAPU8, w.qptr + off, n);
+                                   freshHeap(M).HEAPU8, w.qptr + off, n);
         }
         done += n;
       }
@@ -1632,7 +1633,7 @@ export class WebGPUDecoder {
         device.queue.writeBuffer(this.bufScale, w.scaleBase * 4,
                                  new Uint8Array(await src.read(w.soff, sBytes)), 0, sBytes);
       } else {
-        device.queue.writeBuffer(this.bufScale, w.scaleBase * 4, M.HEAPU8, w.sptr, sBytes);
+        device.queue.writeBuffer(this.bufScale, w.scaleBase * 4, freshHeap(M).HEAPU8, w.sptr, sBytes);
       }
       if (done - lastReport > (256 << 20)) {
         lastReport = done;
@@ -1656,7 +1657,7 @@ export class WebGPUDecoder {
     const normBytes = (normFloats + this.ropeMaxSeq * cfg.headDim) * 4;
     this.bufNorm = device.createBuffer({ size: normBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     for (const n of nmap.values())
-      device.queue.writeBuffer(this.bufNorm, n.base * 4, M.HEAPU8, n.ptr, n.count * 4);
+      device.queue.writeBuffer(this.bufNorm, n.base * 4, freshHeap(M).HEAPU8, n.ptr, n.count * 4);
     this.uploadRopeTable();
 
     this.wmap = wmap;
@@ -2007,8 +2008,8 @@ export class WebGPUDecoder {
         const src = l * wasmStride * cfg.kvDim;
         let kSrc, vSrc;
         if (srcF16) {
-          kSrc = new Uint16Array(M.HEAPU8.buffer, kPtr + src * srcBytes, n);
-          vSrc = new Uint16Array(M.HEAPU8.buffer, vPtr + src * srcBytes, n);
+          kSrc = new Uint16Array(freshHeap(M).HEAPU8.buffer, kPtr + src * srcBytes, n);
+          vSrc = new Uint16Array(freshHeap(M).HEAPU8.buffer, vPtr + src * srcBytes, n);
           if (this.kvF16) { kSrc = kSrc.slice(); vSrc = vSrc.slice(); }
           else {
             /* Widen through Float16Array's element accessors (exact). */
@@ -2016,8 +2017,8 @@ export class WebGPUDecoder {
             vSrc = Float32Array.from(new Float16Array(vSrc.slice().buffer));
           }
         } else {
-          kSrc = new Float32Array(M.HEAPF32.buffer, kPtr + src * srcBytes, n);
-          vSrc = new Float32Array(M.HEAPF32.buffer, vPtr + src * srcBytes, n);
+          kSrc = new Float32Array(freshHeap(M).HEAPF32.buffer, kPtr + src * srcBytes, n);
+          vSrc = new Float32Array(freshHeap(M).HEAPF32.buffer, vPtr + src * srcBytes, n);
           if (this.kvF16) { kSrc = new Float16Array(kSrc); vSrc = new Float16Array(vSrc); }
           else { kSrc = kSrc.slice(); vSrc = vSrc.slice(); }
         }
@@ -2615,7 +2616,7 @@ export class WebGPUDecoder {
      * array and one writeBuffer - issuing a call per dim measured seconds of
      * pure overhead against a busy tab. */
     const sp = this.seqPad;
-    const src = new Float32Array(M.HEAPF32.buffer, embedsPtr, seq * cfg.hidden);
+    const src = new Float32Array(freshHeap(M).HEAPF32.buffer, embedsPtr, seq * cfg.hidden);
     const stage = new Float32Array(cfg.hidden * sp);
     for (let s2 = 0; s2 < seq; s2++) {
       const row = s2 * cfg.hidden;
@@ -2657,7 +2658,7 @@ export class WebGPUDecoder {
     mark(lp, "prepareMs", tp);
 
     const sp = this.seqPad;
-    const src = new Float32Array(M.HEAPF32.buffer, embedsPtr, seq * cfg.hidden);
+    const src = new Float32Array(freshHeap(M).HEAPF32.buffer, embedsPtr, seq * cfg.hidden);
     const stage = new Float32Array(cfg.hidden * sp);
     for (let s2 = 0; s2 < nNew; s2++) {
       const row = (p0 + s2) * cfg.hidden;
@@ -2711,10 +2712,10 @@ export class WebGPUDecoder {
       const p = M._qwen_wasm_token_text(id) >>> 0;
       if (!p) return;
       let end = p;
-      while (M.HEAPU8[end] !== 0) end++;
+      while (freshHeap(M).HEAPU8[end] !== 0) end++;
       if (end === p) return;
       /* Copy out: TextDecoder refuses views backed by a SharedArrayBuffer. */
-      const s = utf8.decode(new Uint8Array(M.HEAPU8.subarray(p, end)), { stream: true });
+      const s = utf8.decode(new Uint8Array(freshHeap(M).HEAPU8.subarray(p, end)), { stream: true });
       if (s) { text += s; if (onPiece) onPiece(s); }
     };
 

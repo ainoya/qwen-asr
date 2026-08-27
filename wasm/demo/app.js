@@ -8,6 +8,7 @@
  */
 
 import { WebGPUDecoder } from "./webgpu-decoder.js";
+import { freshHeap } from "./heap.js";
 import { tick, until, sleep } from "./tick.js";
 import { WebGPUEncoder } from "./webgpu-encoder.js";
 
@@ -164,7 +165,7 @@ async function copyStreamInto(stream, ptr, total, label, alsoWrite) {
     const { done, value } = await reader.read();
     if (done) break;
     // Re-read HEAPU8 every time: growing memory swaps the backing buffer.
-    Module.HEAPU8.set(value, ptr + off);
+    freshHeap(Module).HEAPU8.set(value, ptr + off);
     if (alsoWrite) {
       try { await alsoWrite.write(value); } catch { alsoWrite = null; }
     }
@@ -360,9 +361,10 @@ async function loadGpuResident(url, total, threads) {
   setStatus(`building the reduced image (${reducedSize} in wasm)...`);
   const ptr = P(Module._qwen_wasm_alloc(reducedLen));
   if (!ptr) throw new Error(`could not allocate ${reducedLen} bytes of wasm memory`);
-  const heap = Module.HEAPU8;
-  new DataView(heap.buffer, ptr, 8).setBigUint64(0, BigInt(hjson.length), true);
-  heap.set(hjson, ptr + 8);
+  /* No cached view: every heap access re-validates (freshHeap). */
+  new DataView(freshHeap(Module).HEAPU8.buffer, ptr, 8)
+    .setBigUint64(0, BigInt(hjson.length), true);
+  freshHeap(Module).HEAPU8.set(hjson, ptr + 8);
   let copied = 0, lastReport = 0;
   for (const [name, t] of kept) {
     const size = t.data_offsets[1] - t.data_offsets[0];
@@ -370,7 +372,7 @@ async function loadGpuResident(url, total, threads) {
     const dst = ptr + 8 + hjson.length + newHeader[name].data_offsets[0];
     for (let off = 0; off < size; off += 64 << 20) {
       const n = Math.min(64 << 20, size - off);
-      Module.HEAPU8.set(asU8(await read(srcOff + off, n)), dst + off);
+      freshHeap(Module).HEAPU8.set(asU8(await read(srcOff + off, n)), dst + off);
       copied += n;
       if (copied - lastReport > 128 << 20) {
         lastReport = copied;
@@ -545,7 +547,7 @@ $("load").onclick = async () => {
             idsPtr = idsPtr >>> 0;
             dst = dst >>> 0;
             /* Copy before await: the ids live in a worker-owned stack frame. */
-            const ids = new Int32Array(Module.HEAPU8.buffer, idsPtr, n).slice();
+            const ids = new Int32Array(freshHeap(Module).HEAPU8.buffer, idsPtr, n).slice();
             const missing = [];
             const seen = new Set();
             for (const id of ids) {
@@ -567,7 +569,7 @@ $("load").onclick = async () => {
               const id = ids[i];
               const row = embedCache.get(id) || fresh.get(id);
               if (!row) throw new Error(`embedding row ${id} unavailable`);
-              Module.HEAPF32.set(row, base + i * dim);
+              freshHeap(Module).HEAPF32.set(row, base + i * dim);
               if (embedCache.has(id)) embedCache.delete(id);
               embedCache.set(id, row);
               if (embedCache.size > EMBED_CACHE_ROWS)
@@ -606,7 +608,7 @@ $("load").onclick = async () => {
               const out = await encoder.runFromMel(melPtr, frames);
               const p = P(Module._qwen_wasm_alloc(out.byteLength));
               if (!p) throw new Error("out of wasm memory for the encoder output");
-              Module.HEAPF32.set(out, f32idx(p));
+              freshHeap(Module).HEAPF32.set(out, f32idx(p));
               Module._qwen_wasm_enc_hook_done(p, encoder.tokens);
               hs.encMs += performance.now() - et0;
               (hs.encProfiles || (hs.encProfiles = [])).push(
@@ -653,7 +655,7 @@ $("load").onclick = async () => {
             if (!p) throw new Error("out of wasm memory for the token ids");
             /* HEAP32 is not exported by this build; any heap view's buffer
              * is the same SharedArrayBuffer. */
-            new Int32Array(Module.HEAPU8.buffer, p, ids.length).set(ids);
+            new Int32Array(freshHeap(Module).HEAPU8.buffer, p, ids.length).set(ids);
             Module._qwen_wasm_dec_hook_done(p, ids.length);
             Module._qwen_wasm_release(p);
             hs.decMs += performance.now() - t0;
@@ -745,7 +747,7 @@ async function runBatch(bytes, label) {
     /* Everything but mel on the GPU when the audio tower is available:
      * mel here, tower and decoder there, prompt assembly back here. */
     try {
-      Module.HEAPF32.set(samples, f32idx(ptr));
+      freshHeap(Module).HEAPF32.set(samples, f32idx(ptr));
       const t0 = performance.now();
       let seq, melMs = 0;
       if (encoder) {
@@ -760,7 +762,7 @@ async function runBatch(bytes, label) {
         const encOut = await encoder.runFromMel(P(Module._qwen_wasm_mel_ptr()), frames);
         const ep = P(Module._qwen_wasm_alloc(encOut.byteLength));
         if (!ep) throw new Error("out of wasm memory for the encoder output");
-        Module.HEAPF32.set(encOut, f32idx(ep));
+        freshHeap(Module).HEAPF32.set(encOut, f32idx(ep));
         if (Module._qwen_wasm_embeds_from_enc_start(ep, encoder.tokens) !== 0) {
           Module._qwen_wasm_release(ep);
           throw new Error("prompt assembly failed to start");
@@ -828,7 +830,7 @@ async function runBatch(bytes, label) {
   }
 
   try {
-    Module.HEAPF32.set(samples, f32idx(ptr));
+    freshHeap(Module).HEAPF32.set(samples, f32idx(ptr));
     if (Module._qwen_wasm_batch_start(ptr, samples.length) !== 0)
       throw new Error("could not start transcription");
   } catch (e) {
@@ -902,7 +904,7 @@ $("mic").onclick = async () => {
       for (let i = 0; i < s.length; i += 8) peak = Math.max(peak, Math.abs(s[i]));
       $("lvlfill").style.width = Math.min(100, peak * 180) + "%";
       const ptr = ensureSampleBuf(s.length);
-      Module.HEAPF32.set(s, f32idx(ptr));
+      freshHeap(Module).HEAPF32.set(s, f32idx(ptr));
       Module._qwen_wasm_stream_push(ptr, s.length);
       streamedSamples += s.length;
     };
@@ -979,7 +981,7 @@ $("simstream").onclick = async () => {
     for (let off = 0; off < samples.length; off += CHUNK) {
       const part = samples.subarray(off, Math.min(off + CHUNK, samples.length));
       const ptr = ensureSampleBuf(part.length);
-      Module.HEAPF32.set(part, f32idx(ptr));
+      freshHeap(Module).HEAPF32.set(part, f32idx(ptr));
       Module._qwen_wasm_stream_push(ptr, part.length);
       streamedSamples += part.length;
       await sleep(250);

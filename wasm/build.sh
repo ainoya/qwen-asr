@@ -73,7 +73,7 @@ emcc $SRCS -o "$OUT/qwen_asr.js" \
     -sPTHREAD_POOL_SIZE=12 \
     -sPTHREAD_POOL_SIZE_STRICT=0 \
     -sEXPORTED_FUNCTIONS="$EXPORTS" \
-    -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap","UTF8ToString","stringToUTF8","lengthBytesUTF8","HEAPU8","HEAPF32","FS"]' \
+    -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap","UTF8ToString","stringToUTF8","lengthBytesUTF8","HEAPU8","HEAPF32","FS","wasmMemory"]' \
     -sFORCE_FILESYSTEM=1 \
     -sASSERTIONS=0
 

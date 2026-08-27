@@ -9,6 +9,14 @@ batch, streaming and microphone transcription in a WebGPU-capable browser.
 One ~2.2 GB model download on first visit, cached locally (OPFS); later
 visits are ready in a few seconds.
 
+<video src="https://github.com/ainoya/qwen-asr/raw/perf/q8-wasm-webgpu/docs/media/streaming-jp.mp4" poster="https://raw.githubusercontent.com/ainoya/qwen-asr/perf/q8-wasm-webgpu/docs/media/streaming-jp-poster.jpg" controls muted playsinline width="100%">
+  <a href="https://github.com/ainoya/qwen-asr/raw/perf/q8-wasm-webgpu/docs/media/streaming-jp.mp4"><img src="docs/media/streaming-jp-poster.jpg" alt="Live Japanese microphone transcription in the browser" width="100%"></a>
+</video>
+
+*Live microphone streaming, Japanese, in a browser tab: 2.18 GB packed model
+fetched once, 0.5 MB of it kept in the wasm heap, decoder and audio tower
+resident on the GPU — 8.8 s of speech transcribed in 5.95 s (1.48x realtime).*
+
 **Model:** [ainoya/qwen3-asr-1.7b-q8-packed](https://huggingface.co/ainoya/qwen3-asr-1.7b-q8-packed)
 on Hugging Face — a pre-quantized int8 image (2.18 GB instead of 4.70 GB of
 bf16) that both the native and browser builds attach directly.

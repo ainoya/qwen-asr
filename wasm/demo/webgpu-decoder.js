@@ -190,6 +190,83 @@ const MATVEC_SG_WGSL = "enable subgroups;\n" + HEADER + MATVEC_SG_BODY
 const LOGITS_SG_WGSL = "enable subgroups;\n" + HEADER + MATVEC_SG_BODY
   .replace("$STORE$", "scratch[P.c + row] = total;");
 
+/* The packed Qwen gate/up matrix interleaves the two rows for each FFN
+ * channel. Compute that pair in one workgroup and apply SwiGLU before writing
+ * it out. This removes one dispatch per layer and the 2*intermediate activation
+ * between the matvec and SwiGLU without changing the dot products. */
+const GATE_UP_WGSL = HEADER + `
+const WG : u32 = $WG$u;
+var<workgroup> rg : array<f32, WG>;
+var<workgroup> ru : array<f32, WG>;
+
+@compute @workgroup_size(WG)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  let pair = wid.x + wid.y * P.d;
+  let grow = pair * 2u;
+  if (grow >= P.rows) { return; }
+  let nwords = P.cols / 4u;
+  rg[lid.x] = $GATEFN$;
+  ru[lid.x] = $UPFN$;
+  workgroupBarrier();
+  var s : u32 = WG / 2u;
+  loop {
+    if (s == 0u) { break; }
+    if (lid.x < s) {
+      rg[lid.x] = rg[lid.x] + rg[lid.x + s];
+      ru[lid.x] = ru[lid.x] + ru[lid.x + s];
+    }
+    workgroupBarrier();
+    s = s / 2u;
+  }
+  if (lid.x == 0u) {
+    let g = rg[0];
+    act[P.yOff + pair] = (g / (1.0 + exp(-g))) * ru[0];
+  }
+}
+`;
+
+const GATE_UP_SG_WGSL = "enable subgroups;\n" + HEADER + `
+const WG : u32 = $WG$u;
+var<workgroup> rg : array<f32, WG / 4u>;
+var<workgroup> ru : array<f32, WG / 4u>;
+
+@compute @workgroup_size(WG)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>,
+        @builtin(subgroup_invocation_id) sglane : u32,
+        @builtin(subgroup_size) sgsz : u32) {
+  let pair = wid.x + wid.y * P.d;
+  let grow = pair * 2u;
+  if (grow >= P.rows) { return; }
+  let nwords = P.cols / 4u;
+  let pg = subgroupAdd($GATEFN$);
+  let pu = subgroupAdd($UPFN$);
+  var g : f32;
+  var u : f32;
+  if (WG == 32u && sgsz == 32u) {
+    g = pg;
+    u = pu;
+  } else {
+    if (sglane == 0u) {
+      rg[lid.x / sgsz] = pg;
+      ru[lid.x / sgsz] = pu;
+    }
+    workgroupBarrier();
+    let nsg = (WG + sgsz - 1u) / sgsz;
+    var tg : f32 = 0.0;
+    var tu : f32 = 0.0;
+    for (var i : u32 = 0u; i < nsg; i = i + 1u) {
+      tg = tg + rg[i];
+      tu = tu + ru[i];
+    }
+    g = tg;
+    u = tu;
+  }
+  if (lid.x == 0u) { act[P.yOff + pair] = (g / (1.0 + exp(-g))) * u; }
+}
+`;
+
 /* Same reduction, but the result goes to scratch as a logit. */
 const LOGITS_WGSL = HEADER + `
 const WG : u32 = $WG$u;
@@ -517,17 +594,6 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
 }
 `;
 
-const SWIGLU_WGSL = HEADER + `
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x;
-  if (i >= P.n) { return; }
-  let g = act[P.xOff + 2u * i];
-  let u = act[P.xOff + 2u * i + 1u];
-  act[P.yOff + i] = (g / (1.0 + exp(-g))) * u;
-}
-`;
-
 const EMBED_WGSL = HEADER + `
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -717,6 +783,103 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
   store_row(row0 + 5u, sq0, a5);
   store_row(row0 + 6u, sq0, a6);
   store_row(row0 + 7u, sq0, a7);
+}
+`;
+
+/* Qwen's packed gate/up rows are interleaved. The ordinary 128-row tile already
+ * brings 64 gate/up pairs into a workgroup, so applying SwiGLU while the eight
+ * accumulators are still live removes the separate activation and dispatch at
+ * no extra weight traffic. */
+const PRE_GATE_UP_WGSL = HEADER + `
+const TR : u32 = 128u;
+const TS : u32 = 64u;
+const TK : u32 = 16u;
+
+var<workgroup> ws : array<f32, 2048>;
+var<workgroup> xs : array<f32, 1024>;
+
+fn store_pair(row : u32, sq : u32, gate : f32, up : f32) {
+  if (row * 2u >= P.rows || sq >= P.n) { return; }
+  act[P.yOff + row * P.a + sq] = (gate / (1.0 + exp(-gate))) * up;
+}
+
+fn store_row(row : u32, sq0 : u32, gate : vec4<f32>, up : vec4<f32>) {
+  store_pair(row, sq0, gate.x, up.x);
+  store_pair(row, sq0 + 1u, gate.y, up.y);
+  store_pair(row, sq0 + 2u, gate.z, up.z);
+  store_pair(row, sq0 + 3u, gate.w, up.w);
+}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  let r0 = wid.y * TR;
+  let s0 = wid.x * TS;
+  let tid = lid.y * 16u + lid.x;
+  let nwords = P.cols / 4u;
+  let nblocks = P.cols / 64u;
+  let wb = lid.y * 8u;
+  let xb = lid.x * 4u;
+
+  var a0 = vec4<f32>(0.0); var a1 = vec4<f32>(0.0);
+  var a2 = vec4<f32>(0.0); var a3 = vec4<f32>(0.0);
+  var a4 = vec4<f32>(0.0); var a5 = vec4<f32>(0.0);
+  var a6 = vec4<f32>(0.0); var a7 = vec4<f32>(0.0);
+
+  var kb : u32 = 0u;
+  loop {
+    if (kb >= P.cols) { break; }
+    for (var t = 0u; t < 2u; t = t + 1u) {
+      let idx = tid + t * 256u;
+      let rr = idx / 4u;
+      let wq = idx % 4u;
+      let row = r0 + rr;
+      let col0 = kb + wq * 4u;
+      var v = vec4<f32>(0.0);
+      if (row < P.rows) {
+        let word = quants[P.wordBase + row * nwords + col0 / 4u];
+        v = vec4<f32>(i8x4(word)) * scales[P.scaleBase + row * nblocks + col0 / 64u];
+      }
+      let base = rr * TK + wq * 4u;
+      ws[base] = v.x;
+      ws[base + 1u] = v.y;
+      ws[base + 2u] = v.z;
+      ws[base + 3u] = v.w;
+    }
+    for (var t = 0u; t < 4u; t = t + 1u) {
+      let idx = tid + t * 256u;
+      let kk = idx / TS;
+      let ss = idx % TS;
+      let col = kb + kk;
+      let sq = s0 + ss;
+      var val : f32 = 0.0;
+      if (col < P.cols && sq < P.n) { val = act[P.xOff + col * P.a + sq]; }
+      xs[kk * TS + ss] = val;
+    }
+    workgroupBarrier();
+    for (var k = 0u; k < TK; k = k + 1u) {
+      let xo = k * TS + xb;
+      let x4 = vec4<f32>(xs[xo], xs[xo + 1u], xs[xo + 2u], xs[xo + 3u]);
+      let wo = wb * TK + k;
+      a0 = a0 + ws[wo] * x4;
+      a1 = a1 + ws[wo + TK] * x4;
+      a2 = a2 + ws[wo + 2u * TK] * x4;
+      a3 = a3 + ws[wo + 3u * TK] * x4;
+      a4 = a4 + ws[wo + 4u * TK] * x4;
+      a5 = a5 + ws[wo + 5u * TK] * x4;
+      a6 = a6 + ws[wo + 6u * TK] * x4;
+      a7 = a7 + ws[wo + 7u * TK] * x4;
+    }
+    workgroupBarrier();
+    kb = kb + TK;
+  }
+
+  let pair0 = r0 / 2u + wb / 2u;
+  let sq0 = s0 + xb;
+  store_row(pair0, sq0, a0, a1);
+  store_row(pair0 + 1u, sq0, a2, a3);
+  store_row(pair0 + 2u, sq0, a4, a5);
+  store_row(pair0 + 3u, sq0, a6, a7);
 }
 `;
 
@@ -1183,19 +1346,6 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
 }
 `;
 
-/* SwiGLU on the transposed layout: gate/up rows are interleaved. */
-const PRE_SWIGLU_WGSL = HEADER + `
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let sq = gid.x;
-  let r = gid.y;
-  if (sq >= P.b || r >= P.n) { return; }
-  let g = act[P.xOff + (2u * r) * P.a + sq];
-  let u = act[P.xOff + (2u * r + 1u) * P.a + sq];
-  act[P.yOff + r * P.a + sq] = (g / (1.0 + exp(-g))) * u;
-}
-`;
-
 /* Pull one column of the transposed prefill state into the generation buffer. */
 const PRE_EXTRACT_WGSL = HEADER + `
 @compute @workgroup_size(64)
@@ -1500,7 +1650,6 @@ export class WebGPUDecoder {
     slot("k", cfg.kvDim);
     slot("v", cfg.kvDim);
     slot("attn", cfg.qDim);
-    slot("gu", 2 * cfg.inter);
     slot("g", cfg.inter);
     /* Per-block scales for the quantized copies of the vectors that feed a
      * matvec. Packed int8 words live in the `tok` buffer. */
@@ -1518,7 +1667,6 @@ export class WebGPUDecoder {
     prow("xn", cfg.hidden);
     prow("qkv", cfg.qDim + 2 * cfg.kvDim);
     prow("attn", cfg.qDim);
-    prow("gu", 2 * cfg.inter);
     prow("g", cfg.inter);
     this.preRows = pr;
     this.Q = {
@@ -1571,19 +1719,28 @@ export class WebGPUDecoder {
      * compared on the same audio (setSubgroups). */
     this.matvecPipes = { q8: {}, f32: {} };
     this.logitsPipes = { q8: {}, f32: {} };
+    this.gateUpPipes = { q8: {}, f32: {} };
     this.matvecPipesTree = { q8: {}, f32: {} };
     this.logitsPipesTree = { q8: {}, f32: {} };
+    this.gateUpPipesTree = { q8: {}, f32: {} };
     for (const [mode, rowfn] of [["q8", ROW_Q8], ["f32", ROW_F32]]) {
       for (const wg of [32, 64, 128, 256]) {
         const sub = (code) => code.replace("$WG$", String(wg)).replace("$ROWFN$", rowfn);
+        const gatefn = rowfn.replace(/\brow\b/g, "grow");
+        const upfn = rowfn.replace(/\brow\b/g, "(grow + 1u)");
+        const subGateUp = (code) => code.replace("$WG$", String(wg))
+          .replace("$GATEFN$", gatefn).replace("$UPFN$", upfn);
         this.matvecPipesTree[mode][wg] = mk(sub(MATVEC_WGSL), `matvec_${mode}_${wg}`);
         this.logitsPipesTree[mode][wg] = mk(sub(LOGITS_WGSL), `logits_${mode}_${wg}`);
+        this.gateUpPipesTree[mode][wg] = mk(subGateUp(GATE_UP_WGSL), `gate_up_${mode}_${wg}`);
         if (this.hasSubgroups) {
           this.matvecPipes[mode][wg] = mk(sub(MATVEC_SG_WGSL), `matvec_sg_${mode}_${wg}`);
           this.logitsPipes[mode][wg] = mk(sub(LOGITS_SG_WGSL), `logits_sg_${mode}_${wg}`);
+          this.gateUpPipes[mode][wg] = mk(subGateUp(GATE_UP_SG_WGSL), `gate_up_sg_${mode}_${wg}`);
         } else {
           this.matvecPipes[mode][wg] = this.matvecPipesTree[mode][wg];
           this.logitsPipes[mode][wg] = this.logitsPipesTree[mode][wg];
+          this.gateUpPipes[mode][wg] = this.gateUpPipesTree[mode][wg];
         }
       }
     }
@@ -1597,6 +1754,7 @@ export class WebGPUDecoder {
     this.pipe = {
       matvec: this.matvecPipes.f32[64],
       logits: this.logitsPipes.f32[64],
+      gateUp: this.gateUpPipes.f32[64],
       rmsnorm: mk(RMSNORM_WGSL, "rmsnorm"),
       qkrope: mk(QKROPE_WGSL, "qkrope"),
       scores: this.hasSubgroups ? mk(ATTN_SCORES_SG_WGSL, "scores_sg")
@@ -1604,9 +1762,9 @@ export class WebGPUDecoder {
       softmax: mk(ATTN_SOFTMAX_WGSL, "softmax"),
       apply: mk(ATTN_APPLY_WGSL, "apply"),
       merge: mk(ATTN_MERGE_WGSL, "merge"),
-      swiglu: mk(SWIGLU_WGSL, "swiglu"),
       quantAct: mk(QUANTACT_WGSL, "quantAct"),
       preMatmul: mk(PRE_MATMUL_WGSL, "preMatmul"),
+      preGateUp: mk(PRE_GATE_UP_WGSL, "preGateUp"),
       preRms: mk(PRE_RMSNORM_WGSL, "preRms"),
       preQkRope: mk(PRE_QKROPE_WGSL, "preQkRope"),
       preKvStore: mk(PRE_KVSTORE_WGSL, "preKvStore"),
@@ -1617,7 +1775,6 @@ export class WebGPUDecoder {
       preSoftmaxKv: mk(PRE_SOFTMAX_KV_WGSL, "preSoftmaxKv"),
       preApplyKv: mk(PRE_APPLY_KV_WGSL, "preApplyKv"),
       preApply: mk(PRE_APPLY_WGSL, "preApply"),
-      preSwiglu: mk(PRE_SWIGLU_WGSL, "preSwiglu"),
       preExtract: mk(PRE_EXTRACT_WGSL, "preExtract"),
       embed: mk(EMBED_WGSL, "embed"),
       argmax: mk(ARGMAX_WGSL, "argmax"),
@@ -1657,8 +1814,10 @@ export class WebGPUDecoder {
     const mode = this.quantizeActivations ? "q8" : "f32";
     const mv = this.useSubgroups ? this.matvecPipes : this.matvecPipesTree;
     const lg = this.useSubgroups ? this.logitsPipes : this.logitsPipesTree;
+    const gu = this.useSubgroups ? this.gateUpPipes : this.gateUpPipesTree;
     this.pipe.matvec = mv[mode][this.matvecWidth];
     this.pipe.logits = lg[mode][this.matvecWidth];
+    this.pipe.gateUp = gu[mode][this.matvecWidth];
   }
 
   /* Flip between the subgroup and shared-memory-tree reductions (A/B). */
@@ -1927,8 +2086,9 @@ export class WebGPUDecoder {
       L.rms2 = push({ n: cfg.hidden, xOff: A.x, yOff: A.xn, a: nb(N_POST_ATTN, l), fa: this.eps });
       const wgu = w(W_GATE_UP, l);
       L.qxn2 = push({ n: cfg.hidden, xOff: A.xn, a: this.Q.xn, b: A.sxn });
-      L.gu = push({ shard: wgu.shard, wordBase: wgu.wordBase, scaleBase: wgu.scaleBase, rows: wgu.rows, cols: wgu.cols, a: this.Q.xn, b: A.sxn, xOff: A.xn, yOff: A.gu, d: grid(wgu.rows) });
-      L.swiglu = push({ n: cfg.inter, xOff: A.gu, yOff: A.g });
+      L.gu = push({ shard: wgu.shard, wordBase: wgu.wordBase, scaleBase: wgu.scaleBase,
+                    rows: wgu.rows, cols: wgu.cols, a: this.Q.xn, b: A.sxn,
+                    xOff: A.xn, yOff: A.g, d: grid(cfg.inter) });
       const wd = w(W_DOWN, l);
       L.qg = push({ n: cfg.inter, xOff: A.g, a: this.Q.g, b: A.sg });
       L.down = push({ shard: wd.shard, wordBase: wd.wordBase, scaleBase: wd.scaleBase, rows: wd.rows, cols: wd.cols, a: this.Q.g, b: A.sg, xOff: A.g, yOff: A.x, pos: 1, d: grid(wd.rows) });
@@ -2005,8 +2165,7 @@ export class WebGPUDecoder {
                         xOff: PT.x, yOff: PT.xn, fa: eps });
         const wgu = w(W_GATE_UP, l);
         L.gu = push({ shard: wgu.shard, wordBase: wgu.wordBase, scaleBase: wgu.scaleBase, rows: wgu.rows,
-                      cols: wgu.cols, a: sp, n: seq, xOff: PT.xn, yOff: PT.gu });
-        L.swiglu = push({ a: sp, b: seq, n: cfg.inter, xOff: PT.gu, yOff: PT.g });
+                      cols: wgu.cols, a: sp, n: seq, xOff: PT.xn, yOff: PT.g });
         const wd = w(W_DOWN, l);
         L.down = push({ shard: wd.shard, wordBase: wd.wordBase, scaleBase: wd.scaleBase, rows: wd.rows,
                         cols: wd.cols, a: sp, n: seq, xOff: PT.g, yOff: PT.x, pos: 1 });
@@ -2135,8 +2294,8 @@ export class WebGPUDecoder {
       }
       ph("pre.mm.o"); use(pipe.preMatmul, L.o); pass.dispatchWorkgroups(sBlocks, up(cfg.hidden, 128));
       ph("pre.rms"); use(pipe.preRms, L.rms2); pass.dispatchWorkgroups(sBlocks);
-      ph("pre.mm.gu"); use(pipe.preMatmul, L.gu); pass.dispatchWorkgroups(sBlocks, up(2 * cfg.inter, 128));
-      ph("pre.swiglu"); use(pipe.preSwiglu, L.swiglu); pass.dispatchWorkgroups(sBlocks, cfg.inter);
+      ph("pre.mm.gu+swiglu"); use(pipe.preGateUp, L.gu);
+      pass.dispatchWorkgroups(sBlocks, up(2 * cfg.inter, 128));
       ph("pre.mm.down"); use(pipe.preMatmul, L.down); pass.dispatchWorkgroups(sBlocks, up(cfg.hidden, 128));
     }
 
@@ -2244,8 +2403,7 @@ export class WebGPUDecoder {
       ph("matvec.o"); use(pipe.matvec, L.o); dw(...rowGrid(cfg.hidden));
       ph("rmsnorm"); use(pipe.rmsnorm, L.rms2); dw(1);
       if (this.quantizeActivations) { ph("quantAct"); use(pipe.quantAct, L.qxn2); dw(cfg.hidden / 64); }
-      ph("matvec.gu"); use(pipe.matvec, L.gu); dw(...rowGrid(2 * cfg.inter));
-      ph("swiglu"); use(pipe.swiglu, L.swiglu); dw(up(cfg.inter, 256));
+      ph("matvec.gu+swiglu"); use(pipe.gateUp, L.gu); dw(...rowGrid(cfg.inter));
       if (this.quantizeActivations) { ph("quantAct"); use(pipe.quantAct, L.qg); dw(cfg.inter / 64); }
       ph("matvec.down"); use(pipe.matvec, L.down); dw(...rowGrid(cfg.hidden));
     }

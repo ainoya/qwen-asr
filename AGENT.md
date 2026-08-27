@@ -552,6 +552,13 @@ Things that were learned the hard way and should not be re-litigated:
   wasm-side hazards, both hit: EM_ASM passes pointers as signed ints (heap >
   2 GB needs `>>> 0`), and joining the stream thread from the main thread
   deadlocks the hooks it is waiting on - finish is split into EOF/poll/join.
+- **SwiGLU is fused into the gate/up matmuls.** The packed gate_up matrix
+  interleaves the two rows of each FFN pair, so the workgroup that computed
+  both dots can apply silu(g)*u at writeback: one dispatch per layer less in
+  both prefill and generation, and the 2*inter intermediate activation is gone
+  (prefill arena 66 -> 38 MB at seq 549). The tile structure and accumulation
+  order are copied from PRE_MATMUL / the matvec row functions unchanged, which
+  is why the golden suite kept 18/23 byte-identical.
 - **Generation steps are batched 8 per submit** - the token id stays in a GPU
   buffer, each step copies its id out, one mapAsync returns all eight. This cut
   ~8 ms/token of per-step submit/readback overhead to 1-2. An EOS inside a

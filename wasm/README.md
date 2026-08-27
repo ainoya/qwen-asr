@@ -22,6 +22,22 @@ The demo has a **batch** tab (audio file or one of the bundled samples) and a
 **streaming** tab (microphone, or "Stream sample file" to watch the incremental
 path without a mic).
 
+## Hosted playground
+
+The demo deploys to GitHub Pages via `.github/workflows/pages.yml` (repo
+setting: Pages -> Source: "GitHub Actions"). Pages cannot send the COOP/COEP
+headers that SharedArrayBuffer needs, so the demo ships
+`coi-serviceworker.js`: a service worker stamps the headers on and the first
+visit reloads once. The 2.18 GB model is not in the site - it exceeds the
+2 GB GitHub release-asset limit anyway - and is fetched from Hugging Face
+(CORS + range-capable CDN) as configured by `playground-config.js`, which the
+workflow overwrites at deploy; the tracked copy is a no-op so local serving
+via `wasm/serve.py` (real headers, repo-relative model path) is unchanged.
+Verified end-to-end against the same topology: a header-less local server
+plus a cross-origin model server, in real Chrome - isolation dance, CORS
+fetch under COEP, OPFS cache (second visit loads in ~3 s), GPU-resident load,
+correct English and Japanese transcripts.
+
 ## Why a packed model file
 
 The engine normally quantizes the bf16 safetensors at load time, which is free

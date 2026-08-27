@@ -12,7 +12,12 @@ import { tick, until, sleep } from "./tick.js";
 import { WebGPUEncoder } from "./webgpu-encoder.js";
 
 const $ = (id) => document.getElementById(id);
-const MODEL_BASE = "../../qwen3-asr-1.7b-q8";
+/* A hosted playground overrides these via playground-config.js; the local
+ * dev server (wasm/serve.py) uses the repo-relative defaults. */
+const CFG = (typeof window !== "undefined" && window.QWEN_PLAYGROUND) || {};
+const MODEL_BASE = CFG.modelBase || "../../qwen3-asr-1.7b-q8";
+const SAMPLE_EN = CFG.sampleEn || "../../samples/jfk.wav";
+const SAMPLE_JA = CFG.sampleJa || "../../samples/extra/ja_bench.wav";
 
 let Module = null;
 let ready = false;
@@ -475,10 +480,15 @@ $("load").onclick = async () => {
       Module.FS.writeFile(`/model/${name}`, new Uint8Array(await r.arrayBuffer()));
     }
 
-    const head = await fetch(`${MODEL_BASE}/qwen-asr-q8.bin`, { method: "HEAD" });
-    if (!head.ok) throw new Error(`model: HTTP ${head.status}`);
-    const total = Number(head.headers.get("content-length"));
-    if (!total) throw new Error("server did not report Content-Length for the model");
+    let total = 0;
+    try {
+      const head = await fetch(`${MODEL_BASE}/qwen-asr-q8.bin`, { method: "HEAD" });
+      if (head.ok) total = Number(head.headers.get("content-length")) || 0;
+    } catch {}
+    /* Some CDNs answer HEAD without an exposed Content-Length; the deploy
+     * config carries the size so progress and the OPFS cache still work. */
+    if (!total) total = Number(CFG.modelSize) || 0;
+    if (!total) throw new Error("could not determine the model size");
 
     const threads = Number($("threads").value) || 8;
     /* GPU backend: probe first, and if the GPU is real, keep the transformer
@@ -858,8 +868,8 @@ async function runSample(url) {
   if (!r.ok) { log(`sample ${url}: HTTP ${r.status}`, "err"); return; }
   runBatch(await r.arrayBuffer(), url.split("/").pop());
 }
-$("sample-ja").onclick = () => runSample("../../samples/extra/ja_bench.wav");
-$("sample-en").onclick = () => runSample("../../samples/jfk.wav");
+$("sample-ja").onclick = () => runSample(SAMPLE_JA);
+$("sample-en").onclick = () => runSample(SAMPLE_EN);
 
 /* ---------------- streaming ---------------- */
 
@@ -956,8 +966,7 @@ $("simstream").onclick = async () => {
   sendSettings();
 
   try {
-    const url = $("lang").value === "English" ? "../../samples/jfk.wav"
-                                              : "../../samples/extra/ja_bench.wav";
+    const url = $("lang").value === "English" ? SAMPLE_EN : SAMPLE_JA;
     const r = await fetch(url);
     if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
     const samples = await decodeTo16k(await r.arrayBuffer());

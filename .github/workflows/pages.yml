@@ -1,0 +1,65 @@
+# Build the wasm demo and publish it to GitHub Pages as a playground.
+#
+# The model itself is NOT part of the site: it is 2.18 GB, which is over the
+# 2 GB GitHub release-asset limit and far over Pages limits. The demo fetches
+# it from Hugging Face (CORS + range-request capable CDN); playground-config.js
+# written below points the demo there. GitHub Pages cannot send COOP/COEP
+# response headers, so the demo ships coi-serviceworker.js, which installs a
+# service worker that stamps them on - one automatic reload on first visit.
+#
+# Requires (one-time, repo settings): Pages -> Source: "GitHub Actions".
+name: playground
+
+on:
+  push:
+    branches: [main, perf/q8-wasm-webgpu]
+    paths: ['wasm/**', 'qwen_asr*', 'Makefile', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.61
+      - name: Build wasm
+        run: bash wasm/build.sh
+      - name: Assemble site
+        run: |
+          mkdir -p _site/samples
+          cp wasm/demo/*.html wasm/demo/*.js wasm/demo/*.wasm _site/
+          cp samples/jfk.wav _site/samples/
+          cp samples/ja_say_eval/audio/daily__kyoko_normal.wav _site/samples/
+          MODEL_SIZE=$(cat wasm/demo/model-size.txt 2>/dev/null || echo 2179070272)
+          cat > _site/playground-config.js <<CFG
+          window.QWEN_PLAYGROUND = {
+            modelBase: "https://huggingface.co/${{ vars.HF_MODEL_REPO || 'ainoya/qwen3-asr-1.7b-q8-packed' }}/resolve/main",
+            modelSize: $MODEL_SIZE,
+            sampleEn: "samples/jfk.wav",
+            sampleJa: "samples/daily__kyoko_normal.wav",
+          };
+          CFG
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

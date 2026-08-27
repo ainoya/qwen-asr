@@ -418,6 +418,8 @@ static int g_emb_seq = 0;
 static double g_emb_mel_ms = 0, g_emb_enc_ms = 0;
 static float *g_emb_samples = NULL;
 static int g_emb_n = 0;
+static float *g_emb_enc_output = NULL;
+static int g_emb_enc_seq = 0;
 
 static void *embeds_main(void *arg) {
     (void)arg;
@@ -452,6 +454,9 @@ int qwen_wasm_embeds_finish(void) {
     g_emb_running = 0;
     free(g_emb_samples);
     g_emb_samples = NULL;
+    free(g_emb_enc_output);
+    g_emb_enc_output = NULL;
+    g_emb_enc_seq = 0;
     return g_emb ? g_emb_seq : 0;
 }
 
@@ -668,6 +673,53 @@ void qwen_wasm_set_gpu_encoder(int on) {
     qwen_set_encoder_hook(g_ctx, on ? gpu_encoder_hook : NULL, NULL);
 }
 
+/* ---- Tied token embeddings on the GPU ----
+ *
+ * A GPU-resident model need not retain the 311 MB tied embedding / LM-head
+ * table in wasm too. Prompt assembly asks the main thread for individual rows;
+ * JS caches them, so repeated control and streaming-prefix tokens are free.
+ */
+#define QWEN_EMBED_HOOK_TIMEOUT_MS 30000
+
+static volatile int g_embed_hook_state = 0; /* 0 idle, 1 pending, 2 done, 3 failed */
+static volatile unsigned int g_embed_hook_req = 0;
+
+EMSCRIPTEN_KEEPALIVE
+void qwen_wasm_embed_hook_done(unsigned int req, int ok) {
+    if (req != __atomic_load_n(&g_embed_hook_req, __ATOMIC_ACQUIRE)) return;
+    __atomic_store_n(&g_embed_hook_state, ok ? 2 : 3, __ATOMIC_RELEASE);
+}
+
+static int gpu_token_embed_hook(void *ud, const int *token_ids, int n,
+                                float *dst, int dim) {
+    (void)ud;
+    unsigned int req = __atomic_add_fetch(&g_embed_hook_req, 1, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&g_embed_hook_state, 1, __ATOMIC_RELEASE);
+
+    MAIN_THREAD_ASYNC_EM_ASM({
+        if (Module.__gpuEmbedMany) Module.__gpuEmbedMany($0, $1, $2, $3, $4);
+        else _qwen_wasm_embed_hook_done($4, 0);
+    }, (int)(uintptr_t)token_ids, n, (int)(uintptr_t)dst, dim, req);
+
+    double t0 = emscripten_get_now();
+    for (;;) {
+        int st = __atomic_load_n(&g_embed_hook_state, __ATOMIC_ACQUIRE);
+        if (st >= 2) break;
+        if (emscripten_get_now() - t0 > QWEN_EMBED_HOOK_TIMEOUT_MS) {
+            __atomic_store_n(&g_embed_hook_state, 3, __ATOMIC_RELEASE);
+            return -1;
+        }
+        emscripten_thread_sleep(1);
+    }
+    return __atomic_load_n(&g_embed_hook_state, __ATOMIC_ACQUIRE) == 2 ? 0 : -1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void qwen_wasm_set_gpu_embedder(int on) {
+    if (!g_ctx) return;
+    qwen_set_token_embed_hook(g_ctx, on ? gpu_token_embed_hook : NULL, NULL);
+}
+
 /* ---- Audio tower on the GPU: mel here, encoder there, assembly back here ----
  *
  * qwen_build_embeds() runs mel, the encoder and the prompt assembly as one
@@ -745,6 +797,57 @@ int qwen_wasm_embeds_from_enc(const float *enc_output, int enc_seq_len) {
     if (!g_emb) return 0;
     g_emb_seq = seq;
     return seq;
+}
+
+/* Asynchronous form for the GPU-resident browser path. Prompt assembly may
+ * request tied embedding rows from WebGPU on the main thread, so doing it in
+ * the synchronous entry point above would block the very event loop that must
+ * resolve those requests. The input is copied before the caller releases it. */
+static void *embeds_from_enc_main(void *arg) {
+    (void)arg;
+    char vocab_path[1024];
+    snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", g_ctx->model_dir);
+    qwen_tokenizer_t *tok = qwen_tokenizer_load(vocab_path);
+    free(g_emb);
+    g_emb = NULL;
+    g_emb_seq = 0;
+    if (tok) {
+        g_emb = qwen_assemble_embeds(g_ctx, tok, g_emb_enc_output,
+                                     g_emb_enc_seq, NULL, 0, &g_emb_seq);
+        qwen_tokenizer_free(tok);
+    }
+    g_emb_done = 1;
+    return NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int qwen_wasm_embeds_from_enc_start(const float *enc_output, int enc_seq_len) {
+    if (!g_ctx || !enc_output || enc_seq_len <= 0 || g_emb_running) return -1;
+    size_t n = (size_t)enc_seq_len * g_ctx->config.dec_hidden;
+    free(g_emb_enc_output);
+    g_emb_enc_output = (float *)malloc(n * sizeof(float));
+    if (!g_emb_enc_output) return -1;
+    memcpy(g_emb_enc_output, enc_output, n * sizeof(float));
+    g_emb_enc_seq = enc_seq_len;
+    g_emb_done = 0;
+    if (pthread_create(&g_emb_thread, NULL, embeds_from_enc_main, NULL) != 0) {
+        free(g_emb_enc_output);
+        g_emb_enc_output = NULL;
+        g_emb_enc_seq = 0;
+        return -1;
+    }
+    g_emb_running = 1;
+    return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int qwen_wasm_embeds_from_enc_done(void) {
+    return qwen_wasm_embeds_done();
+}
+
+EMSCRIPTEN_KEEPALIVE
+int qwen_wasm_embeds_from_enc_finish(void) {
+    return qwen_wasm_embeds_finish();
 }
 
 /* ---- CPU prefill, so the GPU only has to run generation ----

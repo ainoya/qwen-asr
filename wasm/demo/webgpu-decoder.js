@@ -616,6 +616,29 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 }
 `;
 
+/* Batched form used only for prompt assembly readback. Token ids occupy
+ * tok[0..n), rows are written contiguously to the alternate activation bind.
+ * gid.y is bounded by the dispatch, so no extra uniform is needed. */
+const EMBED_BATCH_WGSL = HEADER + `
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let w = gid.x;
+  let i = gid.y;
+  let nwords = P.cols / 4u;
+  if (w >= nwords) { return; }
+  let tid = tok[i];
+  if (tid < P.b || tid >= P.b + P.c) { return; }
+  let row = tid - P.b;
+  let sc = scales[P.scaleBase + row * (P.cols / 64u) + (w / 16u)] * 127.0;
+  let q = unpack4x8snorm(quants[P.wordBase + row * nwords + w]) * sc;
+  let o = P.yOff + i * P.cols + w * 4u;
+  act[o] = q.x;
+  act[o + 1u] = q.y;
+  act[o + 2u] = q.z;
+  act[o + 3u] = q.w;
+}
+`;
+
 const ARGMAX_WGSL = HEADER + `
 const WG : u32 = 256u;
 var<workgroup> rv : array<f32, WG>;
@@ -1777,6 +1800,7 @@ export class WebGPUDecoder {
       preApply: mk(PRE_APPLY_WGSL, "preApply"),
       preExtract: mk(PRE_EXTRACT_WGSL, "preExtract"),
       embed: mk(EMBED_WGSL, "embed"),
+      embedBatch: mk(EMBED_BATCH_WGSL, "embedBatch"),
       argmax: mk(ARGMAX_WGSL, "argmax"),
     };
 
@@ -2474,6 +2498,79 @@ export class WebGPUDecoder {
              totalMs: total,
              rows: rows.map(([label, ms]) =>
                ({ label, ms: +ms.toFixed(3), pct: +(100 * ms / total).toFixed(1) })) };
+  }
+
+  /* Initialize the small parameter arena and separate output/readback buffers
+   * used for token embedding lookups. Call this once after init(), before any
+   * live decoder context exists; later lookups do not touch the activation or
+   * KV buffers, so streaming suffix-prefill state remains intact. */
+  prepareEmbeddingLookup(rows = 1) {
+    if (!this.off) this.prepareContext(1, 0, { prefillSeq: 1 });
+    if (rows > this.tokWords) throw new Error(`embedding batch ${rows} exceeds ${this.tokWords}`);
+    if (!this.embedRows || rows > this.embedRows) {
+      let cap = this.embedRows || 16;
+      while (cap < rows) cap *= 2;
+      if (this.bufEmbedOut) this.bufEmbedOut.destroy();
+      if (this.bufEmbedRead) this.bufEmbedRead.destroy();
+      this.bufEmbedOut = this.device.createBuffer({
+        size: cap * this.cfg.hidden * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+      this.bufEmbedRead = this.device.createBuffer({
+        size: cap * this.cfg.hidden * 4,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      this.embedRows = cap;
+    }
+  }
+
+  /* Read rows of Qwen's tied input-embedding / LM-head table in one dispatch
+   * and one map operation. This is used only while C assembles a prompt;
+   * autoregressive generation keeps token ids and lookups entirely on-GPU. */
+  async readTokenEmbeddings(tokenIds) {
+    if (this.lost) throw new Error(`GPU device lost (${this.lost})`);
+    if (!tokenIds.length) return new Float32Array();
+    for (const tokenId of tokenIds)
+      if (!Number.isInteger(tokenId) || tokenId < 0 || tokenId >= this.cfg.vocab)
+        throw new Error(`invalid token id ${tokenId}`);
+    this.prepareEmbeddingLookup(tokenIds.length);
+
+    const { device, cfg, pipe } = this;
+    device.queue.writeBuffer(this.bufTok, 0, new Uint32Array(tokenIds));
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    for (const slot of this.off.embed) {
+      const shard = this.slotShard[slot] | 0;
+      const bind = device.createBindGroup({
+        layout: this._bgl,
+        entries: [
+          { binding: 0, resource: { buffer: this.bufParams, size: PARAM_FIELDS * 4 } },
+          { binding: 1, resource: { buffer: this.bufQuants[shard] } },
+          { binding: 2, resource: { buffer: this.bufScale } },
+          { binding: 3, resource: { buffer: this.bufNorm } },
+          { binding: 4, resource: { buffer: this.bufEmbedOut } },
+          { binding: 5, resource: { buffer: this.bufKV } },
+          { binding: 6, resource: { buffer: this.bufTok } },
+          { binding: 7, resource: { buffer: this.bufScratch } },
+        ],
+      });
+      pass.setPipeline(pipe.embedBatch);
+      pass.setBindGroup(0, bind, [slot * PARAM_STRIDE]);
+      pass.dispatchWorkgroups(Math.ceil((cfg.hidden / 4) / 64), tokenIds.length);
+    }
+    pass.end();
+    const bytes = tokenIds.length * cfg.hidden * 4;
+    enc.copyBufferToBuffer(this.bufEmbedOut, 0, this.bufEmbedRead, 0, bytes);
+    device.queue.submit([enc.finish()]);
+    await this.bufEmbedRead.mapAsync(GPUMapMode.READ, 0, bytes);
+    const out = new Float32Array(
+      this.bufEmbedRead.getMappedRange(0, bytes).slice(0));
+    this.bufEmbedRead.unmap();
+    return out;
+  }
+
+  async readTokenEmbedding(tokenId) {
+    return (await this.readTokenEmbeddings([tokenId])).subarray(0, this.cfg.hidden);
   }
 
   /* Prefill on the GPU from wasm-built embeddings, then generate.

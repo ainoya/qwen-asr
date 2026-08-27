@@ -229,7 +229,10 @@ Three deliberate choices bound what the GPU backend allocates:
 
 And the big one: with the GPU backend the demo no longer materializes the
 decoder's transformer weights in wasm memory at all. The safetensors header is
-parsed in JS, wasm gets a reduced image - **0.68 GB instead of 2.18** - and
+parsed in JS, wasm gets a reduced image - **0.5 MB instead of 2.18 GB**, just
+the decoder norms; the audio tower and the tied embedding / LM head live only
+on the GPU, and prompt assembly reads the few embedding rows it needs back
+through a batched, cached hook - and
 the layer tensors upload to the GPU straight from the OPFS cache (or, where
 OPFS cannot hold the file, from a transient JS-side copy that is dropped once
 the upload finishes). Steady-state browser memory drops by ~1.5 GB. The C

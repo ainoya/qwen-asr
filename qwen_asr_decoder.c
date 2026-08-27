@@ -176,6 +176,11 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
         use_q8 = 1;
         use_q8_embed = 1;
         q8_bytes += qwen_q8_bytes(&dec->tok_embeddings_q8);
+    } else if (qwen_gpu_resident) {
+        /* The reduced image deliberately omits this table. Avoid asking the
+         * ordinary loader for it: a missing-weight diagnostic here would be
+         * noise, not an error. */
+        use_q8_embed = 0;
     } else {
         dec->tok_embeddings_bf16 = load_bf16_direct(ms,
             "thinker.model.embed_tokens.weight");
@@ -184,7 +189,7 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
     dec->quantized = use_q8;
     dec->embed_quantized = use_q8_embed;
 
-    if (use_q8_embed && !embed_prepacked) {
+    if (use_q8_embed && !embed_prepacked && dec->tok_embeddings_bf16) {
         if (qwen_q8_from_bf16(&dec->tok_embeddings_q8, dec->tok_embeddings_bf16,
                               cfg->vocab_size, cfg->dec_hidden) != 0)
             return -1;
@@ -227,7 +232,8 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
         snprintf(name, sizeof(name), "%s.%d.post_attention_layernorm.weight", lp, i);
         l->post_attn_norm = load_f32(ms, name);
 
-        if (embed_prepacked) {
+        if (embed_prepacked ||
+            (qwen_gpu_resident && !dec->tok_embeddings_bf16)) {
             /* Pre-quantized image: point straight at the mapped bytes. */
             struct { const char *suffix; qwen_q8_mat_t *dst; } q8[] = {
                 { "self_attn.q_proj.weight", &l->wq_q8 },

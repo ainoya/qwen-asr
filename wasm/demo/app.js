@@ -257,9 +257,10 @@ async function fetchModelToOpfs(url, total) {
  * wasm memory cannot shrink, so the classic flow - materialize the whole
  * 2.18 GB image in the heap, upload 1.72 GB of it to the GPU - holds both
  * copies forever. Here the safetensors header is parsed in JS, a reduced
- * image (embedding table, norms, encoder; ~0.66 GB) is built for wasm, and
- * the decoder layers upload to the GPU straight from the cached file. */
-const DROP_RE = /^thinker\.model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate_up|down_proj))\.weight\.q8s?$|^thinker\.audio_tower\./;
+ * image containing only the decoder norms is built for wasm. Decoder layers,
+ * the audio tower and the tied embedding / LM head upload straight to the GPU;
+ * prompt assembly reads a small cached set of embedding rows back on demand. */
+const DROP_RE = /^thinker\.model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate_up|down_proj))\.weight\.q8s?$|^thinker\.model\.embed_tokens\.weight\.q8s?$|^thinker\.audio_tower\./;
 
 /* Random-access source for the packed model: the OPFS cache when it can hold
  * the file, else a JS ArrayBuffer held only until the GPU upload finishes -
@@ -329,7 +330,7 @@ async function loadGpuResident(url, total, threads) {
   const header = JSON.parse(new TextDecoder().decode(asU8(await read(8, hlen))));
   const dataBase = 8 + hlen;
 
-  /* Reduced image: same format, decoder-layer tensors left out. */
+  /* Reduced image: same format, GPU-owned tensors left out. */
   const kept = Object.entries(header)
     .filter(([name]) => name !== "__metadata__" && !DROP_RE.test(name))
     .sort((a, b) => a[1].data_offsets[0] - b[1].data_offsets[0]);
@@ -348,7 +349,10 @@ async function loadGpuResident(url, total, threads) {
   hjson = padded;
 
   const reducedLen = 8 + hjson.length + dataOff;
-  setStatus(`building the reduced image (${(reducedLen / 1e9).toFixed(2)} GB in wasm)...`);
+  const reducedSize = reducedLen < 100e6
+    ? `${(reducedLen / 1e6).toFixed(1)} MB`
+    : `${(reducedLen / 1e9).toFixed(2)} GB`;
+  setStatus(`building the reduced image (${reducedSize} in wasm)...`);
   const ptr = P(Module._qwen_wasm_alloc(reducedLen));
   if (!ptr) throw new Error(`could not allocate ${reducedLen} bytes of wasm memory`);
   const heap = Module.HEAPU8;
@@ -452,7 +456,7 @@ async function loadGpuResident(url, total, threads) {
   Module._qwen_wasm_release(dir);
   if (rc !== 0) throw new Error("qwen_wasm_init failed on the reduced image");
   gpuResidentActive = true;
-  log(`gpu-resident load: ${(reducedLen / 1e9).toFixed(2)} GB in wasm instead of ${(total / 1e9).toFixed(2)} GB`);
+  log(`gpu-resident load: ${reducedSize} in wasm instead of ${(total / 1e9).toFixed(2)} GB`);
 }
 
 $("load").onclick = async () => {
@@ -518,6 +522,54 @@ $("load").onclick = async () => {
         await gpu.init((m) => setStatus(m));
         gpu.weightSource = null;
         log(`GPU decoder ready (${(gpu.weightBytes / 1e9).toFixed(2)} GB resident on the GPU)`);
+
+        /* The input embedding and LM head are one tied Qwen matrix. Keep that
+         * 311 MB table only on the GPU and cache the few rows C asks for while
+         * assembling prompts. The cache is bounded (~2 MB for the 1.7B model)
+         * and an LRU refresh keeps streaming-prefix vocabulary hot. */
+        gpu.prepareEmbeddingLookup();
+        const embedCache = new Map();
+        const EMBED_CACHE_ROWS = 256;
+        Module.__gpuEmbedMany = async (idsPtr, n, dst, dim, req) => {
+          try {
+            idsPtr = idsPtr >>> 0;
+            dst = dst >>> 0;
+            /* Copy before await: the ids live in a worker-owned stack frame. */
+            const ids = new Int32Array(Module.HEAPU8.buffer, idsPtr, n).slice();
+            const missing = [];
+            const seen = new Set();
+            for (const id of ids) {
+              if (!embedCache.has(id) && !seen.has(id)) {
+                seen.add(id);
+                missing.push(id);
+              }
+            }
+            const fresh = new Map();
+            if (missing.length) {
+              const rows = await gpu.readTokenEmbeddings(missing);
+              if (rows.length !== missing.length * dim)
+                throw new Error(`embedding batch width ${rows.length}, expected ${missing.length * dim}`);
+              for (let i = 0; i < missing.length; i++)
+                fresh.set(missing[i], rows.slice(i * dim, (i + 1) * dim));
+            }
+            const base = f32idx(dst);
+            for (let i = 0; i < ids.length; i++) {
+              const id = ids[i];
+              const row = embedCache.get(id) || fresh.get(id);
+              if (!row) throw new Error(`embedding row ${id} unavailable`);
+              Module.HEAPF32.set(row, base + i * dim);
+              if (embedCache.has(id)) embedCache.delete(id);
+              embedCache.set(id, row);
+              if (embedCache.size > EMBED_CACHE_ROWS)
+                embedCache.delete(embedCache.keys().next().value);
+            }
+            Module._qwen_wasm_embed_hook_done(req, 1);
+          } catch (err) {
+            console.error("gpu embedding hook:", err);
+            Module._qwen_wasm_embed_hook_done(req, 0);
+          }
+        };
+        Module._qwen_wasm_set_gpu_embedder(1);
 
         /* The audio tower is optional: if it will not start, mel and the
          * encoder stay in wasm and only the decoder moves. */
@@ -699,8 +751,13 @@ async function runBatch(bytes, label) {
         const ep = P(Module._qwen_wasm_alloc(encOut.byteLength));
         if (!ep) throw new Error("out of wasm memory for the encoder output");
         Module.HEAPF32.set(encOut, f32idx(ep));
-        seq = Module._qwen_wasm_embeds_from_enc(ep, encoder.tokens);
+        if (Module._qwen_wasm_embeds_from_enc_start(ep, encoder.tokens) !== 0) {
+          Module._qwen_wasm_release(ep);
+          throw new Error("prompt assembly failed to start");
+        }
         Module._qwen_wasm_release(ep);
+        await until(() => Module._qwen_wasm_embeds_from_enc_done());
+        seq = Module._qwen_wasm_embeds_from_enc_finish();
         if (!seq) throw new Error("prompt assembly failed");
       } else {
         if (Module._qwen_wasm_embeds_start(ptr, samples.length) !== 0)
@@ -745,8 +802,10 @@ async function runBatch(bytes, label) {
         gpu = null; encoder = null;
         Module.__gpuEncode = null;
         Module.__gpuDecode = null;
+        Module.__gpuEmbedMany = null;
         Module._qwen_wasm_set_gpu_encoder(0);
         Module._qwen_wasm_set_gpu_decoder(0);
+        Module._qwen_wasm_set_gpu_embedder(0);
         $("backend").value = "cpu";
         busy = false;
         return runBatch(bytes, label);

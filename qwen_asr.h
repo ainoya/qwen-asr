@@ -211,8 +211,9 @@ extern int qwen_weight_quant;
  * decoder transformer-layer tensors. The browser sets this when the GPU owns
  * those weights: they are uploaded straight from the cached model file, and
  * materializing a second copy in wasm memory - which can never shrink - would
- * hold ~1.5 GB for nothing. The embedding table, norms and encoder still load
- * normally; CPU decode paths fail cleanly if reached. */
+ * hold ~1.5 GB for nothing. The tied embedding can be omitted too when a
+ * qwen_token_embed_hook supplies its rows; norms still load normally and CPU
+ * decode paths fail cleanly if reached. */
 extern int qwen_gpu_resident;
 
 /* ========================================================================
@@ -258,6 +259,18 @@ typedef float *(*qwen_encoder_hook)(void *userdata, const float *mel,
 typedef int (*qwen_decoder_hook)(void *userdata, const float *embeds,
                                  int total_seq, int reuse_len, int max_new,
                                  int *out_tokens);
+
+/* Supply tied token-embedding rows from an external backend.
+ *
+ * The browser keeps the 311 MB Q8 embedding / LM-head table resident on the
+ * GPU. This hook lets prompt assembly fetch the handful of rows it needs, so
+ * the same table does not also have to remain in wasm's non-shrinking heap.
+ * Batching is important because a browser GPU readback has fixed dispatch/map
+ * overhead. Return 0 after writing [n][dim] floats to dst, or -1 to fall back
+ * to a locally loaded table (and fail cleanly when the reduced image has
+ * none). */
+typedef int (*qwen_token_embed_hook)(void *userdata, const int *token_ids,
+                                     int n, float *dst, int dim);
 
 /* ========================================================================
  * Main Context
@@ -305,6 +318,8 @@ typedef struct {
     void *encoder_hook_userdata;
     qwen_decoder_hook decoder_hook;
     void *decoder_hook_userdata;
+    qwen_token_embed_hook token_embed_hook;
+    void *token_embed_hook_userdata;
 
     /* Segmentation settings */
     float segment_sec;             /* 0 = no splitting, default full-audio decode */
@@ -393,6 +408,10 @@ void qwen_set_encoder_hook(qwen_ctx_t *ctx, qwen_encoder_hook fn, void *userdata
 
 /* See qwen_decoder_hook. Used by the interactive streaming loop only. */
 void qwen_set_decoder_hook(qwen_ctx_t *ctx, qwen_decoder_hook fn, void *userdata);
+
+/* See qwen_token_embed_hook. Applies to every prompt/token embedding lookup. */
+void qwen_set_token_embed_hook(qwen_ctx_t *ctx, qwen_token_embed_hook fn,
+                               void *userdata);
 
 /* Set optional system prompt text (UTF-8). Pass NULL or "" to clear.
  * Returns 0 on success, -1 on allocation/encoding errors. */

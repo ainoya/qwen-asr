@@ -45,6 +45,13 @@ void qwen_set_decoder_hook(qwen_ctx_t *ctx, qwen_decoder_hook fn, void *userdata
     ctx->decoder_hook_userdata = userdata;
 }
 
+void qwen_set_token_embed_hook(qwen_ctx_t *ctx, qwen_token_embed_hook fn,
+                               void *userdata) {
+    if (!ctx) return;
+    ctx->token_embed_hook = fn;
+    ctx->token_embed_hook_userdata = userdata;
+}
+
 static const char *QWEN_SUPPORTED_LANGUAGES[] = {
     "Chinese", "English", "Cantonese", "Arabic", "German", "French",
     "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
@@ -419,13 +426,41 @@ static void tok_embed_bf16_to_f32(float *dst, const uint16_t *tok_emb_bf16,
     }
 }
 
-/* Embedding lookup that works for either weight representation. */
-static void tok_embed_lookup(const qwen_decoder_t *dec, float *dst,
-                             int token_id, int dim) {
-    if (dec->embed_quantized)
+/* Embedding lookup that works for an external backend or either local weight
+ * representation. A hook failure may still fall back when a full image is
+ * loaded; a reduced GPU-resident image has no local table and returns -1. */
+static int tok_embed_local(qwen_ctx_t *ctx, float *dst,
+                           int token_id, int dim) {
+    if (token_id < 0 || token_id >= ctx->config.vocab_size) return -1;
+    const qwen_decoder_t *dec = &ctx->decoder;
+    if (dec->embed_quantized && dec->tok_embeddings_q8.q) {
         qwen_q8_row_to_f32(dst, &dec->tok_embeddings_q8, token_id);
-    else
+        return 0;
+    }
+    if (dec->tok_embeddings_bf16) {
         tok_embed_bf16_to_f32(dst, dec->tok_embeddings_bf16, token_id, dim);
+        return 0;
+    }
+    return -1;
+}
+
+static int tok_embed_many(qwen_ctx_t *ctx, float *dst, const int *token_ids,
+                          int n, int dim) {
+    if (n <= 0) return 0;
+    if (ctx->token_embed_hook &&
+        ctx->token_embed_hook(ctx->token_embed_hook_userdata,
+                              token_ids, n, dst, dim) == 0)
+        return 0;
+    for (int i = 0; i < n; i++)
+        if (tok_embed_local(ctx, dst + (size_t)i * dim,
+                            token_ids[i], dim) != 0)
+            return -1;
+    return 0;
+}
+
+static int tok_embed_lookup(qwen_ctx_t *ctx, float *dst,
+                            int token_id, int dim) {
+    return tok_embed_many(ctx, dst, &token_id, 1, dim);
 }
 
 static double get_time_ms(void) {
@@ -681,34 +716,29 @@ float *qwen_assemble_embeds(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer,
     int n_past_prompt_tokens = (n_past_tokens > 0) ? (n_past_tokens + 1) : 0; /* + <asr_text> */
     int total_seq = prefix_len + enc_seq_len + suffix_len + n_past_prompt_tokens;
     float *input_embeds = (float *)malloc((size_t)total_seq * dim * sizeof(float));
-    float *tmp_embed = (float *)malloc(dim * sizeof(float));
-    if (!input_embeds || !tmp_embed) {
+    if (!input_embeds) {
         free(input_embeds);
-        free(tmp_embed);
         return NULL;
     }
 
     /* Embed prefix head: <|im_start|>system\n */
     int off = 0;
-    for (int i = 0; i < PREFIX_HEAD_LEN; i++) {
-        tok_embed_lookup(&ctx->decoder, input_embeds + off * dim,
-                             PROMPT_PREFIX_HEAD[i], dim);
-        off++;
-    }
+    if (tok_embed_many(ctx, input_embeds + (size_t)off * dim,
+                       PROMPT_PREFIX_HEAD, PREFIX_HEAD_LEN, dim) != 0)
+        goto embed_fail;
+    off += PREFIX_HEAD_LEN;
 
     /* Embed optional prompt text (system content) */
-    for (int i = 0; i < ctx->n_prompt_tokens; i++) {
-        tok_embed_lookup(&ctx->decoder, input_embeds + off * dim,
-                             ctx->prompt_tokens[i], dim);
-        off++;
-    }
+    if (tok_embed_many(ctx, input_embeds + (size_t)off * dim,
+                       ctx->prompt_tokens, ctx->n_prompt_tokens, dim) != 0)
+        goto embed_fail;
+    off += ctx->n_prompt_tokens;
 
     /* Embed prefix tail: <|im_end|>\n<|im_start|>user\n<|audio_start|> */
-    for (int i = 0; i < PREFIX_TAIL_LEN; i++) {
-        tok_embed_lookup(&ctx->decoder, input_embeds + off * dim,
-                             PROMPT_PREFIX_TAIL[i], dim);
-        off++;
-    }
+    if (tok_embed_many(ctx, input_embeds + (size_t)off * dim,
+                       PROMPT_PREFIX_TAIL, PREFIX_TAIL_LEN, dim) != 0)
+        goto embed_fail;
+    off += PREFIX_TAIL_LEN;
 
     /* Replace audio_pad positions with encoder output */
     for (int i = 0; i < enc_seq_len; i++) {
@@ -719,34 +749,40 @@ float *qwen_assemble_embeds(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer,
 
     /* Embed suffix base: <|audio_end|><|im_end|>\n<|im_start|>assistant\n */
     int suffix_off = prefix_len + enc_seq_len;
-    for (int i = 0; i < SUFFIX_BASE_LEN; i++) {
-        tok_embed_lookup(&ctx->decoder, input_embeds + (suffix_off + i) * dim,
-                             PROMPT_SUFFIX_BASE[i], dim);
-    }
+    if (tok_embed_many(ctx, input_embeds + (size_t)suffix_off * dim,
+                       PROMPT_SUFFIX_BASE, SUFFIX_BASE_LEN, dim) != 0)
+        goto embed_fail;
 
     /* Optional forced-language suffix: "language X" + <asr_text> */
-    for (int i = 0; i < ctx->n_force_prompt_tokens; i++) {
-        tok_embed_lookup(&ctx->decoder, input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
-                             ctx->force_prompt_tokens[i], dim);
-    }
+    if (tok_embed_many(ctx,
+                       input_embeds + (size_t)(suffix_off + SUFFIX_BASE_LEN) * dim,
+                       ctx->force_prompt_tokens, ctx->n_force_prompt_tokens,
+                       dim) != 0)
+        goto embed_fail;
 
     /* Optional past-text conditioning tokens (for segmented mode).
      * Put a fresh <asr_text> marker AFTER the past text so generation
      * restarts from a new ASR span instead of terminating immediately. */
     int past_off = suffix_off + suffix_len;
-    for (int i = 0; i < n_past_tokens; i++) {
-        tok_embed_lookup(&ctx->decoder, input_embeds + (past_off + i) * dim,
-                             past_tokens[i], dim);
-    }
+    if (tok_embed_many(ctx, input_embeds + (size_t)past_off * dim,
+                       past_tokens, n_past_tokens, dim) != 0)
+        goto embed_fail;
     if (n_past_tokens > 0) {
-        tok_embed_lookup(&ctx->decoder, input_embeds + (past_off + n_past_tokens) * dim,
-                             QWEN_TOKEN_ASR_TEXT, dim);
+        if (tok_embed_lookup(ctx,
+                             input_embeds + (size_t)(past_off + n_past_tokens) * dim,
+                             QWEN_TOKEN_ASR_TEXT, dim) != 0)
+            goto embed_fail;
     }
 
 
     if (out_seq) *out_seq = total_seq;
-    free(tmp_embed);
     return input_embeds;
+
+embed_fail:
+    if (qwen_verbose >= 1)
+        fprintf(stderr, "token embedding lookup failed\n");
+    free(input_embeds);
+    return NULL;
 }
 
 /* Mel + encoder + assembly: the whole path from audio to decoder inputs. */
@@ -944,8 +980,11 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
         }
 
         /* Embed and generate next token */
-        tok_embed_lookup(&ctx->decoder, tmp_embed,
-                             token, dim);
+        if (tok_embed_lookup(ctx, tmp_embed, token, dim) != 0) {
+            free(tmp_embed);
+            free(text);
+            return NULL;
+        }
         token = qwen_decoder_forward(ctx, tmp_embed);
     }
 
@@ -1204,8 +1243,10 @@ static int decode_segment_group(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer,
         for (int a = 0; a < n_active; a++) {
             slot_t *sl = &slots[active[a]];
             if (sl->done) continue;
-            tok_embed_lookup(&ctx->decoder, slot_embeds + (size_t)active[a] * dim,
-                             sl->token, dim);
+            if (tok_embed_lookup(ctx,
+                                 slot_embeds + (size_t)active[a] * dim,
+                                 sl->token, dim) != 0)
+                goto done;
         }
     }
 
@@ -1966,6 +2007,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     int prev_prefill_cap = 0;
     int prefill_total_tokens = 0;
     int prefill_reused_tokens = 0;
+    int stream_failed = 0;
 
     while (audio_cursor < audio_n_samples || (live && !live_eof)) {
         /* Live mode: wait until we have enough data for the next chunk. */
@@ -2240,21 +2282,20 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         }
 
         int off = 0;
-        for (int i = 0; i < PREFIX_HEAD_LEN; i++) {
-            tok_embed_lookup(&ctx->decoder, input_embeds + off * dim,
-                             PROMPT_PREFIX_HEAD[i], dim);
-            off++;
-        }
-        for (int i = 0; i < ctx->n_prompt_tokens; i++) {
-            tok_embed_lookup(&ctx->decoder, input_embeds + off * dim,
-                             ctx->prompt_tokens[i], dim);
-            off++;
-        }
-        for (int i = 0; i < PREFIX_TAIL_LEN; i++) {
-            tok_embed_lookup(&ctx->decoder, input_embeds + off * dim,
-                             PROMPT_PREFIX_TAIL[i], dim);
-            off++;
-        }
+        int embed_failed = 0;
+        if (tok_embed_many(ctx, input_embeds + (size_t)off * dim,
+                           PROMPT_PREFIX_HEAD, PREFIX_HEAD_LEN, dim) != 0)
+            embed_failed = 1;
+        off += PREFIX_HEAD_LEN;
+        if (!embed_failed &&
+            tok_embed_many(ctx, input_embeds + (size_t)off * dim,
+                           ctx->prompt_tokens, ctx->n_prompt_tokens, dim) != 0)
+            embed_failed = 1;
+        off += ctx->n_prompt_tokens;
+        if (!embed_failed &&
+            tok_embed_many(ctx, input_embeds + (size_t)off * dim,
+                           PROMPT_PREFIX_TAIL, PREFIX_TAIL_LEN, dim) != 0)
+            embed_failed = 1;
 
         for (int i = 0; i < enc_seq_len; i++)
             memcpy(input_embeds + (prefix_len + i) * dim,
@@ -2263,18 +2304,32 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         enc_output = NULL;
 
         int suffix_off = prefix_len + enc_seq_len;
-        for (int i = 0; i < SUFFIX_BASE_LEN; i++)
-            tok_embed_lookup(&ctx->decoder, input_embeds + (suffix_off + i) * dim,
-                             PROMPT_SUFFIX_BASE[i], dim);
+        if (!embed_failed &&
+            tok_embed_many(ctx, input_embeds + (size_t)suffix_off * dim,
+                           PROMPT_SUFFIX_BASE, SUFFIX_BASE_LEN, dim) != 0)
+            embed_failed = 1;
 
-        for (int i = 0; i < ctx->n_force_prompt_tokens; i++)
-            tok_embed_lookup(&ctx->decoder, input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
-                             ctx->force_prompt_tokens[i], dim);
+        if (!embed_failed &&
+            tok_embed_many(ctx,
+                           input_embeds + (size_t)(suffix_off + SUFFIX_BASE_LEN) * dim,
+                           ctx->force_prompt_tokens, ctx->n_force_prompt_tokens,
+                           dim) != 0)
+            embed_failed = 1;
 
         int text_off = suffix_off + suffix_len;
-        for (int i = 0; i < n_prefix_tokens; i++)
-            tok_embed_lookup(&ctx->decoder, input_embeds + (text_off + i) * dim,
-                             raw_tokens[prefix_offset + i], dim);
+        if (!embed_failed &&
+            tok_embed_many(ctx, input_embeds + (size_t)text_off * dim,
+                           raw_tokens + prefix_offset, n_prefix_tokens,
+                           dim) != 0)
+            embed_failed = 1;
+
+        if (embed_failed) {
+            if (qwen_verbose >= 1)
+                fprintf(stderr, "stream: token embedding lookup failed\n");
+            free(input_embeds);
+            stream_failed = 1;
+            break;
+        }
 
         /* ---- Decoder prefill + first token ---- */
         t0 = get_time_ms();
@@ -2389,9 +2444,17 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
             chunk_tokens[n_chunk_tokens++] = token;
 
-            tok_embed_lookup(&ctx->decoder, tmp_embed,
-                             token, dim);
+            if (tok_embed_lookup(ctx, tmp_embed, token, dim) != 0) {
+                stream_failed = 1;
+                break;
+            }
             token = qwen_decoder_forward(ctx, tmp_embed);
+        }
+
+        if (stream_failed) {
+            free(chunk_tokens);
+            free(hook_ids);
+            break;
         }
 
         double decode_ms = get_time_ms() - t0;
@@ -2752,6 +2815,11 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     qwen_tokenizer_free(tokenizer);
     free(compacted_samples);
     free(local_samples);
+
+    if (stream_failed) {
+        free(result);
+        return NULL;
+    }
 
     /* Trim whitespace */
     size_t rlen = strlen(result);

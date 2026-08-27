@@ -621,8 +621,14 @@ The pool is a hybrid spin/park barrier with work stealing
   ~2.08 GB, below the 2.18 GB image - else a transient JS-side copy in 256 MB
   chunks (one ArrayBuffer caps near 2^31) that is dropped after upload, which
   JS memory, unlike wasm memory, actually returns. The encoder went the same
-  way afterwards - 0.33 GB in wasm, everything but the embedding table and
-  norms on the GPU - which surfaced the one real bug of the exercise: variant
+  way afterwards, and finally the tied embedding / LM head did too: the
+  reduced image is now 0.5 MB of decoder norms, and prompt assembly fetches
+  the few embedding rows it needs back from the GPU through
+  `qwen_set_token_embed_hook` (batched, LRU-cached in JS, ~2 MB; a warm run
+  costs nothing). Offline assembly had to move off the main thread first -
+  `qwen_wasm_embeds_from_enc_start/done/finish` - because a synchronous
+  entry point on the main thread deadlocks against the WebGPU promise it is
+  waiting on. Everything but that cache and the norms on the GPU - which surfaced the one real bug of the exercise: variant
   detection probed only `audio_tower.layers.18`, so an image with no audio
   tower silently detected as 0.6B and every decoder dimension halved into
   garbage. Detection now falls back to the decoder norm width (2048 vs 1024),

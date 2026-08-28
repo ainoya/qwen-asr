@@ -606,9 +606,24 @@ The pool is a hybrid spin/park barrier with work stealing
   exactly those 5 rolled-back tokens before producing ~7 genuinely new ones
   (2 s of Japanese at ~3.4 tokens/s). Verifying 5 of ~12 tokens in one batched
   pass saves ~4 sequential steps of ~15 ms - about 7% of chunk latency for a
-  verification path that must be exactly right. Revisit only if a real draft
-  source appears (a distilled encoder-only head, or Token Map Drafting's
-  n-gram tables, arXiv:2507.21522).
+  verification path that must be exactly right.
+
+  The obvious real draft source - 0.6B drafting for 1.7B - has now been
+  measured too (`tools/draft_acceptance.c`: the target generates greedily,
+  the draft is teacher-forced along that token sequence with its own audio
+  tower, and every position records whether its argmax matched). Acceptance
+  is excellent and is NOT the problem: 87.9% on real Japanese recordings,
+  89.8% on the synthetic Japanese set, 92.9% English; at draft length K=8 a
+  verify accepts ~5.3 tokens. The problem is the cost ratio: measured on the
+  same 45 s clip at the same context, the 0.6B step is 8.3 ms against the
+  1.7B's 20.0 ms - the draft is only 2.4x cheaper, so even with ~90%
+  acceptance the whole-cycle model (K x 8.3 ms + a ~25-32 ms batched verify)
+  yields just 1.1-1.4x, on single-stream generation only. Long-form batched
+  decode is attention-bound (the same reason 4-bit bought nothing there), and
+  the browser adds +0.7 GB GPU for the drafter plus a dispatch-overhead floor
+  under the 0.6B step. SpecASR's 3x results come from pairs where the draft
+  is an order of magnitude cheaper; this pair is not that. Still deferred -
+  now with the acceptance data to prove it is the economics, not the models.
 - ~~**The browser's double retention**~~ Done for the decoder layers, the bulk
   of it: with the GPU backend the demo parses the safetensors header in JS,
   builds a reduced image without the transformer-layer tensors (0.68 GB in

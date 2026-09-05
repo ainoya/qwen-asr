@@ -1,0 +1,195 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Automated WebGPU Test</title>
+</head>
+<body style="background:#12141a;color:#fff;font-family:sans-serif;padding:20px;">
+<h2>Automated WebGPU Test Runner</h2>
+<div id="status">Starting...</div>
+<pre id="log"></pre>
+
+<script src="qwen_asr.js"></script>
+<script type="module">
+import { WebGPUDecoder } from "./webgpu-decoder.js";
+import { WebGPUEncoder } from "./webgpu-encoder.js";
+import { until } from "./tick.js";
+
+const MODEL_BASE = "../../qwen3-asr-1.7b-q8";
+const logEl = document.getElementById("log");
+const statusEl = document.getElementById("status");
+
+function log(msg) {
+  console.log(msg);
+  logEl.textContent += msg + "\n";
+}
+
+const P = (x) => x >>> 0;
+function cstr(M, s) {
+  const len = M.lengthBytesUTF8(s) + 1;
+  const p = P(M._qwen_wasm_alloc(len));
+  M.stringToUTF8(s, p, len);
+  return p;
+}
+
+function parseWavMono16k(buf) {
+  const v = new DataView(buf);
+  let off = 12, fmt = null, dataOff = 0, dataSize = 0;
+  while (off + 8 <= buf.byteLength) {
+    const id = String.fromCharCode(v.getUint8(off), v.getUint8(off+1), v.getUint8(off+2), v.getUint8(off+3));
+    const size = v.getUint32(off + 4, true);
+    if (id === "fmt ") {
+      fmt = { channels: v.getUint16(off + 8, true), rate: v.getUint32(off + 10, true), bits: v.getUint16(off + 20, true) };
+    } else if (id === "data") {
+      dataOff = off + 8;
+      dataSize = size;
+      break;
+    }
+    off += 8 + size + (size & 1);
+  }
+  if (!fmt || !dataOff) throw new Error("Invalid WAV");
+  const frames = Math.floor(dataSize / 2 / fmt.channels);
+  const mono = new Float32Array(frames);
+  for (let i = 0; i < frames; i++) {
+    let acc = 0;
+    for (let c = 0; c < fmt.channels; c++) {
+      acc += v.getInt16(dataOff + (i * fmt.channels + c) * 2, true) / 32768;
+    }
+    mono[i] = acc / fmt.channels;
+  }
+  return mono;
+}
+
+async function run() {
+  try {
+    statusEl.textContent = "Probing WebGPU...";
+    const probe = await WebGPUDecoder.probe();
+    if (!probe.ok) throw new Error("WebGPU probe failed: " + probe.why);
+    log(`[TEST] WebGPU available: adapter ${probe.info.vendor || "?"} ${probe.info.architecture || ""}`);
+
+    statusEl.textContent = "Loading WASM...";
+    const M = await createQwenASR();
+    M.FS.mkdirTree("/model");
+    for (const f of ["vocab.json", "merges.txt"]) {
+      const r = await fetch(`${MODEL_BASE}/${f}`);
+      M.FS.writeFile(`/model/${f}`, new Uint8Array(await r.arrayBuffer()));
+    }
+    const head = await fetch(`${MODEL_BASE}/qwen-asr-q8.bin`, { method: "HEAD" });
+    const total = Number(head.headers.get("content-length"));
+    log(`[TEST] Fetching ${(total / 1e9).toFixed(2)} GB model...`);
+    const ptr = P(M._qwen_wasm_alloc(total));
+    const res = await fetch(`${MODEL_BASE}/qwen-asr-q8.bin`);
+    const rd = res.body.getReader();
+    let o = 0;
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      M.HEAPU8.set(value, ptr + o);
+      o += value.length;
+    }
+    const threads = 4;
+    const dir = cstr(M, "/model");
+    if (M._qwen_wasm_init(ptr, total, dir, threads, 0) !== 0) throw new Error("wasm init failed");
+    M._qwen_wasm_release(dir);
+    log(`[TEST] WASM engine ready, threads=${M._qwen_wasm_threads()}`);
+
+    statusEl.textContent = "Initializing WebGPU Decoder...";
+    const gpu = new WebGPUDecoder(M);
+    gpu.kvF16Pref = false;
+    await gpu.init((m) => log("  [decoder-init] " + m));
+    log(`[TEST] WebGPUDecoder initialized successfully!`);
+
+    statusEl.textContent = "Testing Audio Transcription...";
+    const audioRes = await fetch("../../samples/jfk.wav");
+    const audioBuf = await audioRes.arrayBuffer();
+    const samples = parseWavMono16k(audioBuf);
+    log(`[TEST] Loaded audio sample: ${samples.length} samples (${(samples.length / 16000).toFixed(1)}s)`);
+
+    const sp = P(M._qwen_wasm_alloc(samples.length * 4));
+    M.HEAPF32.set(samples, sp / 4);
+
+    // Compute embeds
+    const t0 = performance.now();
+    if (M._qwen_wasm_embeds_start(sp, samples.length) !== 0) throw new Error("embeds start failed");
+    await until(() => M._qwen_wasm_embeds_done());
+    const seq = M._qwen_wasm_embeds_finish();
+    if (!seq) throw new Error("embeds failed");
+    const embPtr = P(M._qwen_wasm_embeds_ptr());
+    const embMs = performance.now() - t0;
+    log(`[TEST] Embeds computed: seq=${seq} in ${embMs.toFixed(0)}ms`);
+
+    // GPU Prefill and Generation
+    // JFK Audio
+    log(`\n=== JFK (English 11s) ===`);
+    let t1 = performance.now();
+    let genResult = await gpu.prefillAndGenerate(embPtr, seq, 256, null);
+    let genMs = performance.now() - t1;
+    log(`[TEST] GPU Generation finished in ${genMs.toFixed(0)}ms:`);
+    log(`[TRANSCRIPTION] ${genResult.text}`);
+    log(`[TOKENS] ${genResult.tokens} tokens (${(genMs / Math.max(1, genResult.tokens - 1)).toFixed(1)} ms/tok)`);
+
+    M._qwen_wasm_release(sp);
+
+    // Validate transcript
+    const cleanText = genResult.text.toLowerCase();
+    if (!cleanText.includes("country") && !cleanText.includes("ask not")) {
+      throw new Error("Transcription result did not match expected JFK speech content: " + genResult.text);
+    }
+
+    // Japanese Audio
+    log(`\n=== JA Bench (Japanese 41s) ===`);
+    const jaRes = await fetch("../../samples/extra/ja_bench.wav");
+    const jaBuf = await jaRes.arrayBuffer();
+    const jaSamples = parseWavMono16k(jaBuf);
+    log(`[TEST] Loaded JA audio: ${jaSamples.length} samples (${(jaSamples.length / 16000).toFixed(1)}s)`);
+
+    const spJa = P(M._qwen_wasm_alloc(jaSamples.length * 4));
+    M.HEAPF32.set(jaSamples, spJa / 4);
+
+    const tJa0 = performance.now();
+    if (M._qwen_wasm_embeds_start(spJa, jaSamples.length) !== 0) throw new Error("JA embeds start failed");
+    await until(() => M._qwen_wasm_embeds_done());
+    const seqJa = M._qwen_wasm_embeds_finish();
+    if (!seqJa) throw new Error("JA embeds failed");
+    const embPtrJa = P(M._qwen_wasm_embeds_ptr());
+    const embMsJa = performance.now() - tJa0;
+    log(`[TEST] JA Embeds computed: seq=${seqJa} in ${embMsJa.toFixed(0)}ms`);
+
+    const tJa1 = performance.now();
+    const genResultJa = await gpu.prefillAndGenerate(embPtrJa, seqJa, 512, null);
+    const genMsJa = performance.now() - tJa1;
+    log(`[TEST] JA GPU Generation finished in ${genMsJa.toFixed(0)}ms:`);
+    log(`[TRANSCRIPTION JA] ${genResultJa.text}`);
+    log(`[TOKENS JA] ${genResultJa.tokens} tokens (${(genMsJa / Math.max(1, genResultJa.tokens - 1)).toFixed(1)} ms/tok)`);
+
+    M._qwen_wasm_release(spJa);
+
+    if (genResultJa.tokens < 10) {
+      throw new Error("Japanese transcription generated too few tokens: " + genResultJa.text);
+    }
+
+    statusEl.textContent = "PASS";
+    window.__TEST_RESULT = {
+      ok: true,
+      text: genResult.text,
+      tokens: genResult.tokens,
+      genMs: genMs,
+      embMs: embMs
+    };
+    log("[TEST_RESULT:PASS]");
+  } catch (err) {
+    statusEl.textContent = "FAIL: " + err.message;
+    console.error("[TEST_ERROR]", err);
+    log("[TEST_RESULT:FAIL] " + (err.stack || err.message));
+    window.__TEST_RESULT = {
+      ok: false,
+      error: err.message,
+      stack: err.stack
+    };
+  }
+}
+
+window.addEventListener("DOMContentLoaded", run);
+</script>
+</body>
+</html>

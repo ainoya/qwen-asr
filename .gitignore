@@ -17,3 +17,4 @@ wasm/demo/qwen_asr.js
 wasm/demo/qwen_asr.wasm
 wasm/demo/*.worker.js
 wasm/demo/golden/
+scratch/

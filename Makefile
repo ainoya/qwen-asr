@@ -113,6 +113,9 @@ bench-plot:
 bench-record:
 	python3 tools/benchmark.py --record
 
+test-webgpu:
+	node tools/run-webgpu-test.mjs
+
 # =============================================================================
 # Dependencies
 # =============================================================================

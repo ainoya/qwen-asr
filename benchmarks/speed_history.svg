@@ -1,0 +1,187 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 640" width="1020" height="640">
+  <defs>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+      .title { font-size: 20px; font-weight: 700; fill: #f0f6fc; }
+      .subtitle { font-size: 13px; fill: #8b949e; }
+      .panel-title { font-size: 14px; font-weight: 600; fill: #f0f6fc; }
+      .axis-lbl { font-size: 11px; fill: #8b949e; text-anchor: middle; }
+      .y-lbl { font-size: 11px; fill: #8b949e; text-anchor: end; }
+      .legend { font-size: 11px; font-weight: 500; }
+      .badge-txt { font-size: 12px; font-weight: 600; fill: #f0f6fc; }
+      .val-lbl { font-size: 10px; font-weight: 600; text-anchor: middle; }
+    </style>
+  </defs>
+
+  <rect width="1020" height="640" fill="#0d1117"/>
+
+  <text x="40" y="36" class="title">Qwen-ASR Optimization Benchmark History</text>
+  <text x="40" y="56" class="subtitle">Commit-by-commit speed, latency, and memory progression on WebGPU / Browser (1.7B Model)</text>
+
+  <g transform="translate(560, 18)">
+    <rect width="130" height="42" rx="6" fill="#161b22" stroke="#30363d"/>
+    <text x="65" y="18" text-anchor="middle" font-size="10" fill="#8b949e">REALTIME FACTOR</text>
+    <text x="65" y="34" text-anchor="middle" class="badge-txt" fill="#58a6ff">5.95x (11s clip)</text>
+
+    <rect x="140" width="130" height="42" rx="6" fill="#161b22" stroke="#30363d"/>
+    <text x="205" y="18" text-anchor="middle" font-size="10" fill="#8b949e">DECODE LATENCY</text>
+    <text x="205" y="34" text-anchor="middle" class="badge-txt" fill="#d29922">14.8 ms / tok</text>
+
+    <rect x="280" width="140" height="42" rx="6" fill="#161b22" stroke="#30363d"/>
+    <text x="350" y="18" text-anchor="middle" font-size="10" fill="#8b949e">WASM HEAP MEMORY</text>
+    <text x="350" y="34" text-anchor="middle" class="badge-txt" fill="#f778ba">330 MB (-85%)</text>
+  </g>
+
+
+  <rect x="40" y="80" width="530" height="250" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="56" y="104" class="panel-title">End-to-End Transcription Time (seconds)</text>
+  <circle cx="400" cy="100" r="4" fill="#58a6ff"/>
+  <text x="410" y="104" class="legend" fill="#58a6ff">11s English</text>
+  <circle cx="480" cy="100" r="4" fill="#3fb950"/>
+  <text x="490" y="104" class="legend" fill="#3fb950">41s Japanese</text>
+
+  <line x1="85" y1="300.0" x2="555" y2="300.0" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="77" y="304.0" class="y-lbl">0s</text>
+  <line x1="85" y1="256.25" x2="555" y2="256.25" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="77" y="260.25" class="y-lbl">4s</text>
+  <line x1="85" y1="212.5" x2="555" y2="212.5" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="77" y="216.5" class="y-lbl">8s</text>
+  <line x1="85" y1="168.75" x2="555" y2="168.75" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="77" y="172.75" class="y-lbl">12s</text>
+  <line x1="85" y1="125.0" x2="555" y2="125.0" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="77" y="129.0" class="y-lbl">16s</text>
+  <path d="M 85.0,139.21875 L 179.0,175.3125 L 273.0,178.59375 L 367.0,186.25 L 461.0,195.0 L 555.0,203.75" fill="none" stroke="#3fb950" stroke-width="2.5"/>
+  <circle cx="85.0" cy="139.21875" r="5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+  <text x="85.0" y="130.21875" class="val-lbl" fill="#3fb950">14.7s (2.79x)</text>
+  <circle cx="179.0" cy="175.3125" r="5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+  <text x="179.0" y="166.3125" class="val-lbl" fill="#3fb950">11.4s (3.6x)</text>
+  <circle cx="273.0" cy="178.59375" r="5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+  <text x="273.0" y="169.59375" class="val-lbl" fill="#3fb950">11.1s (3.69x)</text>
+  <circle cx="367.0" cy="186.25" r="5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+  <text x="367.0" y="177.25" class="val-lbl" fill="#3fb950">10.4s (3.94x)</text>
+  <circle cx="461.0" cy="195.0" r="5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+  <text x="461.0" y="186.0" class="val-lbl" fill="#3fb950">9.6s (4.27x)</text>
+  <circle cx="555.0" cy="203.75" r="5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+  <text x="555.0" y="194.75" class="val-lbl" fill="#3fb950">8.8s (4.66x)</text>
+  <path d="M 85.0,262.046875 L 179.0,273.859375 L 273.0,274.296875 L 367.0,276.15625 L 461.0,277.578125 L 555.0,279.765625" fill="none" stroke="#58a6ff" stroke-width="2.5"/>
+  <circle cx="85.0" cy="262.046875" r="5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+  <text x="85.0" y="253.046875" class="val-lbl" fill="#58a6ff">3.47s (3.17x)</text>
+  <circle cx="179.0" cy="273.859375" r="5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+  <text x="179.0" y="264.859375" class="val-lbl" fill="#58a6ff">2.39s (4.6x)</text>
+  <circle cx="273.0" cy="274.296875" r="5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+  <text x="273.0" y="265.296875" class="val-lbl" fill="#58a6ff">2.35s (4.68x)</text>
+  <circle cx="367.0" cy="276.15625" r="5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+  <text x="367.0" y="267.15625" class="val-lbl" fill="#58a6ff">2.18s (5.05x)</text>
+  <circle cx="461.0" cy="277.578125" r="5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+  <text x="461.0" y="268.578125" class="val-lbl" fill="#58a6ff">2.05s (5.37x)</text>
+  <circle cx="555.0" cy="279.765625" r="5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+  <text x="555.0" y="270.765625" class="val-lbl" fill="#58a6ff">1.85s (5.95x)</text>
+  <text x="85.0" y="318" class="axis-lbl">wasm-base</text>
+  <text x="179.0" y="318" class="axis-lbl">25215fb</text>
+  <text x="273.0" y="318" class="axis-lbl">f49f21c</text>
+  <text x="367.0" y="318" class="axis-lbl">caf8753</text>
+  <text x="461.0" y="318" class="axis-lbl">341f5fb</text>
+  <text x="555.0" y="318" class="axis-lbl">ee9a1a6</text>
+
+  <rect x="586" y="80" width="394" height="250" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="602" y="104" class="panel-title">Decode Step Latency (ms / token)</text>
+  <text x="602" y="120" class="subtitle">Memory-bandwidth &amp; kernel reduction bound</text>
+
+  <line x1="631" y1="300.0" x2="965" y2="300.0" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="623" y="304.0" class="y-lbl">0</text>
+  <line x1="631" y1="250.5" x2="965" y2="250.5" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="623" y="254.5" class="y-lbl">15</text>
+  <line x1="631" y1="201.0" x2="965" y2="201.0" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="623" y="205.0" class="y-lbl">30</text>
+  <line x1="631" y1="151.5" x2="965" y2="151.5" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="623" y="155.5" class="y-lbl">45</text>
+  <path d="M 631.0,151.5 L 697.8,219.15 L 764.6,222.45 L 831.4,227.4 L 898.2,243.24 L 965.0,251.16" fill="none" stroke="#d29922" stroke-width="2.5"/>
+  <circle cx="631.0" cy="151.5" r="5" fill="#0d1117" stroke="#d29922" stroke-width="2.5"/>
+  <text x="631.0" y="142.5" class="val-lbl" fill="#d29922">45.0ms</text>
+  <circle cx="697.8" cy="219.15" r="5" fill="#0d1117" stroke="#d29922" stroke-width="2.5"/>
+  <text x="697.8" y="210.15" class="val-lbl" fill="#d29922">24.5ms</text>
+  <circle cx="764.6" cy="222.45" r="5" fill="#0d1117" stroke="#d29922" stroke-width="2.5"/>
+  <text x="764.6" y="213.45" class="val-lbl" fill="#d29922">23.5ms</text>
+  <circle cx="831.4" cy="227.4" r="5" fill="#0d1117" stroke="#d29922" stroke-width="2.5"/>
+  <text x="831.4" y="218.4" class="val-lbl" fill="#d29922">22.0ms</text>
+  <circle cx="898.2" cy="243.24" r="5" fill="#0d1117" stroke="#d29922" stroke-width="2.5"/>
+  <text x="898.2" y="234.24" class="val-lbl" fill="#d29922">17.2ms</text>
+  <circle cx="965.0" cy="251.16" r="5" fill="#0d1117" stroke="#d29922" stroke-width="2.5"/>
+  <text x="965.0" y="242.16" class="val-lbl" fill="#d29922">14.8ms</text>
+  <text x="631.0" y="318" class="axis-lbl">wasm-base</text>
+  <text x="697.8" y="318" class="axis-lbl">25215fb</text>
+  <text x="764.6" y="318" class="axis-lbl">f49f21c</text>
+  <text x="831.4" y="318" class="axis-lbl">caf8753</text>
+  <text x="898.2" y="318" class="axis-lbl">341f5fb</text>
+  <text x="965.0" y="318" class="axis-lbl">ee9a1a6</text>
+
+  <rect x="40" y="345" width="530" height="250" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="56" y="369" class="panel-title">Prefill GEMM Latency (41s clip, seq=549)</text>
+  <text x="56" y="385" class="subtitle">Compute-bound prompt processing time</text>
+
+  <line x1="95" y1="565.0" x2="550" y2="565.0" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="87" y="569.0" class="y-lbl">0ms</text>
+  <line x1="95" y1="523.75" x2="550" y2="523.75" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="87" y="527.75" class="y-lbl">2000ms</text>
+  <line x1="95" y1="482.5" x2="550" y2="482.5" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="87" y="486.5" class="y-lbl">4000ms</text>
+  <line x1="95" y1="441.25" x2="550" y2="441.25" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="87" y="445.25" class="y-lbl">6000ms</text>
+  <line x1="95" y1="400.0" x2="550" y2="400.0" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="87" y="404.0" class="y-lbl">8000ms</text>
+  <path d="M 95.0,420.00625 L 186.0,514.675 L 277.0,515.5 L 368.0,516.53125 L 459.0,533.03125 L 550.0,535.7125" fill="none" stroke="#bc8cff" stroke-width="2.5"/>
+  <circle cx="95.0" cy="420.00625" r="5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+  <text x="95.0" y="411.00625" class="val-lbl" fill="#bc8cff">7030ms</text>
+  <circle cx="186.0" cy="514.675" r="5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+  <text x="186.0" y="505.67499999999995" class="val-lbl" fill="#bc8cff">2440ms</text>
+  <circle cx="277.0" cy="515.5" r="5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+  <text x="277.0" y="506.5" class="val-lbl" fill="#bc8cff">2400ms</text>
+  <circle cx="368.0" cy="516.53125" r="5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+  <text x="368.0" y="507.53125" class="val-lbl" fill="#bc8cff">2350ms</text>
+  <circle cx="459.0" cy="533.03125" r="5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+  <text x="459.0" y="524.03125" class="val-lbl" fill="#bc8cff">1550ms</text>
+  <circle cx="550.0" cy="535.7125" r="5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+  <text x="550.0" y="526.7125" class="val-lbl" fill="#bc8cff">1420ms</text>
+  <text x="95.0" y="583" class="axis-lbl">wasm-base</text>
+  <text x="186.0" y="583" class="axis-lbl">25215fb</text>
+  <text x="277.0" y="583" class="axis-lbl">f49f21c</text>
+  <text x="368.0" y="583" class="axis-lbl">caf8753</text>
+  <text x="459.0" y="583" class="axis-lbl">341f5fb</text>
+  <text x="550.0" y="583" class="axis-lbl">ee9a1a6</text>
+
+  <rect x="586" y="345" width="394" height="250" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="602" y="369" class="panel-title">WASM Heap Memory Footprint (MB)</text>
+  <text x="602" y="385" class="subtitle">Offloading to GPU storage buffers reduces CPU memory</text>
+
+  <line x1="636" y1="565.0" x2="960" y2="565.0" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="628" y="569.0" class="y-lbl">0MB</text>
+  <line x1="636" y1="532.0" x2="960" y2="532.0" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="628" y="536.0" class="y-lbl">500MB</text>
+  <line x1="636" y1="499.0" x2="960" y2="499.0" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="628" y="503.0" class="y-lbl">1000MB</text>
+  <line x1="636" y1="466.0" x2="960" y2="466.0" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="628" y="470.0" class="y-lbl">1500MB</text>
+  <line x1="636" y1="433.0" x2="960" y2="433.0" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="628" y="437.0" class="y-lbl">2000MB</text>
+  <path d="M 636.0,421.12 L 700.8,421.12 L 765.6,520.12 L 830.4,543.22 L 895.2,543.22 L 960.0,543.22" fill="none" stroke="#f778ba" stroke-width="2.5"/>
+  <circle cx="636.0" cy="421.12" r="5" fill="#0d1117" stroke="#f778ba" stroke-width="2.5"/>
+  <text x="636.0" y="412.12" class="val-lbl" fill="#f778ba">2180MB</text>
+  <circle cx="700.8" cy="421.12" r="5" fill="#0d1117" stroke="#f778ba" stroke-width="2.5"/>
+  <text x="700.8" y="412.12" class="val-lbl" fill="#f778ba">2180MB</text>
+  <circle cx="765.6" cy="520.12" r="5" fill="#0d1117" stroke="#f778ba" stroke-width="2.5"/>
+  <text x="765.6" y="511.12" class="val-lbl" fill="#f778ba">680MB</text>
+  <circle cx="830.4" cy="543.22" r="5" fill="#0d1117" stroke="#f778ba" stroke-width="2.5"/>
+  <text x="830.4" y="534.22" class="val-lbl" fill="#f778ba">330MB</text>
+  <circle cx="895.2" cy="543.22" r="5" fill="#0d1117" stroke="#f778ba" stroke-width="2.5"/>
+  <text x="895.2" y="534.22" class="val-lbl" fill="#f778ba">330MB</text>
+  <circle cx="960.0" cy="543.22" r="5" fill="#0d1117" stroke="#f778ba" stroke-width="2.5"/>
+  <text x="960.0" y="534.22" class="val-lbl" fill="#f778ba">330MB</text>
+  <text x="636.0" y="583" class="axis-lbl">wasm-base</text>
+  <text x="700.8" y="583" class="axis-lbl">25215fb</text>
+  <text x="765.6" y="583" class="axis-lbl">f49f21c</text>
+  <text x="830.4" y="583" class="axis-lbl">caf8753</text>
+  <text x="895.2" y="583" class="axis-lbl">341f5fb</text>
+  <text x="960.0" y="583" class="axis-lbl">ee9a1a6</text>
+
+  <text x="40" y="628" font-size="11" fill="#8b949e">Generated by tools/benchmark.py • Values verified on Apple Silicon / WebGPU pipeline</text>
+</svg>

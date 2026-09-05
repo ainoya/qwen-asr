@@ -65,7 +65,7 @@
     "notes": "SwiGLU fused into gate/up matmuls, SIMD subgroup reductions for row sums, causal tiled V-sum."
   },
   {
-    "commit": "current",
+    "commit": "ee9a1a6",
     "date": "2026-09-05",
     "title": "GPU Tiled Transpose, 2-Stage Argmax, Zero-Alloc Streaming",
     "clip_11s_sec": 1.85,

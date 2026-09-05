@@ -141,6 +141,24 @@ Highlights, each measured (details and the full trial-and-error log in
   guaranteed for small arguments), `dot4I8Packed` avoided (emulated on
   Apple GPUs), and GPU timestamp profiling built in
   (`profileStep`/`profilePrefill`/`profileRun`).
+- **GPU-accelerated tiled transpose for prompt & audio embeddings**:
+  Linear embeddings upload directly from WASM memory to GPU scratch; a
+  16x16 shared-memory tiled compute shader (`TRANSPOSE_EMBEDS_WGSL`) with
+  bank-conflict-free stride-17 padding transposes on the GPU, completely
+  eliminating multi-megabyte JS heap allocations and nested CPU loops.
+- **64-way FTZ-immune 2-stage Argmax**: 16,384 threads across 64 workgroups
+  in Stage 1 and 1 workgroup in Stage 2. Token IDs are preserved as
+  normalized float indices (immune to GPU Flush-To-Zero driver policies
+  that previously zeroed token IDs), separated by compute pass boundaries
+  to eliminate RAW hazard undefined behavior (~13x faster argmax).
+- **Precomputed sinusoidal position embeddings**: Audio tower local positions
+  ($t \in [0..15]$) are precomputed at initialization, replacing ~768,000
+  trigonometric evaluations per chunk with instantaneous table lookups
+  (6.1x faster PE upload).
+- **Persistent Grow-Only buffers & unified device context**: Encoder and
+  decoder share a single `GPUDevice` (~100 MB VRAM saved) and maintain
+  capacity-based buffers across chunks, eliminating buffer destruction and
+  browser GC pause stutters.
 
 **Verification discipline**: `webgpu-golden.html` scores the GPU pipeline
 against 23 reference transcripts dumped by the native engine -
@@ -188,6 +206,15 @@ throw, but writes through a stale view *silently vanish*
   halving the chunk (2 s → 1 s) halves how long words sit unconfirmed on
   screen while staying ahead of realtime (measured 1.19x realtime over a
   full 41 s Japanese stream, zero hook failures).
+- **Zero-allocation streaming pipeline**:
+  Reusing typed arrays (`peBuf`, `melDstBuf`) and Grow-Only GPU buffers
+  (`bufScratch`, `bufAct`) ensures no memory allocations occur during
+  streaming inference. This eliminates browser garbage collection spikes
+  (GC pauses), preventing audio buffer underruns and live-stream stutters.
+- **GPU-accelerated suffix transpose**:
+  Every incremental chunk streams new token embeddings directly to GPU
+  scratch via DMA and transposes them using the shared-memory tiled compute
+  kernel, completely removing CPU loops from the streaming hot path.
 
 ## 6. Quantization research tooling (and the 4-bit verdict)
 

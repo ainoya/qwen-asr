@@ -42,12 +42,16 @@ The short version:
   transcripts; Node harnesses for benchmarking and a 22/22 regression
   suite.
 - **A WebGPU backend** running the *entire* model on the GPU: audio tower,
-  decoder prefill and generation, with subgroup reductions, batched
-  generation steps, suffix prefill for streaming, and SwiGLU fused into
-  the gate/up matmuls. Verified against 23 golden transcripts —
+  decoder prefill and generation, with GPU-accelerated shared-memory tiled
+  transpose, 64-way 2-stage parallel argmax, subgroup reductions, batched
+  generation steps, zero-allocation suffix prefill for streaming, and
+  SwiGLU fused into the gate/up matmuls. Verified against 23 golden transcripts —
   18/23 byte-identical to the CPU decoder.
 - **GPU-resident weights**: the wasm heap keeps **0.5 MB** of the model
   instead of 2.18 GB; browser memory is ~2.3 GB total instead of ~4.4 GB.
+- **Zero-allocation streaming**: persistent typed arrays and Grow-Only
+  GPU buffers eliminate runtime allocations and GC pauses during live
+  streaming.
 - **Quantization research tooling**: activation calibration, AWQ channel
   rescaling, and an opt-in 4-bit mode whose documentation explains, with
   long-form measurements, why it is *not* the default.
@@ -60,9 +64,12 @@ The short version:
 | Path | Workload | Result |
 |---|---|---|
 | Native (M1 Pro, `-S 30 --batch 4`) | 25 min of real speech | **~16x realtime** |
-| Browser WebGPU (throttled tab) | 41 s Japanese clip | **~8x realtime** |
-| Browser WebGPU streaming (1 s chunks) | 41 s stream | 1.19x realtime |
+| Browser WebGPU (11 s English clip) | jfk.wav | **5.95x realtime** (1.85 s) |
+| Browser WebGPU (41 s Japanese clip)| ja_bench.wav | **4.66x realtime** (8.80 s) |
+| Browser WebGPU streaming (1 s chunks) | 41 s stream | **1.19x realtime** (zero GC pauses) |
 | Browser wasm-only (no WebGPU) | English suite in Node | 22/22 at ~3.5x realtime |
+
+See [benchmarks/README.md](benchmarks/README.md) for the commit-by-commit speedup history and plots.
 
 ## Quick start (native)
 
@@ -93,6 +100,7 @@ WebGPU verification pages, and the Node harnesses.
 |---|---|
 | [docs/MANUAL.md](docs/MANUAL.md) | Full usage manual: every CLI option, modes, benchmarks, memory, C API |
 | [docs/EXTENSIONS.md](docs/EXTENSIONS.md) | What this fork adds, with the measurements behind each decision |
+| [benchmarks/README.md](benchmarks/README.md) | Benchmark history, commit-by-commit speedup plots, and measurement guide |
 | [wasm/README.md](wasm/README.md) | Browser/wasm/WebGPU architecture and workflows |
 | [AGENT.md](AGENT.md) | Engineering log: everything tried, measured, kept or rejected |
 | [Original README](https://github.com/antirez/qwen-asr#readme) | The upstream project's own write-up |

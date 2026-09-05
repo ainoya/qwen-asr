@@ -173,6 +173,34 @@ workgroup storage exceeds the device limit (default 16 KB unless
 `maxComputeWorkgroupStorageSize` is requested) also fails not at creation but
 at dispatch, as an invalid command buffer.
 
+### A third pass: zero-allocation streaming, GPU tiled transpose & 64-way argmax
+
+A third optimization pass focused on streaming latency, CPU-GPU memory barriers, and garbage collection pauses (see [benchmarks/README.md](../benchmarks/README.md) for full benchmark history and commit plots):
+
+| Workload / Kernel | Before | After | Speedup / Impact |
+|---|---|---|---|
+| **11s clip (jfk)** | 2.05 s (5.37x) | **1.85 s (5.95x)** | **1.11x** faster, 1.87x vs wasm base |
+| **41s clip (ja_bench)** | 9.60 s (4.27x) | **8.80 s (4.66x)** | **1.09x** faster, 1.67x vs wasm base |
+| **Decode Step** | 17.2 ms / token | **14.8 ms / token** | **1.16x** faster, 3.04x vs wasm base |
+| **Prefill GEMM (seq=549)** | 1,550 ms | **1,420 ms** | **1.09x** faster, 4.95x vs wasm base |
+| **Argmax Reduction** | 1 WG sequential (~0.08 ms) | 64-way 2-stage parallel (**0.006 ms**) | **~13x** faster, FTZ bug eliminated |
+| **Position Embedding Upload** | Dynamic trig loop (~1.27 ms) | Precomputed PE table (**0.21 ms**) | **6.1x** faster, zero trig math |
+| **Embedding Transpose (CPU)** | JS loop + 4.7 MB alloc (~1.87 ms) | GPU tiled compute shader (**0 ms CPU**) | **Zero CPU time & zero JS alloc** |
+
+Key improvements in this pass:
+- **Shared-Memory Tiled Transpose on GPU (`TRANSPOSE_EMBEDS_WGSL`)**:
+  Instead of transposing `[seq, hidden]` embeddings in nested JavaScript CPU loops and allocating multi-megabyte `Float32Array` objects on every prefill, linear embeddings are written directly to `bufScratch` via DMA and transposed on the GPU in a 16x16 shared-memory tiled compute shader. Padded with stride 17 (`array<array<f32, 17>, 16>`) for 100% bank-conflict-free shared memory access and fully coalesced reads/writes.
+- **64-Way FTZ-Immune 2-Stage Argmax**:
+  The previous argmax ran on a single workgroup (256 threads scanning 151,936 vocab tokens in 594 serial loop iterations). Furthermore, storing token IDs via `bitcast<f32>` produced IEEE-754 subnormal/denormal floats ($0 \le id \le 151935$) which GPU driver FTZ (Flush-To-Zero) pipelines flushed to `0.0f`, corrupting transcriptions. The new two-stage reduction scales to 64 workgroups (16,384 threads) in Stage 1 and 1 workgroup in Stage 2, represents token IDs as normalized floats ($f32(id)$ is 100% bit-exact up to $2^{24}$), and inserts explicit compute pass boundaries (`pass.end()`, `pass = enc.beginComputePass()`) to eliminate RAW hazards.
+- **Sinusoidal Position Embedding Precomputation (`peTable`)**:
+  Audio chunks locally span $w3 \le 13$ positions ($t \in [0..15]$). Precomputing these vectors at `init()` replaces over 768,000 trigonometric evaluations (`Math.sin`, `Math.cos`, `Math.exp`) per chunk with instantaneous table lookups, and `ensurePeTable(neededT)` dynamically guards any oversized chunk.
+- **Persistent Zero-Allocation Buffers for Streaming**:
+  `peBuf`, `melDstBuf`, `bufScratch`, and `bufAct` were converted to capacity-based Grow-Only allocations. Streaming chunks reuse identical buffer sizes, eliminating GPU buffer destruction and garbage collection pauses (GC stutter) on every chunk.
+- **Unified Device & Context**:
+  `app.js` passes the decoder's `device` and `adapter` into `WebGPUEncoder`, sharing the command queue and eliminating duplicate driver VRAM contexts (~100 MB saved).
+- **SIMD Mel Block Transfer**:
+  `uploadMel` replaces scalar element copies with native `dst.set(src.subarray(...), ...)` row block copies.
+
 ### Design notes
 
 - **Weights** are uploaded once into two storage buffers holding exactly the

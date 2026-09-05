@@ -1,0 +1,80 @@
+[
+  {
+    "commit": "wasm-base",
+    "date": "2026-08-20",
+    "title": "Baseline WASM (CPU)",
+    "clip_11s_sec": 3.47,
+    "clip_11s_rtf": 3.17,
+    "clip_41s_sec": 14.7,
+    "clip_41s_rtf": 2.79,
+    "decode_ms_per_tok": 45.0,
+    "prefill_41s_ms": 7030,
+    "wasm_heap_mb": 2180,
+    "notes": "Original multi-threaded WASM implementation running on CPU worker threads."
+  },
+  {
+    "commit": "25215fb",
+    "date": "2026-08-24",
+    "title": "Initial WebGPU Decoder",
+    "clip_11s_sec": 2.39,
+    "clip_11s_rtf": 4.6,
+    "clip_41s_sec": 11.4,
+    "clip_41s_rtf": 3.6,
+    "decode_ms_per_tok": 24.5,
+    "prefill_41s_ms": 2440,
+    "wasm_heap_mb": 2180,
+    "notes": "First WebGPU decoder port with chunked prefill to keep score scratch linear."
+  },
+  {
+    "commit": "f49f21c",
+    "date": "2026-08-25",
+    "title": "GPU-Resident Decoder Weights",
+    "clip_11s_sec": 2.35,
+    "clip_11s_rtf": 4.68,
+    "clip_41s_sec": 11.1,
+    "clip_41s_rtf": 3.69,
+    "decode_ms_per_tok": 23.5,
+    "prefill_41s_ms": 2400,
+    "wasm_heap_mb": 680,
+    "notes": "Sharded Q8 decoder weights resident in WebGPU storage buffers; WASM heap drops to 0.68 GB."
+  },
+  {
+    "commit": "caf8753",
+    "date": "2026-08-26",
+    "title": "GPU-Resident Audio Tower",
+    "clip_11s_sec": 2.18,
+    "clip_11s_rtf": 5.05,
+    "clip_41s_sec": 10.4,
+    "clip_41s_rtf": 3.94,
+    "decode_ms_per_tok": 22.0,
+    "prefill_41s_ms": 2350,
+    "wasm_heap_mb": 330,
+    "notes": "Audio encoder transformer tower moved to WebGPU; WASM heap drops to 0.33 GB."
+  },
+  {
+    "commit": "341f5fb",
+    "date": "2026-08-27",
+    "title": "Fused SwiGLU & Subgroups",
+    "clip_11s_sec": 2.05,
+    "clip_11s_rtf": 5.37,
+    "clip_41s_sec": 9.6,
+    "clip_41s_rtf": 4.27,
+    "decode_ms_per_tok": 17.2,
+    "prefill_41s_ms": 1550,
+    "wasm_heap_mb": 330,
+    "notes": "SwiGLU fused into gate/up matmuls, SIMD subgroup reductions for row sums, causal tiled V-sum."
+  },
+  {
+    "commit": "current",
+    "date": "2026-09-05",
+    "title": "GPU Tiled Transpose, 2-Stage Argmax, Zero-Alloc Streaming",
+    "clip_11s_sec": 1.85,
+    "clip_11s_rtf": 5.95,
+    "clip_41s_sec": 8.8,
+    "clip_41s_rtf": 4.66,
+    "decode_ms_per_tok": 14.8,
+    "prefill_41s_ms": 1420,
+    "wasm_heap_mb": 330,
+    "notes": "Shared-memory bank-conflict-free GPU tiled transpose, 64-way FTZ-immune argmax with pass barriers, precomputed sinusoidal PE, persistent zero-allocation streaming buffers, unified GPUDevice."
+  }
+]

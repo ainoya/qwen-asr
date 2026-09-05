@@ -168,7 +168,8 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
       var v = vec4<f32>(0.0);
       if (row < P.rows) {
         let word = quants[P.wordBase + row * nwords + col0 / 4u];
-        v = vec4<f32>(i8x4(word)) * scales[P.scaleBase + row * nblocks + col0 / 64u];
+        let sc = scales[P.scaleBase + row * nblocks + col0 / 64u] * 127.0;
+        v = unpack4x8snorm(word) * sc;
       }
       let base = rr * TK + wq * 4u;
       ws[base] = v.x; ws[base + 1u] = v.y; ws[base + 2u] = v.z; ws[base + 3u] = v.w;
@@ -552,8 +553,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 const ceilDiv = (a, b) => Math.floor((a + b - 1) / b);
 
 export class WebGPUEncoder {
-  constructor(Module) {
+  constructor(Module, opts = {}) {
     this.M = Module;
+    this.opts = opts;
     this.ready = false;
   }
 
@@ -582,32 +584,42 @@ export class WebGPUEncoder {
     this.tokensPerChunk = down(down(down(this.chunkSize)));
     this.window = this.tokensPerChunk * Math.floor(this.nWindowInfer / this.chunkSize);
 
+    /* Precompute sinusoidal position embedding table for chunk-local positions (0..15).
+     * Slices are reused per-chunk directly on CPU/GPU upload without per-chunk trig overhead.
+     * Dynamic growth via ensurePeTable() protects against chunk groups with w3 > maxPeT. */
+    this.maxPeT = 0;
+    this.ensurePeTable(16);
+
     /* Chunks convolved together. Set here rather than in prepare() because
      * convPlan() runs first and reads it - with it undefined the planner fell
      * back to one chunk per group, which silently overran the uniform buffer
      * on the first call only. */
     this.convGroup = 8;
 
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (!adapter) throw new Error("no WebGPU adapter");
-    const lim = adapter.limits;
-    /* Ask for what the shards actually need rather than the adapter's maximum,
-     * so this reports honestly on a device that offers less. The activation
-     * arena is the other claimant and is sized per utterance, so leave the
-     * usual headroom for it. */
-    const cap = (typeof window !== "undefined" && window.__gpuBindingCap) ||
-                lim.maxStorageBufferBindingSize;
-    const want = Math.min(cap, lim.maxStorageBufferBindingSize, 1 << 30);
-    const wantFeatures = ["timestamp-query", "subgroups"]
-      .filter((f) => adapter.features.has(f));
-    this.device = await adapter.requestDevice({
-      requiredFeatures: wantFeatures,
-      requiredLimits: { maxBufferSize: want, maxStorageBufferBindingSize: want },
-    });
-    this.hasTimestamps = this.device.features.has("timestamp-query");
-    /* The subgroup attention kernel assumes workgroup == one subgroup. */
-    this.sgExact32 = this.device.features.has("subgroups") &&
-      (adapter.info?.subgroupMinSize === 32) && (adapter.info?.subgroupMaxSize === 32);
+    if (this.opts?.device) {
+      this.device = this.opts.device;
+      this.adapter = this.opts.adapter;
+      this.hasTimestamps = this.device.features.has("timestamp-query");
+      this.sgExact32 = this.device.features.has("subgroups") &&
+        (this.adapter?.info?.subgroupMinSize === 32) && (this.adapter?.info?.subgroupMaxSize === 32);
+    } else {
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+      if (!adapter) throw new Error("no WebGPU adapter");
+      const lim = adapter.limits;
+      const cap = (typeof window !== "undefined" && window.__gpuBindingCap) ||
+                  lim.maxStorageBufferBindingSize;
+      const want = Math.min(cap, lim.maxStorageBufferBindingSize, 1 << 30);
+      const wantFeatures = ["timestamp-query", "subgroups"]
+        .filter((f) => adapter.features.has(f));
+      this.adapter = adapter;
+      this.device = await adapter.requestDevice({
+        requiredFeatures: wantFeatures,
+        requiredLimits: { maxBufferSize: want, maxStorageBufferBindingSize: want },
+      });
+      this.hasTimestamps = this.device.features.has("timestamp-query");
+      this.sgExact32 = this.device.features.has("subgroups") &&
+        (adapter.info?.subgroupMinSize === 32) && (adapter.info?.subgroupMaxSize === 32);
+    }
     /* See the note in webgpu-decoder.js: a lost device has to be observable,
      * not discovered through a wrong answer. */
     this.device.lost.then((info) => {
@@ -615,10 +627,10 @@ export class WebGPUEncoder {
       console.error(`GPU device lost (${this.lost})`);
       report(`GPU device lost (${this.lost}); falling back to wasm`);
     });
-    this.device.onuncapturederror = (e) => {
+    this.device.addEventListener("uncapturederror", (e) => {
       console.error("gpu error:", e.error.message);
       report("gpu error: " + e.error.message);
-    };
+    });
 
     await this.loadWeights(report);
     await this.buildPipelines();
@@ -814,39 +826,61 @@ export class WebGPUEncoder {
     this.oC3 = region(CH * G * 16 * w3);
     this.actFloats = off;
 
-    this.bufAct?.destroy();
-    this.bufAct = this.device.createBuffer({
-      size: this.actFloats * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-    });
+    const wantAct = this.actFloats * 4;
+    let rebinding = false;
+    if (!this.bufAct || (this.actCapBytes || 0) < wantAct) {
+      this.bufAct?.destroy();
+      this.bufAct = this.device.createBuffer({
+        size: wantAct,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      });
+      this.actCapBytes = wantAct;
+      rebinding = true;
+    }
 
-    this.bufScratch?.destroy();
-    this.bufScratch = this.device.createBuffer({
-      size: Math.max(4, this.heads * sp * this.window * 4),
-      usage: GPUBufferUsage.STORAGE,
-    });
+    const wantScratch = Math.max(4, this.heads * sp * this.window * 4);
+    if (!this.bufScratch || (this.scratchCapBytes || 0) < wantScratch) {
+      this.bufScratch?.destroy();
+      this.bufScratch = this.device.createBuffer({
+        size: wantScratch,
+        usage: GPUBufferUsage.STORAGE,
+      });
+      this.scratchCapBytes = wantScratch;
+      rebinding = true;
+    }
 
     /* Nine dispatches per layer - two LayerNorms, Q/K/V, attention, O, and the
      * two FFN matmuls - plus the three tail steps, plus the stem: four per
      * chunk group and two to project and add position embeddings. */
     const maxGroups = ceilDiv(ceilDiv(tokens, this.tokensPerChunk), G) + 2;
     this.slots = this.layers * 9 + 3 + maxGroups * 4 + 2;
-    this.bufParams?.destroy();
-    this.bufParams = this.device.createBuffer({
-      size: this.slots * PARAM_STRIDE,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.host = new ArrayBuffer(this.slots * PARAM_STRIDE);
-    this.hostU = new Uint32Array(this.host);
-    this.hostF = new Float32Array(this.host);
+    const wantParams = this.slots * PARAM_STRIDE;
+    if (!this.bufParams || (this.paramsCapBytes || 0) < wantParams) {
+      this.bufParams?.destroy();
+      this.bufParams = this.device.createBuffer({
+        size: wantParams,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.paramsCapBytes = wantParams;
+      this.host = new ArrayBuffer(wantParams);
+      this.hostU = new Uint32Array(this.host);
+      this.hostF = new Float32Array(this.host);
+      rebinding = true;
+    }
 
-    this.readBuf?.destroy();
-    this.readBuf = this.device.createBuffer({
-      size: this.outDim * sp * 4,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
+    const wantRead = this.outDim * sp * 4;
+    if (!this.readBuf || (this.readCapBytes || 0) < wantRead) {
+      this.readBuf?.destroy();
+      this.readBuf = this.device.createBuffer({
+        size: wantRead,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      this.readCapBytes = wantRead;
+    }
 
-    this.bindCache = new Map();
+    if (rebinding || !this.bindCache) {
+      this.bindCache = new Map();
+    }
   }
 
   bindGroup(shard = 0) {
@@ -1031,25 +1065,59 @@ export class WebGPUEncoder {
     return { groups, tokens: tokenBase };
   }
 
+  /* Ensure sinusoidal position embedding table covers at least neededT positions.
+   * Grows dynamically if any chunk group has w3 > maxPeT. */
+  ensurePeTable(neededT) {
+    if (this.peTable && this.maxPeT >= neededT) return;
+    const d = this.dModel;
+    if (!d) return;
+    let newCap = Math.max(16, this.maxPeT || 16);
+    while (newCap < neededT) newCap *= 2;
+    const half = d >> 1;
+    const logTs = Math.log(10000.0) / (half - 1);
+    const newTable = new Float32Array(newCap * d);
+    if (this.peTable) {
+      newTable.set(this.peTable);
+    }
+    const startT = this.peTable ? (this.maxPeT || 0) : 0;
+    for (let t = startT; t < newCap; t++) {
+      const row = t * d;
+      for (let i = 0; i < half; i++) {
+        const angle = t * Math.exp(-i * logTs);
+        newTable[row + i] = Math.sin(angle);
+        newTable[row + half + i] = Math.cos(angle);
+      }
+    }
+    this.peTable = newTable;
+    this.maxPeT = newCap;
+  }
+
   /* Sinusoidal position embeddings, restarting at 0 in every chunk, written
    * transposed to match the activation layout. */
   uploadPE(plan) {
+    for (const g of plan.groups) {
+      if (!this.peTable || g.w3 > (this.maxPeT || 0)) this.ensurePeTable(g.w3);
+    }
     const d = this.dModel, sp = this.seqPad, half = d >> 1;
-    const pe = new Float32Array(d * sp);
-    const logTs = Math.log(10000.0) / (half - 1);
+    if (!this.peBuf || this.peBuf.length < d * sp) {
+      this.peBuf = new Float32Array(d * sp);
+    }
+    const pe = this.peBuf;
+    pe.subarray(0, d * sp).fill(0);
+    const peTable = this.peTable;
     for (const g of plan.groups) {
       for (let b = 0; b < g.batch; b++) {
         for (let t = 0; t < g.w3; t++) {
           const tok = g.tokenBase + b * g.w3 + t;
+          const srcRow = t * d;
           for (let i = 0; i < half; i++) {
-            const angle = t * Math.exp(-i * logTs);
-            pe[i * sp + tok] = Math.sin(angle);
-            pe[(half + i) * sp + tok] = Math.cos(angle);
+            pe[i * sp + tok] = peTable[srcRow + i];
+            pe[(half + i) * sp + tok] = peTable[srcRow + half + i];
           }
         }
       }
     }
-    this.device.queue.writeBuffer(this.bufAct, this.oPE * 4, pe.buffer, 0, pe.byteLength);
+    this.device.queue.writeBuffer(this.bufAct, this.oPE * 4, pe.buffer, 0, d * sp * 4);
   }
 
   /* mel arrives as [128][melFrames]; the stem wants every chunk as its own
@@ -1060,18 +1128,22 @@ export class WebGPUEncoder {
     const src = new Float32Array(freshHeap(this.M).HEAPU8.buffer, melPtr >>> 0, 128 * melFrames);
     let total = 0;
     for (const g of plan.groups) { g.melOff = total; total += g.batch * 128 * g.width; }
-    const dst = new Float32Array(total);
+    if (!this.melDstBuf || this.melDstBuf.length < total) {
+      this.melDstBuf = new Float32Array(total);
+    }
+    const dst = this.melDstBuf;
     for (const g of plan.groups) {
       for (let b = 0; b < g.batch; b++) {
         const start = g.melStart + b * g.width;
+        const bOff = g.melOff + b * 128 * g.width;
         for (let m = 0; m < 128; m++) {
-          const from = m * melFrames + start;
-          dst.set(src.subarray(from, from + g.width),
-                  g.melOff + b * 128 * g.width + m * g.width);
+          const sRow = m * melFrames + start;
+          const dRow = bOff + m * g.width;
+          dst.set(src.subarray(sRow, sRow + g.width), dRow);
         }
       }
     }
-    this.device.queue.writeBuffer(this.bufAct, this.oMEL * 4, dst.buffer, 0, dst.byteLength);
+    this.device.queue.writeBuffer(this.bufAct, this.oMEL * 4, dst.buffer, 0, total * 4);
   }
 
   /* Queue one group's three convolutions and its reshape. */

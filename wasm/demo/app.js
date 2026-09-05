@@ -587,7 +587,7 @@ $("load").onclick = async () => {
          * encoder stay in wasm and only the decoder moves. */
         try {
           setStatus("uploading the audio tower to the GPU...");
-          const e = new WebGPUEncoder(Module);
+          const e = new WebGPUEncoder(Module, { device: gpu.device, adapter: gpu.adapter });
           if (gpuWeightSource) e.weightSource =
             { entries: gpuWeightSource.encEntries, read: gpuWeightSource.read };
           await e.init(() => {});

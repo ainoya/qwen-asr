@@ -675,6 +675,131 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
 }
 `;
 
+/* Two-stage parallel argmax:
+ * Stage 1: M workgroups of WG threads reduce P.n logits to M (val, idx) pairs.
+ * Each workgroup covers a slice of the vocabulary (~2374 elements at M=64),
+ * reducing uncoalesced global reads from 593 per thread down to ~9.
+ *   P.n = total elements (vocab size, e.g. 151936)
+ *   P.a = candidate base in scratch
+ *   P.b = number of workgroups (e.g. 64)
+ */
+const ARGMAX_STAGE1_WGSL = HEADER + `
+const WG : u32 = 256u;
+var<workgroup> rv : array<f32, WG>;
+var<workgroup> ri : array<u32, WG>;
+
+@compute @workgroup_size(WG)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  let M = P.b;
+  if (wid.x >= M) { return; }
+  let per_wg = (P.n + M - 1u) / M;
+  let start = wid.x * per_wg;
+  let end = min(start + per_wg, P.n);
+
+  var bv : f32 = -3.4028235e38;
+  var bi : u32 = start;
+  var i : u32 = start + lid.x;
+  loop {
+    if (i >= end) { break; }
+    let v = scratch[i];
+    if (v > bv) { bv = v; bi = i; }
+    i = i + WG;
+  }
+  rv[lid.x] = bv;
+  ri[lid.x] = bi;
+  workgroupBarrier();
+
+  var s : u32 = WG / 2u;
+  loop {
+    if (s == 0u) { break; }
+    if (lid.x < s) {
+      if (rv[lid.x + s] > rv[lid.x]) {
+        rv[lid.x] = rv[lid.x + s];
+        ri[lid.x] = ri[lid.x + s];
+      }
+    }
+    workgroupBarrier();
+    s = s / 2u;
+  }
+  if (lid.x == 0u) {
+    scratch[P.a + wid.x * 2u] = rv[0];
+    scratch[P.a + wid.x * 2u + 1u] = f32(ri[0]);
+  }
+}
+`;
+
+/* Stage 2: 1 workgroup of 64 threads reduces 64 candidate pairs to final token id in tok[0].
+ *   P.a = candidate base in scratch
+ *   P.n = candidate count (64)
+ */
+const ARGMAX_STAGE2_WGSL = HEADER + `
+const WG : u32 = 64u;
+var<workgroup> rv : array<f32, WG>;
+var<workgroup> ri : array<u32, WG>;
+
+@compute @workgroup_size(WG)
+fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
+  if (lid.x < P.n) {
+    rv[lid.x] = scratch[P.a + lid.x * 2u];
+    ri[lid.x] = u32(scratch[P.a + lid.x * 2u + 1u] + 0.5);
+  } else {
+    rv[lid.x] = -3.4028235e38;
+    ri[lid.x] = 0u;
+  }
+  workgroupBarrier();
+
+  var s : u32 = WG / 2u;
+  loop {
+    if (s == 0u) { break; }
+    if (lid.x < s) {
+      if (rv[lid.x + s] > rv[lid.x]) {
+        rv[lid.x] = rv[lid.x + s];
+        ri[lid.x] = ri[lid.x + s];
+      }
+    }
+    workgroupBarrier();
+    s = s / 2u;
+  }
+  if (lid.x == 0u) {
+    tok[0] = ri[0];
+  }
+}
+`;
+
+/* Transpose input embeddings directly on the GPU from linear [seq, hidden] in scratch
+ * to transposed [hidden, seqPad] in act, zero-padding any remainder.
+ * Uses 16x16 shared-memory tiling with bank-conflict avoidance padding [16][17] for
+ * 100% coalesced global reads and 100% coalesced global writes.
+ *   P.n = seq, P.rows = hidden, P.a = seqPad, P.xOff = dst in act, P.b = src in scratch
+ */
+const TRANSPOSE_EMBEDS_WGSL = HEADER + `
+const TILE_DIM : u32 = 16u;
+var<workgroup> tile : array<array<f32, 17>, 16>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  let in_col = wid.y * TILE_DIM + lid.x;
+  let in_row = wid.x * TILE_DIM + lid.y;
+
+  if (in_row < P.n && in_col < P.rows) {
+    tile[lid.y][lid.x] = scratch[P.b + in_row * P.rows + in_col];
+  } else {
+    tile[lid.y][lid.x] = 0.0;
+  }
+  workgroupBarrier();
+
+  let out_col = wid.x * TILE_DIM + lid.x;
+  let out_row = wid.y * TILE_DIM + lid.y;
+
+  if (out_row < P.rows && out_col < P.a) {
+    let dst_idx = P.xOff + out_row * P.a + out_col;
+    act[dst_idx] = tile[lid.x][lid.y];
+  }
+}
+`;
+
 /* ==================================================================
  * Prefill kernels
  *
@@ -758,7 +883,8 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
       var v = vec4<f32>(0.0);
       if (row < P.rows) {
         let word = quants[P.wordBase + row * nwords + col0 / 4u];
-        v = vec4<f32>(i8x4(word)) * scales[P.scaleBase + row * nblocks + col0 / 64u];
+        let sc = scales[P.scaleBase + row * nblocks + col0 / 64u] * 127.0;
+        v = unpack4x8snorm(word) * sc;
       }
       let base = rr * TK + wq * 4u;
       ws[base] = v.x;
@@ -862,7 +988,8 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
       var v = vec4<f32>(0.0);
       if (row < P.rows) {
         let word = quants[P.wordBase + row * nwords + col0 / 4u];
-        v = vec4<f32>(i8x4(word)) * scales[P.scaleBase + row * nblocks + col0 / 64u];
+        let sc = scales[P.scaleBase + row * nblocks + col0 / 64u] * 127.0;
+        v = unpack4x8snorm(word) * sc;
       }
       let base = rr * TK + wq * 4u;
       ws[base] = v.x;
@@ -1577,6 +1704,7 @@ export class WebGPUDecoder {
                  typeof Float16Array !== "undefined";
     this.kvBytes = this.kvF16 ? 2 : 4;
     this.device = device;
+    this.adapter = adapter;
     this.maxDim = device.limits.maxComputeWorkgroupsPerDimension;
     this.adapterInfo = adapter.info || {};
     /* Surface these: a missing buffer usage flag makes writeBuffer a silent
@@ -1591,10 +1719,10 @@ export class WebGPUDecoder {
       console.error(m);
       if (this.onError) this.onError(m);
     });
-    device.onuncapturederror = (e) => {
+    device.addEventListener("uncapturederror", (e) => {
       console.error("gpu:", e.error.message);
       if (this.onError) this.onError("gpu error: " + e.error.message);
-    };
+    });
 
     /* ---- upload ---- */
     report(`allocating ${(quantBytes / 1e9).toFixed(2)} GB on the GPU in ` +
@@ -1705,6 +1833,7 @@ export class WebGPUDecoder {
       size: ao * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
     this.actFloats = ao;
+    this.actCapFloats = ao;
 
     this.bufTok = device.createBuffer({
       size: this.tokWords * 4,
@@ -1803,6 +1932,9 @@ export class WebGPUDecoder {
       embed: mk(EMBED_WGSL, "embed"),
       embedBatch: mk(EMBED_BATCH_WGSL, "embedBatch"),
       argmax: mk(ARGMAX_WGSL, "argmax"),
+      argmax1: mk(ARGMAX_STAGE1_WGSL, "argmax_stage1"),
+      argmax2: mk(ARGMAX_STAGE2_WGSL, "argmax_stage2"),
+      transposeEmbeds: mk(TRANSPOSE_EMBEDS_WGSL, "transpose_embeds"),
     };
 
     let shaderErrors = 0;
@@ -1929,11 +2061,12 @@ export class WebGPUDecoder {
     const wantAct = seqPad
       ? (Math.ceil(this.actGenFloats / seqPad) + this.preRows) * seqPad
       : this.actGenFloats;
-    if (this.actFloats !== wantAct) {
-      this.bufAct.destroy();
+    if (!this.bufAct || (this.actCapFloats || 0) < wantAct) {
+      if (this.bufAct) this.bufAct.destroy();
       this.bufAct = device.createBuffer({
         size: wantAct * 4,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+      this.actCapFloats = wantAct;
       this.actFloats = wantAct;
       this._bind = null;
     }
@@ -1976,10 +2109,11 @@ export class WebGPUDecoder {
     this.perLayer = perLayer;
     this.vDelta = cfg.layers * perLayer;
 
-    /* scratch holds, in order: logits | attention scores | apply partials. */
-    this.scoreBase = cfg.vocab;
+    /* scratch holds, in order: logits | argmax candidates (128 floats) | attention scores | apply partials. */
+    this.argmaxCandBase = cfg.vocab;
+    this.scoreBase = cfg.vocab + 128;
     this.attnSlices = 8;
-    this.partialBase = cfg.vocab + cfg.heads * maxSeq;
+    this.partialBase = this.scoreBase + cfg.heads * maxSeq;
     /* Prefill scores need heads x rows x columns and reuse the same arena:
      * square for a from-scratch prefill, nNew x paddedTotal for a suffix. */
     this.preBase = suffix ? opts.prefillBase : null;
@@ -1987,11 +2121,13 @@ export class WebGPUDecoder {
       ? Math.ceil((opts.prefillBase + this.preSeq) / 64) * 64 : seqPad;
     const preScores = seqPad ? cfg.heads * seqPad * this.preTotalPad : 0;
     const need = Math.max(this.partialBase + this.attnSlices * cfg.heads * cfg.headDim,
-                          preScores);
-    if (this.scratchCap !== need) {
+                          preScores,
+                          (opts.prefillSeq || 0) * cfg.hidden);
+    if (!this.bufScratch || (this.scratchCap || 0) < need) {
       if (this.bufScratch) this.bufScratch.destroy();
       this.bufScratch = device.createBuffer({
-        size: need * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        size: need * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
       this.scratchCap = need;
       this._bind = null;
     }
@@ -2127,7 +2263,10 @@ export class WebGPUDecoder {
       a: this.Q.xn, b: A.sxn, xOff: A.xn, c: p.rowBase,
       d: Math.min(p.rowCount, this.maxDim),
     }));
+    const candBase = this.argmaxCandBase || cfg.vocab;
     off.argmax = push({ n: cfg.vocab });
+    off.argmax1 = push({ n: cfg.vocab, a: candBase, b: 64 });
+    off.argmax2 = push({ n: 64, a: candBase });
 
     /* ---- prefill slots (only when the GPU is doing the prefill) ---- */
     if (this.seqPad) {
@@ -2198,6 +2337,8 @@ export class WebGPUDecoder {
       }
       off.pre.extract = push({ n: cfg.hidden, a: sp, pos: seq - 1,
                                xOff: PT.x, yOff: A.x });
+      off.pre.transposeEmbeds = push({ n: seq, rows: cfg.hidden, a: sp,
+                                       xOff: PT.x, b: 0 });
     }
 
     this.off = off;
@@ -2284,7 +2425,7 @@ export class WebGPUDecoder {
 
   /* One prefill pass over the whole prompt. Leaves the KV cache filled and the
    * final hidden state of the last position in the generation slot. */
-  encodePrefill(pass, phase) {
+  encodePrefill(pass, phase, enc = null) {
     const { cfg, pipe } = this;
     const ph = (label) => { if (phase) pass = phase(label); };
     const use = (p, slot) => {
@@ -2338,7 +2479,21 @@ export class WebGPUDecoder {
       use(pipe.logits, slot);
       pass.dispatchWorkgroups(...rowGrid(this.slotRows(slot)));
     }
-    use(pipe.argmax, this.off.argmax); pass.dispatchWorkgroups(1);
+    if (pipe.argmax1 && pipe.argmax2 && (phase || enc)) {
+      ph("pre.argmax1");
+      use(pipe.argmax1, this.off.argmax1); pass.dispatchWorkgroups(64);
+      if (phase) {
+        ph("pre.argmax2");
+      } else {
+        pass.end();
+        pass = enc.beginComputePass();
+      }
+      use(pipe.argmax2, this.off.argmax2); pass.dispatchWorkgroups(1);
+    } else {
+      ph("pre.argmax");
+      use(pipe.argmax, this.off.argmax); pass.dispatchWorkgroups(1);
+    }
+    return pass;
   }
 
   /* Per-kernel GPU time for the prefill pass; see profileStep. Needs a
@@ -2366,7 +2521,7 @@ export class WebGPUDecoder {
       qi += 2;
       return cur;
     };
-    this.encodePrefill(phase("pre.head"), phase);
+    cur = this.encodePrefill(phase("pre.head"), phase, enc);
     cur.end();
     enc.resolveQuerySet(qs, 0, qi, qbuf, 0);
     enc.copyBufferToBuffer(qbuf, 0, rbuf, 0, qi * 8);
@@ -2390,7 +2545,7 @@ export class WebGPUDecoder {
    * return the pass to encode the next kernels into. The profiler uses it to
    * put every kernel kind in its own timestamped pass; normal generation
    * passes no callback and everything lands in the single pass it was given. */
-  encodeStep(pass, phase, regionBase = 0) {
+  encodeStep(pass, phase, regionBase = 0, enc = null) {
     const { cfg, pipe, maxDim } = this;
     const ph = (label) => { if (phase) pass = phase(label); };
     const use = (p, slot) => {
@@ -2440,7 +2595,21 @@ export class WebGPUDecoder {
       use(pipe.logits, slot);
       dw(...rowGrid(this.slotRows(slot)));
     }
-    ph("argmax"); use(pipe.argmax, this.off.argmax); dw(1);
+    if (pipe.argmax1 && pipe.argmax2 && (phase || enc)) {
+      ph("argmax1");
+      use(pipe.argmax1, this.off.argmax1); dw(64);
+      if (phase) {
+        ph("argmax2");
+      } else {
+        pass.end();
+        pass = enc.beginComputePass();
+      }
+      use(pipe.argmax2, this.off.argmax2); dw(1);
+    } else {
+      ph("argmax");
+      use(pipe.argmax, this.off.argmax); dw(1);
+    }
+    return pass;
   }
 
   /* Per-kernel GPU time for one generation step, from timestamp queries.
@@ -2476,7 +2645,7 @@ export class WebGPUDecoder {
         qi += 2;
         return cur;
       };
-      this.encodeStep(phase("embed"), phase);
+      cur = this.encodeStep(phase("embed"), phase, 0, enc);
       cur.end();
       enc.resolveQuerySet(qs, 0, qi, qbuf, 0);
       enc.copyBufferToBuffer(qbuf, 0, rbuf, 0, qi * 8);
@@ -2608,25 +2777,27 @@ export class WebGPUDecoder {
 
   async prefillOneShot(embedsPtr, seq, maxNew, onPiece, reserve) {
     if (this.lost) throw new Error(`GPU device lost (${this.lost})`);
+    embedsPtr = embedsPtr >>> 0;
     const { device, cfg, M } = this;
     const t0 = performance.now();
     this.prepareContext(reserve || seq, maxNew, { prefillSeq: seq });
 
-    /* Upload transposed: the prefill kernels want [dim][seqPad]. One staging
-     * array and one writeBuffer - issuing a call per dim measured seconds of
-     * pure overhead against a busy tab. */
+    /* GPU-accelerated transpose: write linear embeddings directly into scratch,
+     * then execute transposeEmbeds compute shader. Zero CPU loops and zero JS allocation. */
     const sp = this.seqPad;
     const src = new Float32Array(freshHeap(M).HEAPF32.buffer, embedsPtr, seq * cfg.hidden);
-    const stage = new Float32Array(cfg.hidden * sp);
-    for (let s2 = 0; s2 < seq; s2++) {
-      const row = s2 * cfg.hidden;
-      for (let d = 0; d < cfg.hidden; d++) stage[d * sp + s2] = src[row + d];
-    }
-    device.queue.writeBuffer(this.bufAct, this.PT.x * 4, stage);
+    device.queue.writeBuffer(this.bufScratch, 0, src.buffer, src.byteOffset, src.byteLength);
 
     const enc = device.createCommandEncoder();
-    const pass = enc.beginComputePass();
-    this.encodePrefill(pass);
+    const up = (a, b) => Math.ceil(a / b);
+    const tpass = enc.beginComputePass();
+    tpass.setPipeline(this.pipe.transposeEmbeds);
+    tpass.setBindGroup(0, this.bindGroup(0), [this.off.pre.transposeEmbeds * PARAM_STRIDE]);
+    tpass.dispatchWorkgroups(up(sp, 16), up(cfg.hidden, 16));
+    tpass.end();
+
+    let pass = enc.beginComputePass();
+    pass = this.encodePrefill(pass, null, enc);
     pass.end();
     enc.copyBufferToBuffer(this.bufTok, 0, this.bufTokRead, 0, 4);
     device.queue.submit([enc.finish()]);
@@ -2647,6 +2818,7 @@ export class WebGPUDecoder {
   async prefillSuffixAndGenerate(embedsPtr, seq, p0, maxNew, onPiece) {
     if (this.lost) throw new Error(`GPU device lost (${this.lost})`);
     if (p0 <= 0) return this.prefillAndGenerate(embedsPtr, seq, maxNew, onPiece);
+    embedsPtr = embedsPtr >>> 0;
     const { device, cfg, M } = this;
     const t0 = performance.now();
     const mark = (o, k, t) => { o[k] = +(performance.now() - t).toFixed(1); };
@@ -2658,19 +2830,21 @@ export class WebGPUDecoder {
     mark(lp, "prepareMs", tp);
 
     const sp = this.seqPad;
-    const src = new Float32Array(freshHeap(M).HEAPF32.buffer, embedsPtr, seq * cfg.hidden);
-    const stage = new Float32Array(cfg.hidden * sp);
-    for (let s2 = 0; s2 < nNew; s2++) {
-      const row = (p0 + s2) * cfg.hidden;
-      for (let d = 0; d < cfg.hidden; d++) stage[d * sp + s2] = src[row + d];
-    }
-    device.queue.writeBuffer(this.bufAct, this.PT.x * 4, stage);
+    const src = new Float32Array(freshHeap(M).HEAPF32.buffer, embedsPtr + p0 * cfg.hidden * 4, nNew * cfg.hidden);
+    device.queue.writeBuffer(this.bufScratch, 0, src.buffer, src.byteOffset, src.byteLength);
     mark(lp, "uploadMs", tp);
 
     tp = performance.now();
     const enc = device.createCommandEncoder();
-    const pass = enc.beginComputePass();
-    this.encodePrefill(pass);
+    const up = (a, b) => Math.ceil(a / b);
+    const tpass = enc.beginComputePass();
+    tpass.setPipeline(this.pipe.transposeEmbeds);
+    tpass.setBindGroup(0, this.bindGroup(0), [this.off.pre.transposeEmbeds * PARAM_STRIDE]);
+    tpass.dispatchWorkgroups(up(sp, 16), up(cfg.hidden, 16));
+    tpass.end();
+
+    let pass = enc.beginComputePass();
+    pass = this.encodePrefill(pass, null, enc);
     pass.end();
     enc.copyBufferToBuffer(this.bufTok, 0, this.bufTokRead, 0, 4);
     device.queue.submit([enc.finish()]);
@@ -2739,8 +2913,8 @@ export class WebGPUDecoder {
       const enc = device.createCommandEncoder();
       for (let k = 0; k < K; k++) {
         this.kvLen = pos + k + 1;    /* scores/apply dispatch geometry */
-        const pass = enc.beginComputePass();
-        this.encodeStep(pass, null, k * this.paramBytes);
+        let pass = enc.beginComputePass();
+        pass = this.encodeStep(pass, null, k * this.paramBytes, enc);
         pass.end();
         enc.copyBufferToBuffer(this.bufTok, 0, this.bufTokRead, k * 4, 4);
       }

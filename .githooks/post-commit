@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# .githooks/post-commit - Automatically checks and plots benchmark if performance code changed
+
+COMMIT_MSG=$(git log -1 --pretty=%B)
+if [[ "$COMMIT_MSG" =~ ^benchmarks: ]]; then
+    exit 0
+fi
+
+DIFF_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD)
+PERF_TOUCHED=0
+
+for f in $DIFF_FILES; do
+    if [[ "$f" =~ ^wasm/demo/webgpu || "$f" =~ ^qwen_asr_kernels || "$f" =~ ^qwen_asr_decoder || "$f" =~ ^qwen_asr_encoder ]]; then
+        PERF_TOUCHED=1
+        break
+    fi
+done
+
+if [[ "$COMMIT_MSG" =~ \[bench\] || "$COMMIT_MSG" =~ \[perf\] ]]; then
+    PERF_TOUCHED=1
+fi
+
+if [ $PERF_TOUCHED -eq 1 ]; then
+    echo "================================================================="
+    echo "[benchmark-hook] Performance-related files modified in HEAD."
+    echo "[benchmark-hook] Refreshing benchmarks/speed_history.svg..."
+    python3 tools/benchmark.py --plot
+    echo "[benchmark-hook] Done. Remember to record new milestone if speed changed:"
+    echo "  python3 tools/benchmark.py --record --title \"Description\" ..."
+    echo "================================================================="
+fi

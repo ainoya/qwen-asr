@@ -5,13 +5,16 @@ tools/benchmark.py - Measure and plot Qwen-ASR speed history across commits.
 Usage:
   python3 tools/benchmark.py --plot
   python3 tools/benchmark.py --list
-  python3 tools/benchmark.py --add --commit <hash> --title <title> --11s <sec> --41s <sec> --decode <ms> --prefill <ms> --heap <mb>
+  python3 tools/benchmark.py --run-wasm [audio.wav] [threads]
+  python3 tools/benchmark.py --record --title <title> [--11s <sec>] [--41s <sec>] [--decode <ms>] [--prefill <ms>] [--heap <mb>] [--auto-commit]
+  python3 tools/benchmark.py --add --commit <hash> --title <title> ...
 """
 
 import argparse
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -35,6 +38,48 @@ def save_history(data, filepath=DEFAULT_HISTORY_FILE):
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     print(f"Saved benchmark history to {filepath}")
+
+def run_wasm_benchmark(wav="samples/jfk.wav", threads=4, model_dir="qwen3-asr-1.7b-q8"):
+    if not os.path.exists(wav):
+        print(f"Error: audio file {wav} not found.")
+        return None
+    if not os.path.exists(model_dir):
+        print(f"Error: model dir {model_dir} not found.")
+        return None
+
+    cmd = ["node", "wasm/bench-node.js", model_dir, wav, str(threads)]
+    print(f"Running: {' '.join(cmd)}")
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        out = res.stdout
+        print(out)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running benchmark: {e.stderr}")
+        return None
+
+    pat = r"audio\s+([\d\.]+)s\s+\|\s+inference\s+([\d\.]+)s\s+\(([\d\.]+)x realtime\)\s+\|\s+encode\s+(\d+)ms\s+decode\s+(\d+)ms\s+\|\s+(\d+)\s+tokens"
+    m = re.search(pat, out)
+    if not m:
+        print("Warning: Could not parse benchmark timing line from output.")
+        return None
+
+    audio_sec = float(m.group(1))
+    inference_sec = float(m.group(2))
+    rtf = float(m.group(3))
+    encode_ms = int(m.group(4))
+    decode_ms = int(m.group(5))
+    tokens = int(m.group(6))
+    ms_per_tok = round(decode_ms / max(tokens, 1), 1)
+
+    return {
+        "audio_sec": audio_sec,
+        "inference_sec": inference_sec,
+        "rtf": rtf,
+        "encode_ms": encode_ms,
+        "decode_ms": decode_ms,
+        "tokens": tokens,
+        "ms_per_tok": ms_per_tok,
+    }
 
 def generate_svg(history_file=DEFAULT_HISTORY_FILE, output_svg=DEFAULT_OUTPUT_SVG):
     history = load_history(history_file)
@@ -274,50 +319,84 @@ def print_list(history_file=DEFAULT_HISTORY_FILE):
               f"{e.get('decode_ms_per_tok',0):<9.1f} {e.get('prefill_41s_ms',0):<9.0f} "
               f"{e.get('wasm_heap_mb',0):<8} {e.get('title','')}")
 
+def record_milestone(args):
+    commit = args.commit or get_git_commit()
+    history = load_history(args.history)
+    entry = None
+    for item in history:
+        if item.get("commit") == commit:
+            entry = item
+            break
+    if not entry:
+        entry = {"commit": commit, "date": datetime.date.today().isoformat()}
+        history.append(entry)
+
+    # If run benchmark requested or parameters missing, optionally run wasm benchmark
+    if args.run_bench:
+        res11 = run_wasm_benchmark("samples/jfk.wav")
+        if res11:
+            entry["clip_11s_sec"] = res11["inference_sec"]
+            entry["clip_11s_rtf"] = res11["rtf"]
+            entry["decode_ms_per_tok"] = res11["ms_per_tok"]
+        if os.path.exists("samples/extra/ja_bench.wav"):
+            res41 = run_wasm_benchmark("samples/extra/ja_bench.wav")
+            if res41:
+                entry["clip_41s_sec"] = res41["inference_sec"]
+                entry["clip_41s_rtf"] = res41["rtf"]
+                entry["prefill_41s_ms"] = res41["encode_ms"]
+
+    if args.title: entry["title"] = args.title
+    if args.s11 is not None:
+        entry["clip_11s_sec"] = args.s11
+        entry["clip_11s_rtf"] = round(11.0 / args.s11, 2)
+    if args.s41 is not None:
+        entry["clip_41s_sec"] = args.s41
+        entry["clip_41s_rtf"] = round(41.0 / args.s41, 2)
+    if args.decode is not None: entry["decode_ms_per_tok"] = args.decode
+    if args.prefill is not None: entry["prefill_41s_ms"] = args.prefill
+    if args.heap is not None: entry["wasm_heap_mb"] = args.heap
+    if args.notes: entry["notes"] = args.notes
+
+    save_history(history, args.history)
+    generate_svg(args.history, args.output)
+
+    if args.auto_commit:
+        try:
+            subprocess.run(["git", "add", args.history, args.output], check=True)
+            subprocess.run(["git", "commit", "-m", f"benchmarks: update speed plot for {commit}"], check=True)
+            print(f"Committed updated benchmark graph for {commit}")
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: git commit failed: {e}")
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark & plot speed history for Qwen-ASR.")
     parser.add_argument("--plot", action="store_true", help="Generate the SVG speed history graph")
     parser.add_argument("--list", action="store_true", help="List benchmark history entries")
     parser.add_argument("--history", default=DEFAULT_HISTORY_FILE, help="Path to history.json")
     parser.add_argument("--output", default=DEFAULT_OUTPUT_SVG, help="Path to output SVG")
-    parser.add_argument("--add", action="store_true", help="Add or update a benchmark record")
+    parser.add_argument("--run-wasm", nargs="?", const="samples/jfk.wav", help="Run wasm benchmark on specified wav file (default: samples/jfk.wav)")
+    parser.add_argument("--threads", type=int, default=4, help="Threads for wasm benchmark")
+    parser.add_argument("--record", action="store_true", help="Record milestone and generate plot")
+    parser.add_argument("--add", action="store_true", help="Alias for --record")
+    parser.add_argument("--run-bench", action="store_true", help="Auto-run wasm benchmark when recording")
     parser.add_argument("--commit", help="Commit hash (default: current HEAD)")
-    parser.add_argument("--title", help="Milestone title")
+    parser.add_argument("--title", default="Performance Optimization", help="Milestone title")
     parser.add_argument("--11s", dest="s11", type=float, help="11s clip latency (sec)")
     parser.add_argument("--41s", dest="s41", type=float, help="41s clip latency (sec)")
     parser.add_argument("--decode", type=float, help="Decode latency (ms/tok)")
     parser.add_argument("--prefill", type=float, help="Prefill latency (ms)")
     parser.add_argument("--heap", type=int, help="WASM heap (MB)")
     parser.add_argument("--notes", help="Notes")
+    parser.add_argument("--auto-commit", action="store_true", help="Automatically commit the updated SVG and history")
 
     args = parser.parse_args()
 
-    if args.add:
-        commit = args.commit or get_git_commit()
-        history = load_history(args.history)
-        entry = None
-        for item in history:
-            if item.get("commit") == commit:
-                entry = item
-                break
-        if not entry:
-            entry = {"commit": commit, "date": datetime.date.today().isoformat()}
-            history.append(entry)
-
-        if args.title: entry["title"] = args.title
-        if args.s11 is not None:
-            entry["clip_11s_sec"] = args.s11
-            entry["clip_11s_rtf"] = round(11.0 / args.s11, 2)
-        if args.s41 is not None:
-            entry["clip_41s_sec"] = args.s41
-            entry["clip_41s_rtf"] = round(41.0 / args.s41, 2)
-        if args.decode is not None: entry["decode_ms_per_tok"] = args.decode
-        if args.prefill is not None: entry["prefill_41s_ms"] = args.prefill
-        if args.heap is not None: entry["wasm_heap_mb"] = args.heap
-        if args.notes: entry["notes"] = args.notes
-
-        save_history(history, args.history)
-        generate_svg(args.history, args.output)
+    if args.run_wasm:
+        res = run_wasm_benchmark(args.run_wasm, args.threads)
+        if res:
+            print(f"Result: {res['inference_sec']}s ({res['rtf']}x RTF) | Decode: {res['ms_per_tok']} ms/tok | Tokens: {res['tokens']}")
+    elif args.record or args.add:
+        record_milestone(args)
     elif args.list:
         print_list(args.history)
     else:

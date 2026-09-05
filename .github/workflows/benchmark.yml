@@ -1,0 +1,27 @@
+name: Benchmark & Plot Check
+
+on:
+  push:
+    paths:
+      - 'benchmarks/**'
+      - 'tools/benchmark.py'
+      - 'wasm/**'
+  pull_request:
+    paths:
+      - 'benchmarks/**'
+      - 'tools/benchmark.py'
+      - 'wasm/**'
+
+jobs:
+  check-benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate benchmark history & verify plot generation
+        run: |
+          python3 tools/benchmark.py --list
+          python3 tools/benchmark.py --plot

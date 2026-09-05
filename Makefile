@@ -17,7 +17,7 @@ TARGET = qwen_asr
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug info help blas noblas test test-stream-cache
+.PHONY: all clean debug info help blas noblas test test-stream-cache bench bench-plot bench-record
 
 # Default: show available targets
 all: help
@@ -103,6 +103,15 @@ endif
 
 test:
 	./asr_regression.py --binary ./qwen_asr --model-dir qwen3-asr-1.7b
+
+bench:
+	python3 tools/benchmark.py --run-wasm
+
+bench-plot:
+	python3 tools/benchmark.py --plot
+
+bench-record:
+	python3 tools/benchmark.py --record
 
 # =============================================================================
 # Dependencies

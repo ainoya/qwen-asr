@@ -671,6 +671,9 @@ After editing:
 4. Update `README.md` (and `wasm/README.md` for browser-facing changes) if
    CLI/runtime behavior changed.
 5. Keep `AGENT.md` aligned if workflow/test defaults changed.
+6. For speed/memory optimizations, record the benchmark and update the plot:
+   - Run `python3 tools/benchmark.py --record --title "..."` (or `make bench-record`)
+   - Verify `benchmarks/speed_history.svg` is updated and committed alongside the changes.
 
 ## Local-Only Artifacts (Do Not Depend On In Commits)
 

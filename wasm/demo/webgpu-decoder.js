@@ -697,7 +697,7 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
   let start = wid.x * per_wg;
   let end = min(start + per_wg, P.n);
 
-  var bv : f32 = -3.4028235e38;
+  var bv : f32 = -3.0e38;
   var bi : u32 = start;
   var i : u32 = start + lid.x;
   loop {
@@ -744,7 +744,7 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
     rv[lid.x] = scratch[P.a + lid.x * 2u];
     ri[lid.x] = u32(scratch[P.a + lid.x * 2u + 1u] + 0.5);
   } else {
-    rv[lid.x] = -3.4028235e38;
+    rv[lid.x] = -3.0e38;
     ri[lid.x] = 0u;
   }
   workgroupBarrier();

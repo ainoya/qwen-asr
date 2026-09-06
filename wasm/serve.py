@@ -40,15 +40,34 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return super().guess_type(path)
 
     def do_GET(self):
-        rng = self.headers.get("Range")
-        if not rng:
-            return super().do_GET()
-
         path = self.translate_path(self.path)
         if not os.path.isfile(path):
             return super().do_GET()
 
         size = os.path.getsize(path)
+        rng = self.headers.get("Range")
+
+        if not rng:
+            if size > CHUNK:
+                self.send_response(200)
+                self.send_header("Content-Type", self.guess_type(path))
+                self.send_header("Content-Length", str(size))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                remaining = size
+                with open(path, "rb") as f:
+                    while remaining > 0:
+                        buf = f.read(min(CHUNK, remaining))
+                        if not buf:
+                            break
+                        try:
+                            self.wfile.write(buf)
+                        except Exception:
+                            return
+                        remaining -= len(buf)
+                return
+            return super().do_GET()
+
         try:
             units, _, spec = rng.partition("=")
             if units.strip() != "bytes":

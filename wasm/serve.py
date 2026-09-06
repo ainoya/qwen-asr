@@ -98,6 +98,7 @@ class Server(socketserver.ThreadingTCPServer):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="0.0.0.0", help="Host address to bind (default: 0.0.0.0)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--root", default=os.path.join(os.path.dirname(__file__), ".."))
     ap.add_argument("--verbose", action="store_true")
@@ -107,9 +108,20 @@ def main():
     os.chdir(root)
 
     handler = lambda *a, **kw: Handler(*a, directory=root, **kw)
-    with Server(("127.0.0.1", args.port), handler) as httpd:
-        print(f"serving {root} on http://localhost:{args.port}")
-        print(f"open    http://localhost:{args.port}/wasm/demo/")
+    with Server((args.host, args.port), handler) as httpd:
+        print(f"serving {root} on http://{args.host}:{args.port}")
+        print(f"local:  http://localhost:{args.port}/wasm/demo/")
+        if args.host in ("0.0.0.0", ""):
+            try:
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(0.2)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+                print(f"LAN:    http://{local_ip}:{args.port}/wasm/demo/")
+            except Exception:
+                pass
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

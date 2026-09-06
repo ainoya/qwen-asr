@@ -59,10 +59,16 @@ function cstr(s) {
  * byte pointer into a Float32Array index. */
 const P = (ptr) => ptr >>> 0;
 
+const isMobileDevice = (typeof navigator !== "undefined" &&
+  (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
+   (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)));
+
 /* hardwareConcurrency counts efficiency cores, and a browser may hand out fewer
  * cores than it reports. Spinning pool threads are counter-productive in that
  * case, so start conservative and let the user raise it. */
-const defaultThreads = Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 4) - 2));
+const defaultThreads = isMobileDevice
+  ? Math.min(2, Math.max(1, (navigator.hardwareConcurrency || 4) - 2))
+  : Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 4) - 2));
 const f32idx = (ptr) => P(ptr) / 4;
 
 function ensureSampleBuf(n) {
@@ -976,9 +982,22 @@ $("load").onclick = async () => {
   cleanupGpuResources();
   const t0 = performance.now();
   try {
+    if (typeof SharedArrayBuffer === "undefined" || !self.crossOriginIsolated) {
+      throw new Error(
+        "SharedArrayBuffer is unavailable (page is not cross-origin isolated). " +
+        "On iOS Safari, access must be via HTTPS or localhost with COOP/COEP headers."
+      );
+    }
     setStatus("instantiating wasm...");
     log("instantiating wasm module");
-    Module = await createQwenASR();
+    const isMobile = isMobileDevice;
+    const mobileThreads = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
+    const poolSize = isMobile ? Math.min(2, mobileThreads) : Math.min(4, defaultThreads);
+    const maxPages = isMobile ? 8192 : 65536; // 512 MB on iOS Safari avoids WebKit Jetsam OOM kill
+    Module = await createQwenASR({
+      pthreadPoolSize: poolSize,
+      maximumMemoryPages: maxPages,
+    });
 
     setStatus("fetching tokenizer...");
     Module.FS.mkdirTree("/model");
@@ -998,7 +1017,7 @@ $("load").onclick = async () => {
     if (!total) total = Number(CFG.modelSize) || 0;
     if (!total) throw new Error("could not determine the model size");
 
-    const threads = Number($("threads").value) || 8;
+    const threads = Number($("threads").value) || (isMobile ? 2 : 8);
     /* GPU backend: probe first, and if the GPU is real, keep the transformer
      * weights out of wasm memory entirely. sessionStorage flag forces the
      * classic full image after a mid-session GPU failure. */

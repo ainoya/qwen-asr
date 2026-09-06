@@ -67,10 +67,10 @@ emcc $SRCS -o "$OUT/qwen_asr.js" \
     -sEXPORT_ES6=0 \
     -sENVIRONMENT=web,worker,node \
     -sALLOW_MEMORY_GROWTH=1 \
-    -sMAXIMUM_MEMORY=4gb \
+    -sMAXIMUM_MEMORY=2gb \
     -sINITIAL_MEMORY=64mb \
     -sSTACK_SIZE=8mb \
-    -sPTHREAD_POOL_SIZE=12 \
+    -sPTHREAD_POOL_SIZE=4 \
     -sPTHREAD_POOL_SIZE_STRICT=0 \
     -sEXPORTED_FUNCTIONS="$EXPORTS" \
     -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap","UTF8ToString","stringToUTF8","lengthBytesUTF8","HEAPU8","HEAPF32","FS","wasmMemory"]' \

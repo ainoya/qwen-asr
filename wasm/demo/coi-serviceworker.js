@@ -36,6 +36,17 @@ if (typeof window === "undefined") {
     };
     if (reg.active && !navigator.serviceWorker.controller) reload();
     navigator.serviceWorker.addEventListener("controllerchange", reload);
+    reg.addEventListener("updatefound", () => {
+      const w = reg.installing;
+      if (w) {
+        w.addEventListener("statechange", () => {
+          if (w.state === "activated" && !navigator.serviceWorker.controller) reload();
+        });
+      }
+    });
+    navigator.serviceWorker.ready.then(() => {
+      if (!navigator.serviceWorker.controller) setTimeout(reload, 300);
+    });
   }).catch((err) => console.warn("coi-serviceworker:", err));
 } else if (window.crossOriginIsolated) {
   sessionStorage.removeItem("coiReloadedOnce");

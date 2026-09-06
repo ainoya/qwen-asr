@@ -77,5 +77,26 @@ emcc $SRCS -o "$OUT/qwen_asr.js" \
     -sFORCE_FILESYSTEM=1 \
     -sASSERTIONS=0
 
+# Post-process qwen_asr.js to support Module.pthreadPoolSize and mobile-safe scaling
+python3 -c '
+import re
+
+path = "'"$OUT"'/qwen_asr.js"
+with open(path, "r", encoding="utf-8") as f:
+    code = f.read()
+
+# Make pthreadPoolSize dynamic and mobile-friendly
+code = re.sub(
+    r"initMainThread\(\)\{var pthreadPoolSize=\d+;while\(pthreadPoolSize--\)\{PThread\.allocateUnusedWorker\(\)\}",
+    r"""initMainThread(){var isMobile=typeof navigator!=="undefined"&&(/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1));var defaultPool=isMobile?2:4;var pthreadPoolSize=(typeof Module!=="undefined"&&Module["pthreadPoolSize"]!==undefined)?Module["pthreadPoolSize"]:defaultPool;while(pthreadPoolSize--){PThread.allocateUnusedWorker()}""",
+    code,
+    count=1
+)
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(code)
+print("Post-processed qwen_asr.js for mobile safety.")
+'
+
 ls -la "$OUT"/qwen_asr.js "$OUT"/qwen_asr.wasm
 echo "built $OUT/qwen_asr.{js,wasm}"

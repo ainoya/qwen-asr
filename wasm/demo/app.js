@@ -984,8 +984,8 @@ $("load").onclick = async () => {
   try {
     if (typeof SharedArrayBuffer === "undefined" || !self.crossOriginIsolated) {
       throw new Error(
-        "SharedArrayBuffer is unavailable (page is not cross-origin isolated). " +
-        "On iOS Safari, access must be via HTTPS or localhost with COOP/COEP headers."
+        "Cross-origin isolation is initializing. " +
+        "Please tap Safari's reload button (🔄) once to activate the Service Worker and SharedArrayBuffer."
       );
     }
     setStatus("instantiating wasm...");
@@ -993,8 +993,22 @@ $("load").onclick = async () => {
     const isMobile = isMobileDevice;
     const mobileThreads = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
     const poolSize = isMobile ? Math.min(2, mobileThreads) : Math.min(4, defaultThreads);
-    const maxPages = isMobile ? 8192 : 65536; // 512 MB on iOS Safari avoids WebKit Jetsam OOM kill
+    const maxPages = isMobile ? 8192 : 32768; // 512 MB on iOS Safari avoids WebKit Jetsam OOM kill
+
+    let wasmMem = null;
+    try {
+      wasmMem = new WebAssembly.Memory({ initial: 1024, maximum: maxPages, shared: true });
+    } catch (e) {
+      for (const p of [16384, 8192, 4096, 2048, 1024]) {
+        try {
+          wasmMem = new WebAssembly.Memory({ initial: 1024, maximum: p, shared: true });
+          break;
+        } catch (_) {}
+      }
+    }
+
     Module = await createQwenASR({
+      wasmMemory: wasmMem,
       pthreadPoolSize: poolSize,
       maximumMemoryPages: maxPages,
     });
@@ -1700,8 +1714,7 @@ if ($("backend")) {
 }
 
 if (!self.crossOriginIsolated) {
-  log("warning: page is not cross-origin isolated, so SharedArrayBuffer (and " +
-      "therefore multithreading) is unavailable. Serve with wasm/serve.py.", "err");
+  log("Note: Cross-origin isolation is initializing. Please tap the Safari reload button (🔄) once to activate SharedArrayBuffer.", "warn");
 }
 
 /* ==========================================================================

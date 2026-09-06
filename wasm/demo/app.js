@@ -1042,6 +1042,12 @@ $("load").onclick = async () => {
     }
 
     if (!loaded) {
+      if (isMobile) {
+        throw new Error(
+          `CPU (wasm) decoding requires ~2.5 GB RAM, which exceeds iOS Safari memory limits. ` +
+          `WebGPU is required on mobile devices. ${probe && !probe.ok ? `Reason WebGPU is unavailable: ${probe.why}` : "Please ensure decoder is set to 'GPU (WebGPU)' and accessed via HTTPS or localhost."}`
+        );
+      }
       log(`fetching packed model, ${(total / 1e9).toFixed(2)} GB`);
       const ptr = await fetchModelInto(`${MODEL_BASE}/qwen-asr-q8.bin`, total);
       setStatus("attaching weights...");
@@ -1684,6 +1690,14 @@ if ($("tab-live")) {
 }
 
 $("threads").value = String(defaultThreads);
+
+if ($("backend")) {
+  if (typeof navigator !== "undefined" && navigator.gpu) {
+    $("backend").value = "gpu";
+  } else if (typeof window !== "undefined" && !window.isSecureContext) {
+    log("Notice: WebGPU requires HTTPS or localhost. Over plain HTTP on LAN (http://192.168.x.x), Safari disables WebGPU. Please access via https:// or a tunnel (e.g. ngrok).", "warn");
+  }
+}
 
 if (!self.crossOriginIsolated) {
   log("warning: page is not cross-origin isolated, so SharedArrayBuffer (and " +

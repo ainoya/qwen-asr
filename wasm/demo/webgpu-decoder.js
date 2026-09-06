@@ -1557,9 +1557,13 @@ export class WebGPUDecoder {
       const isIOS = typeof navigator !== "undefined" &&
         (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
          (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
-      const why = isIOS
-        ? "navigator.gpu is missing. Enable WebGPU in iOS Settings: Apps > Safari > Advanced > Feature Flags > WebGPU"
-        : "navigator.gpu is missing";
+      const notSecure = typeof window !== "undefined" && !window.isSecureContext;
+      let why = "navigator.gpu is missing";
+      if (notSecure) {
+        why = "navigator.gpu is disabled in insecure contexts (HTTP). WebGPU requires HTTPS or localhost. If testing from iPhone, access via https:// (e.g. ngrok tunnel) or USB localhost.";
+      } else if (isIOS) {
+        why = "navigator.gpu is missing. If disabled, enable WebGPU in iOS Settings: Apps > Safari > Advanced > Feature Flags > WebGPU";
+      }
       return { ok: false, why, isIOS };
     }
     try {

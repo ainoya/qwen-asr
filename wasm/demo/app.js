@@ -94,6 +94,7 @@ function ensureSampleBuf(n) {
     if (sampleBuf) Module._qwen_wasm_release(sampleBuf);
     sampleBuf = P(Module._qwen_wasm_alloc(bytes));
     sampleCap = sampleBuf ? bytes : 0;
+    if (!sampleBuf) throw new Error(`Out of WASM memory allocating ${bytes} bytes for audio sample buffer`);
   }
   return sampleBuf;
 }
@@ -1042,21 +1043,23 @@ $("load").onclick = async () => {
     log("instantiating wasm module");
     const isMobile = isMobileDevice;
     const mobileThreads = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
-    const poolSize = isMobile ? 1 : Math.min(4, defaultThreads);
-    const maxPages = isMobile ? 1024 : 32768; // 64 MB on iOS Safari (GPU-resident mode uses ~20 MB)
+    const poolSize = isMobile ? Math.min(2, mobileThreads) : Math.min(4, defaultThreads);
+    const targetMaxPages = isMobile ? 8192 : 32768; // 512 MB on mobile (safely accommodates streaming KV cache & audio buffers), 2 GB on desktop
     const initPages = 1024;  // 64 MB (matches emcc -sINITIAL_MEMORY=64mb declaration)
 
     let wasmMem = null;
-    try {
-      wasmMem = new WebAssembly.Memory({ initial: initPages, maximum: maxPages, shared: true });
-    } catch (e) {
-      const candidates = isMobile ? [1024] : [16384, 8192, 4096, 2048, 1024];
-      for (const p of candidates) {
-        try {
-          wasmMem = new WebAssembly.Memory({ initial: initPages, maximum: Math.max(initPages, p), shared: true });
-          break;
-        } catch (_) {}
-      }
+    let actualMaxPages = targetMaxPages;
+    const candidates = isMobile ? [8192, 4096, 2048] : [32768, 16384, 8192, 4096];
+    for (const p of candidates) {
+      try {
+        wasmMem = new WebAssembly.Memory({ initial: initPages, maximum: p, shared: true });
+        actualMaxPages = p;
+        break;
+      } catch (_) {}
+    }
+    if (!wasmMem) {
+      wasmMem = new WebAssembly.Memory({ initial: initPages, maximum: initPages, shared: true });
+      actualMaxPages = initPages;
     }
 
     const modelBase = getModelBase();
@@ -1067,7 +1070,7 @@ $("load").onclick = async () => {
     Module = await createQwenASR({
       wasmMemory: wasmMem,
       pthreadPoolSize: poolSize,
-      maximumMemoryPages: maxPages,
+      maximumMemoryPages: actualMaxPages,
     });
 
     setStatus("fetching tokenizer...");

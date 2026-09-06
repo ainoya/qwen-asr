@@ -1008,7 +1008,7 @@ $("load").onclick = async () => {
     const mobileThreads = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
     const poolSize = isMobile ? Math.min(2, mobileThreads) : Math.min(4, defaultThreads);
     const maxPages = isMobile ? 4096 : 32768; // 256 MB on iOS Safari (GPU-resident mode uses ~40 MB)
-    const initPages = isMobile ? 512 : 1024;  // 32 MB initial on mobile
+    const initPages = 1024;  // 64 MB (matches emcc -sINITIAL_MEMORY=64mb declaration)
 
     let wasmMem = null;
     try {
@@ -1017,7 +1017,7 @@ $("load").onclick = async () => {
       const candidates = isMobile ? [4096, 2048, 1024] : [16384, 8192, 4096, 2048, 1024];
       for (const p of candidates) {
         try {
-          wasmMem = new WebAssembly.Memory({ initial: Math.min(initPages, p), maximum: p, shared: true });
+          wasmMem = new WebAssembly.Memory({ initial: initPages, maximum: Math.max(initPages, p), shared: true });
           break;
         } catch (_) {}
       }

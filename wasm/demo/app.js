@@ -638,9 +638,9 @@ async function streamChunksToTargets({
   const isMobile = isMobileDevice;
   let fileOffset = initialFileOffset;
   let bytesSinceSync = 0;
-  // On mobile (iOS Safari), use an 8 MB sync interval to prevent WebKit GPU process
-  // staging buffers and Mach IPC queues from accumulating dirty memory past the Jetsam ceiling.
-  const SYNC_INTERVAL = isMobile ? (8 * 1024 * 1024) : (32 * 1024 * 1024);
+  // On mobile (iOS Safari), use a 4 MB sync interval with a 15ms pause to allow
+  // the iOS kernel vm_compressor to compress inactive pages and WebKit to purge staging buffers.
+  const SYNC_INTERVAL = isMobile ? (4 * 1024 * 1024) : (32 * 1024 * 1024);
 
   let alignRemainder = null; // Cross-chunk remainder scratchpad (< 4 bytes)
 
@@ -672,11 +672,11 @@ async function streamChunksToTargets({
       bytesSinceSync = 0;
       reportProgress(fileOffset, totalBytes);
       await device.queue.onSubmittedWorkDone();
-      // On mobile / Safari, yielding via setTimeout(..., 0) allows the native
-      // Cocoa / WebKit CFRunLoop turn to complete, draining the @autoreleasepool,
-      // flushing IPC buffers, and allowing the JS garbage collector to sweep.
+      // On mobile / Safari, yielding via setTimeout(..., 15) gives the native
+      // Cocoa / WebKit CFRunLoop and iOS vm_compressor time to compress cold pages,
+      // drain the @autoreleasepool, flush IPC buffers, and sweep JS garbage.
       if (isMobile) {
-        await new Promise((r) => setTimeout(r, 0));
+        await new Promise((r) => setTimeout(r, 15));
       } else {
         await tick();
       }
@@ -946,7 +946,10 @@ async function loadGpuResidentDirect(url, total, threads) {
   log("pre-allocating WebGPU storage buffers...");
   const { decEntries, encEntries } = extractModelDescriptorsFromHeader(header, dataBase);
 
-  const shardBudget = Math.min(256 << 20, device.limits?.maxStorageBufferBindingSize || (256 << 20));
+  const shardBudget = Math.min(
+    isMobileDevice ? (128 << 20) : (256 << 20),
+    device.limits?.maxStorageBufferBindingSize || (256 << 20)
+  );
 
   gpu = new WebGPUDecoder(Module, { device, adapter });
   gpu.allocateStorageBuffers({
@@ -1032,15 +1035,15 @@ $("load").onclick = async () => {
     log("instantiating wasm module");
     const isMobile = isMobileDevice;
     const mobileThreads = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
-    const poolSize = isMobile ? Math.min(2, mobileThreads) : Math.min(4, defaultThreads);
-    const maxPages = isMobile ? 4096 : 32768; // 256 MB on iOS Safari (GPU-resident mode uses ~40 MB)
+    const poolSize = isMobile ? 1 : Math.min(4, defaultThreads);
+    const maxPages = isMobile ? 1024 : 32768; // 64 MB on iOS Safari (GPU-resident mode uses ~20 MB)
     const initPages = 1024;  // 64 MB (matches emcc -sINITIAL_MEMORY=64mb declaration)
 
     let wasmMem = null;
     try {
       wasmMem = new WebAssembly.Memory({ initial: initPages, maximum: maxPages, shared: true });
     } catch (e) {
-      const candidates = isMobile ? [4096, 2048, 1024] : [16384, 8192, 4096, 2048, 1024];
+      const candidates = isMobile ? [1024] : [16384, 8192, 4096, 2048, 1024];
       for (const p of candidates) {
         try {
           wasmMem = new WebAssembly.Memory({ initial: initPages, maximum: Math.max(initPages, p), shared: true });

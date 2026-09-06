@@ -912,20 +912,24 @@ async function loadGpuResidentDirect(url, total, threads) {
 
   // 1. Open stream
   setStatus("connecting to model stream...");
+  log("connecting to model stream...");
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
   const reader = res.body.getReader();
 
   // 2. Phase 1: Parse Safetensors Header
   setStatus("parsing model header...");
+  log("parsing model header...");
   const { header, dataBase, leftover } = await parseSafetensorsHeaderStream(reader);
 
   // 3. Prepare reduced WASM norm image
   setStatus("preparing reduced norm image in WASM...");
+  log("preparing reduced norm image in WASM...");
   const reduced = prepareWasmReducedImage(header, Module);
 
   // 4. Pre-allocate WebGPU storage buffers
   setStatus("pre-allocating WebGPU storage buffers...");
+  log("pre-allocating WebGPU storage buffers...");
   const { decEntries, encEntries } = extractModelDescriptorsFromHeader(header, dataBase);
 
   const shardBudget = Math.min(256 << 20, device.limits?.maxStorageBufferBindingSize || (256 << 20));
@@ -949,11 +953,13 @@ async function loadGpuResidentDirect(url, total, threads) {
   });
 
   // 5. Build interval dispatch table
+  log("building interval dispatch table...");
   const intervals = buildIntervalDispatchTable(header, dataBase, gpu, encoder, reduced.wasmNormMap);
   const dispatcher = new IntervalDispatcher(intervals, device, Module);
 
   // 6. Phase 2: Direct streaming ingestion
   setStatus("streaming model weights directly to WebGPU...");
+  log(`streaming model weights to WebGPU (sync: ${isMobileDevice ? "8MB" : "32MB"})...`);
   await streamChunksToTargets({
     reader,
     dispatcher,
@@ -962,8 +968,9 @@ async function loadGpuResidentDirect(url, total, threads) {
     device,
     excessChunk: leftover,
     reportProgress: (cur, tot) => {
-      if ($("barfill")) $("barfill").style.width = `${(cur / tot * 100).toFixed(1)}%`;
-      setStatus(`downloading model ${(cur / 1e9).toFixed(2)} / ${(tot / 1e9).toFixed(2)} GB`);
+      const pct = (cur / tot * 100).toFixed(1);
+      if ($("barfill")) $("barfill").style.width = `${pct}%`;
+      setStatus(`downloading model ${(cur / 1e9).toFixed(2)} / ${(tot / 1e9).toFixed(2)} GB (${pct}%)`);
     },
   });
 
@@ -1047,6 +1054,10 @@ $("load").onclick = async () => {
     if (!total) total = Number(CFG.modelSize) || 0;
     if (!total) throw new Error("could not determine the model size");
 
+    if (isMobile) {
+      sessionStorage.removeItem("qwenFullImage");
+    }
+
     const threads = Number($("threads").value) || (isMobile ? 2 : 8);
     /* GPU backend: probe first, and if the GPU is real, keep the transformer
      * weights out of wasm memory entirely. sessionStorage flag forces the
@@ -1064,7 +1075,8 @@ $("load").onclick = async () => {
           await loadGpuResident(`${MODEL_BASE}/qwen-asr-q8.bin`, total, threads);
           loaded = true;
         } catch (e) {
-          log(`gpu-resident load failed (${e.message}); using the full image`, "err");
+          log(`gpu-resident load failed: ${e.message}`, "err");
+          console.error("gpu-resident load failed:", e);
           gpuWeightSource = null;
           gpuResidentActive = false;
         }

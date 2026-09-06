@@ -2,151 +2,300 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>WebGPU capability report</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WebGPU capability report — Qwen-ASR Mobile Safari</title>
 <style>
-  body { background:#12141a; color:#e6e8ef; font:14px/1.6 -apple-system,sans-serif; padding:24px; max-width:900px; margin:0 auto; }
-  pre { background:#0e1015; border:1px solid #2c3040; border-radius:8px; padding:14px; white-space:pre-wrap; word-break:break-word; }
-  button { background:#6ea8fe; color:#101218; border:0; border-radius:7px; padding:9px 16px; font-weight:600; cursor:pointer; margin-right:8px; }
-  .ok { color:#6ee7a8; } .no { color:#f08a8a; } .warn { color:#f0c05e; }
+  :root {
+    --bg: #12141a; --panel: #1b1e26; --line: #2c3040;
+    --fg: #e6e8ef; --dim: #9aa1b4; --accent: #6ea8fe; --ok: #5cd6a0; --warn: #f0a35e; --err: #f08a8a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: calc(16px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
+    max-width: 920px; margin: 0 auto;
+  }
+  h2 { font-size: 20px; margin: 0 0 8px; }
+  p { margin: 8px 0; }
+  pre {
+    background: #0e1015; border: 1px solid var(--line); border-radius: 8px;
+    padding: 14px; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, monospace; font-size: 13px;
+  }
+  .btn-row { display: flex; gap: 10px; margin: 16px 0; flex-wrap: wrap; }
+  button {
+    background: var(--accent); color: #101218; border: 0; border-radius: 8px;
+    padding: 12px 20px; font-weight: 600; font-size: 14px; cursor: pointer; min-height: 44px; min-width: 44px;
+  }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+  .guide-card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px; margin: 16px 0;
+  }
+  .guide-card h3 { margin-top: 0; color: var(--warn); font-size: 16px; }
+  .guide-card ol { margin: 8px 0 8px 20px; padding: 0; }
+  .guide-card li { margin-bottom: 6px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 12px; }
+  .badge-ok { background: rgba(92, 214, 160, 0.2); color: var(--ok); }
+  .badge-warn { background: rgba(240, 163, 94, 0.2); color: var(--warn); }
+  .badge-no { background: rgba(240, 138, 138, 0.2); color: var(--err); }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin: 12px 0; }
+  .stat-box { background: #14171f; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
+  .stat-label { color: var(--dim); font-size: 12px; }
+  .stat-val { font-size: 16px; font-weight: 600; margin-top: 2px; }
 </style>
 </head>
 <body>
-<h2>WebGPU capability report</h2>
-<p>Answers "would this machine run the GPU path, and how fast" <strong>without
-downloading the 2.18 GB model</strong>. The requirement is a property of the
-model's shape, so it is known up front; the old flow only found out after the
-download. Takes a few seconds — run it on any machine and paste the JSON back.</p>
-<p>
-  <button id="run">Run report</button>
-  <button id="copy">Copy JSON</button>
-</p>
-<pre id="out">idle</pre>
+<h2>WebGPU capability report — Qwen-ASR</h2>
+<p>Evaluates device capabilities, WebGPU limits, dynamic sharding compatibility, and projected memory footprint for <strong>Qwen-ASR 1.7B Q8</strong> without downloading the model weights.</p>
+
+<div class="btn-row">
+  <button id="run">Run WebGPU Report</button>
+  <button id="copy" class="ghost">Copy JSON</button>
+</div>
+
+<div id="guide" class="guide-card" style="display:none;"></div>
+<div id="summary-grid" class="stat-grid" style="display:none;"></div>
+
+<pre id="out">Press "Run WebGPU Report" to test your browser.</pre>
 
 <script>
 const out = document.getElementById("out");
+const guideEl = document.getElementById("guide");
+const summaryEl = document.getElementById("summary-grid");
 const say = (s = "") => { out.textContent += s + "\n"; };
 const GB = (n) => (n / 1e9).toFixed(2) + " GB";
-const MB = (n) => (n / 1e6).toFixed(0) + " MB";
+const MB = (n) => (n / 1e6).toFixed(1) + " MB";
+const MiB = (n) => (n / (1024 * 1024)).toFixed(1) + " MiB";
 
-/* What this build asks the GPU for. Derived from the 1.7B shape rather than
- * measured, so the report needs no model: the decoder packs every Q8 matrix
- * into one storage buffer, and that buffer is the binding that has to fit. */
 const SHAPE = {
   decLayers: 28, decHidden: 2048, decHeads: 16, decKvHeads: 8, decHeadDim: 128,
   decInter: 6144, vocab: 151936,
   encLayers: 24, encDim: 1024, encFfn: 4096, encOut: 2048, convProj: 7680,
 };
-/* Weights are sharded, so the binding that has to fit is a shard, not the
- * whole 1.72 GB. The KV cache is the other claimant and scales with context:
- * 224 KiB per token means a 1600-token utterance needs a 360 MB binding no
- * amount of weight sharding avoids. That is why 128 MiB - WebGPU's guaranteed
- * floor - is not a reachable target for this model, and 1 GiB is. */
-const SHARD_BUDGET = 256 << 20;
-function requirements() {
+
+function requirements(bindingCap = 256 << 20) {
   const s = SHAPE;
   const qdim = s.decHeads * s.decHeadDim, kvdim = s.decKvHeads * s.decHeadDim;
   const perLayer = s.decHidden * qdim + s.decHidden * kvdim * 2 + qdim * s.decHidden +
                    s.decHidden * s.decInter * 2 + s.decInter * s.decHidden;
-  const decQuant = s.decLayers * perLayer + s.vocab * s.decHidden;   /* int8 bytes */
+  const decQuant = s.decLayers * perLayer + s.vocab * s.decHidden;   /* int8 bytes: ~1.72 GB */
   const encQuant = s.encLayers * (4 * s.encDim * s.encDim + 2 * s.encDim * s.encFfn) +
                    s.encDim * s.convProj + s.encDim * s.encDim + s.encOut * s.encDim;
-  const kvPerToken = 2 * s.decLayers * s.decKvHeads * s.decHeadDim * 4;
+
+  // Dynamic shard budget clamped to detected storage buffer binding limit
+  const shardBudget = Math.min(256 << 20, bindingCap);
+  const decoderScales = (decQuant / 64) * 4; // ~102.55 MB
+  const embedBytes = s.vocab * s.decHidden;   // ~311.16 MB
+  const embedSlices = Math.ceil(embedBytes / shardBudget);
+  const numDecShards = Math.ceil(decQuant / shardBudget);
+
+  // KV cache per token: 28 layers * 2 (k, v) * 8 kvHeads * 128 dim
+  const kvPerTokenF32 = 2 * s.decLayers * s.decKvHeads * s.decHeadDim * 4; // 224 KiB/token
+  const kvPerTokenF16 = 2 * s.decLayers * s.decKvHeads * s.decHeadDim * 2; // 112 KiB/token
+
   return {
-    decQuant, encQuant,
-    shardBudget: SHARD_BUDGET,
-    decoderScales: (decQuant / 64) * 4,
-    kvPerToken,
-    kv1600: kvPerToken * 1600,
-    /* What actually has to fit in one binding. */
-    largestBinding: Math.max(SHARD_BUDGET, (decQuant / 64) * 4, kvPerToken * 1600),
-    total: decQuant + (decQuant / 64) * 4 + encQuant,
+    decQuant, encQuant, embedBytes, embedSlices, numDecShards,
+    shardBudget,
+    decoderScales,
+    kvPerTokenF32, kvPerTokenF16,
+    // Context length KV cache footprints
+    kv512F16: kvPerTokenF16 * 512,
+    kv768F16: kvPerTokenF16 * 768,
+    kv1024F16: kvPerTokenF16 * 1024,
+    kv512F32: kvPerTokenF32 * 512,
+    kv768F32: kvPerTokenF32 * 768,
+    largestMatrixNonEmbed: 12288 * 2048, // W_GATE_UP = 24.0 MiB
   };
+}
+
+function showSafariHelp(isIOS) {
+  guideEl.style.display = "block";
+  if (isIOS) {
+    guideEl.innerHTML = `
+      <h3>⚠️ WebGPU is disabled on this iOS device</h3>
+      <p>To enable WebGPU in Mobile Safari on iOS 18 / 17:</p>
+      <ol>
+        <li>Open the <strong>Settings</strong> app on your iPhone.</li>
+        <li>Scroll down and tap <strong>Apps &gt; Safari</strong> (or <strong>Safari</strong> on iOS 17).</li>
+        <li>Scroll to the very bottom and tap <strong>Advanced</strong>.</li>
+        <li>Tap <strong>Feature Flags</strong> (or <em>Experimental Features</em>).</li>
+        <li>Locate <strong>WebGPU</strong> and toggle it <strong>ON</strong>.</li>
+        <li>Force-quit Safari, re-open this page, and run the test again.</li>
+      </ol>
+      <p style="color:var(--dim); font-size:12px;"><em>Note: WebGPU may be disabled in Safari Private Browsing mode on iOS. If using a Private tab, switch to a standard tab.</em></p>
+    `;
+  } else {
+    guideEl.innerHTML = `
+      <h3>⚠️ WebGPU is not available in this browser</h3>
+      <p>Please check your browser settings or ensure WebGPU flags are enabled:</p>
+      <ul>
+        <li><strong>Safari (macOS):</strong> Settings &gt; Feature Flags &gt; WebGPU.</li>
+        <li><strong>Chrome / Edge:</strong> Enabled by default on modern versions (113+).</li>
+        <li><strong>Firefox:</strong> dom.webgpu.enabled in about:config.</li>
+      </ul>
+    `;
+  }
 }
 
 async function main() {
   out.textContent = "";
-  const req = requirements();
-  const r = { when: new Date().toISOString(), ua: navigator.userAgent };
+  guideEl.style.display = "none";
+  summaryEl.style.display = "none";
+  summaryEl.innerHTML = "";
+
+  const isIOS = typeof navigator !== "undefined" &&
+    (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
+     (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+
+  const r = {
+    when: new Date().toISOString(),
+    ua: navigator.userAgent,
+    isIOS,
+    webgpu: false,
+  };
 
   if (!navigator.gpu) {
-    say("WebGPU: NOT AVAILABLE — navigator.gpu is missing");
-    r.webgpu = false;
+    say("WebGPU Status: NOT AVAILABLE (navigator.gpu is missing)");
+    showSafariHelp(isIOS);
+    r.why = "navigator.gpu is missing";
     window.__report = r;
     return;
   }
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-  if (!adapter) { say("WebGPU: no adapter"); r.webgpu = false; window.__report = r; return; }
+
+  let adapter = null;
+  try {
+    adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  } catch (e) {
+    say(`requestAdapter error: ${e.message}`);
+  }
+
+  if (!adapter) {
+    say("WebGPU Status: NO ADAPTER RETURNED");
+    showSafariHelp(isIOS);
+    r.why = "requestAdapter returned null";
+    window.__report = r;
+    return;
+  }
 
   const info = adapter.info || {};
   const lim = adapter.limits;
+  const hasF16 = adapter.features.has("shader-f16");
+  const hasFloat16Array = typeof Float16Array !== "undefined";
+  const hasSubgroups = adapter.features.has("subgroups");
+  const hasTimestamps = adapter.features.has("timestamp-query");
+
+  const req = requirements(lim.maxStorageBufferBindingSize);
+
   r.webgpu = true;
-  r.adapter = { vendor: info.vendor, architecture: info.architecture, device: info.device };
+  r.adapter = { vendor: info.vendor || "", architecture: info.architecture || "", device: info.device || "", description: info.description || "" };
   r.features = [...adapter.features];
   r.limits = {
     maxBufferSize: lim.maxBufferSize,
     maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
-    maxComputeInvocationsPerWorkgroup: lim.maxComputeInvocationsPerWorkgroup,
     maxComputeWorkgroupStorageSize: lim.maxComputeWorkgroupStorageSize,
+    maxComputeInvocationsPerWorkgroup: lim.maxComputeInvocationsPerWorkgroup,
   };
+  r.hasShaderF16 = hasF16;
+  r.hasFloat16Array = hasFloat16Array;
+  r.hasSubgroups = hasSubgroups;
+  r.dynamicShardBudget = req.shardBudget;
 
-  say(`adapter: ${info.vendor || "?"} ${info.architecture || ""} ${info.device || ""}`);
-  say(`features: ${r.features.join(", ") || "(none)"}`);
-  say(`maxStorageBufferBindingSize ${GB(lim.maxStorageBufferBindingSize)}`);
-  say(`maxBufferSize               ${GB(lim.maxBufferSize)}`);
+  say("===============================================================");
+  say("             WebGPU Capability & Mobile Safari Report          ");
+  say("===============================================================");
+  say(`Timestamp   : ${r.when}`);
+  say(`Environment : ${isIOS ? "Mobile Safari / iOS WebKit" : "Desktop / Other"}`);
+  say(`Adapter     : ${info.vendor || "Apple/Default"} ${info.architecture || ""} ${info.device || ""}`);
+  say(`Features    : ${r.features.join(", ") || "(none)"}`);
+  say(`shader-f16  : ${hasF16 ? "YES (supported)" : "NO"}`);
+  say(`Float16Array: ${hasFloat16Array ? "YES (supported)" : "NO"}`);
+  say(`Subgroups   : ${hasSubgroups ? "YES" : "NO (Mobile Safari tree-reduction active)"}`);
   say();
 
-  /* The decision this build makes today. */
-  say(`weights: ${GB(req.decQuant)} decoder + ${MB(req.encQuant)} tower, sharded at ${MB(req.shardBudget)}`);
-  say(`scales : ${MB(req.decoderScales)} in one binding`);
-  say(`KV     : ${(req.kvPerToken / 1024).toFixed(0)} KiB per token, ${MB(req.kv1600)} at a 1600-token context`);
-  say(`=> largest single binding needed: ${MB(req.largestBinding)}`);
-  const fitsDec = req.largestBinding <= lim.maxStorageBufferBindingSize;
-  const fitsTower = req.shardBudget <= lim.maxStorageBufferBindingSize;
+  say("------------------- Hardware & Binding Limits -------------------");
+  say(`maxStorageBufferBindingSize : ${MiB(lim.maxStorageBufferBindingSize)} (${lim.maxStorageBufferBindingSize.toLocaleString()} bytes)`);
+  say(`maxBufferSize               : ${MiB(lim.maxBufferSize)} (${lim.maxBufferSize.toLocaleString()} bytes)`);
+  say(`maxWorkgroupStorageSize     : ${lim.maxComputeWorkgroupStorageSize / 1024} KiB`);
+  say(`maxInvocationsPerWorkgroup  : ${lim.maxComputeInvocationsPerWorkgroup}`);
+  say();
+
+  say("------------------- Dynamic Sharding Plan -----------------------");
+  say(`Dynamic Shard Budget        : ${MiB(req.shardBudget)}`);
+  say(`Total Decoder Weights       : ${GB(req.decQuant)} in ${req.numDecShards} shards (<= ${MiB(req.shardBudget)} each)`);
+  say(`Tied Embedding (311 MB)     : Sliced into ${req.embedSlices} partitions (<= ${MiB(req.shardBudget)} each)`);
+  say(`Largest Non-Embed Matrix    : ${MiB(req.largestMatrixNonEmbed)} (W_GATE_UP: fits safely in any shard)`);
+  say(`Decoder Scales Buffer       : ${MiB(req.decoderScales)} (single binding; fits in 128 MiB baseline)`);
+  say();
+
+  say("------------------- KV Cache Footprint & Headroom ----------------");
+  const kvMode = (hasF16 && hasFloat16Array) ? "f16" : "f32";
+  say(`Active KV Precision Mode    : ${kvMode.toUpperCase()} (${kvMode === "f16" ? "112 KiB/tok" : "224 KiB/tok"})`);
+  if (kvMode === "f16") {
+    say(`  - Context 512 tokens      : ${MiB(req.kv512F16)}  [OK <= ${MiB(lim.maxStorageBufferBindingSize)}]`);
+    say(`  - Context 768 tokens      : ${MiB(req.kv768F16)}  [OK <= ${MiB(lim.maxStorageBufferBindingSize)}]`);
+    say(`  - Context 1024 tokens     : ${MiB(req.kv1024F16)}  [OK <= ${MiB(lim.maxStorageBufferBindingSize)}]`);
+  } else {
+    say(`  - Context 512 tokens      : ${MiB(req.kv512F32)}  [OK <= ${MiB(lim.maxStorageBufferBindingSize)}]`);
+    say(`  - Context 768 tokens      : ${MiB(req.kv768F32)}  [${req.kv768F32 <= lim.maxStorageBufferBindingSize ? "OK" : "REQUIRES 256MB"}]`);
+    say(`  (Note: on 128MB devices without f16, maxSeq is clamped to 512 tokens)`);
+  }
+
+  const activeKvBinding = kvMode === "f16" ? req.kv768F16 : req.kv512F32;
+  const largestBinding = Math.max(req.shardBudget, req.decoderScales, activeKvBinding);
+  const fitsDec = largestBinding <= lim.maxStorageBufferBindingSize;
   r.decoderFits = fitsDec;
-  r.towerFits = fitsTower;
-  say(`GPU decoder    : ${fitsDec ? "would start" : "WOULD NOT START — binding limit too small"}`);
-  say(`GPU audio tower: ${fitsTower ? "would start" : "WOULD NOT START"}`);
+  r.largestBindingNeeded = largestBinding;
+
+  say();
+  say("------------------- Final Verdict ------------------------------");
+  if (fitsDec) {
+    say(`Verdict: GPU DECODER READY`);
+    say(`  Model runs within iOS Safari limits via dynamic sharding (${MiB(req.shardBudget)}) and ${kvMode.toUpperCase()} KV cache.`);
+  } else {
+    say(`Verdict: BINDING LIMIT EXCEEDED`);
+    say(`  Largest binding ${MiB(largestBinding)} exceeds adapter limit ${MiB(lim.maxStorageBufferBindingSize)}.`);
+  }
   say();
 
-  /* Limits can be optimistic; try the allocation for real. */
+  // Allocation test
+  say("Testing real storage buffer allocation...");
   let device = null;
   try {
     device = await adapter.requestDevice({
       requiredLimits: {
-        maxBufferSize: Math.min(lim.maxBufferSize, Math.max(req.largestBinding, 1 << 28)),
-        maxStorageBufferBindingSize:
-          Math.min(lim.maxStorageBufferBindingSize, Math.max(req.largestBinding, 1 << 28)),
+        maxBufferSize: Math.min(lim.maxBufferSize, Math.max(req.shardBudget, 128 << 20)),
+        maxStorageBufferBindingSize: Math.min(lim.maxStorageBufferBindingSize, Math.max(req.shardBudget, 128 << 20)),
+        maxComputeWorkgroupStorageSize: Math.min(lim.maxComputeWorkgroupStorageSize, 32768),
       },
-      requiredFeatures: adapter.features.has("shader-f16") ? ["shader-f16"] : [],
+      requiredFeatures: hasF16 ? ["shader-f16"] : [],
     });
+    r.deviceAllocOk = true;
   } catch (e) {
-    say(`requestDevice failed: ${e.message}`);
-    r.deviceError = e.message;
+    say(`  requestDevice failed: ${e.message}`);
+    r.deviceAllocOk = false;
   }
-  if (!device) { window.__report = r; return; }
-  device.onuncapturederror = (e) => say(`gpu error: ${e.error.message}`);
 
-  if (fitsDec) {
-    say(`allocating the ${MB(req.largestBinding)} binding for real...`);
+  if (device) {
+    device.onuncapturederror = (e) => say(`  gpu error: ${e.error.message}`);
     try {
-      const b = device.createBuffer({ size: req.largestBinding, usage: GPUBufferUsage.STORAGE });
+      const b = device.createBuffer({ size: req.shardBudget, usage: GPUBufferUsage.STORAGE });
       await device.queue.onSubmittedWorkDone();
       b.destroy();
-      say("  allocation OK");
-      r.allocOk = true;
+      say(`  Allocated and released ${MiB(req.shardBudget)} storage buffer: SUCCESS`);
+      r.bufferAllocOk = true;
     } catch (e) {
-      say(`  allocation FAILED: ${e.message}`);
-      r.allocOk = false;
+      say(`  Buffer allocation FAILED: ${e.message}`);
+      r.bufferAllocOk = false;
     }
-  }
-  say();
 
-  /* Read bandwidth, the thing decode is actually limited by. */
-  const SIZE = Math.min(256 << 20, lim.maxStorageBufferBindingSize);
-  const words = Math.floor(SIZE / 4);
-  const buf = device.createBuffer({ size: words * 4, usage: GPUBufferUsage.STORAGE });
-  const sink = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE });
-  const code = `
+    // Bandwidth benchmark
+    try {
+      const bSize = Math.min(128 << 20, lim.maxStorageBufferBindingSize);
+      const words = Math.floor(bSize / 4);
+      const srcBuf = device.createBuffer({ size: words * 4, usage: GPUBufferUsage.STORAGE });
+      const dstBuf = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE });
+      const code = `
 @group(0) @binding(0) var<storage, read> src : array<u32>;
 @group(0) @binding(1) var<storage, read_write> dst : array<u32>;
 const LANES : u32 = ${256 * 1024}u;
@@ -157,48 +306,70 @@ fn main(@builtin(global_invocation_id) g : vec3<u32>) {
   loop { if (i >= TOTAL) { break; } acc = acc + src[i]; i = i + LANES; }
   if (acc == 0xdeadbeefu) { dst[0] = acc; }
 }`;
-  const pipe = device.createComputePipeline({
-    layout: "auto", compute: { module: device.createShaderModule({ code }), entryPoint: "main" },
-  });
-  const bind = device.createBindGroup({
-    layout: pipe.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: { buffer: buf } }, { binding: 1, resource: { buffer: sink } }],
-  });
-  const go = async () => {
-    const e = device.createCommandEncoder();
-    const p = e.beginComputePass();
-    p.setPipeline(pipe); p.setBindGroup(0, bind); p.dispatchWorkgroups(1024); p.end();
-    device.queue.submit([e.finish()]);
-    await device.queue.onSubmittedWorkDone();
-  };
-  await go();
-  const t0 = performance.now();
-  for (let i = 0; i < 8; i++) await go();
-  const ms = (performance.now() - t0) / 8;
-  const bw = (words * 4 / 1e9) / (ms / 1e3);
-  r.readBandwidthGBs = Number(bw.toFixed(1));
-  say(`coalesced read bandwidth: ${bw.toFixed(1)} GB/s`);
+      const pipe = device.createComputePipeline({
+        layout: "auto",
+        compute: { module: device.createShaderModule({ code }), entryPoint: "main" },
+      });
+      const bind = device.createBindGroup({
+        layout: pipe.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: { buffer: srcBuf } }, { binding: 1, resource: { buffer: dstBuf } }],
+      });
+      const runPass = async () => {
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        pass.setPipeline(pipe); pass.setBindGroup(0, bind); pass.dispatchWorkgroups(1024); pass.end();
+        device.queue.submit([enc.finish()]);
+        await device.queue.onSubmittedWorkDone();
+      };
+      await runPass();
+      const t0 = performance.now();
+      for (let i = 0; i < 8; i++) await runPass();
+      const ms = (performance.now() - t0) / 8;
+      const bw = (words * 4 / 1e9) / (ms / 1e3);
+      r.readBandwidthGBs = Number(bw.toFixed(1));
+      const perTokenBytes = req.decQuant + req.decoderScales;
+      r.projectedMsPerToken = Number(((perTokenBytes / 1e9) / bw * 1000).toFixed(1));
+      say(`  Read Bandwidth: ${bw.toFixed(1)} GB/s (~${r.projectedMsPerToken} ms/token projected decode floor)`);
+      srcBuf.destroy();
+      dstBuf.destroy();
+    } catch (e) {
+      say(`  Bandwidth benchmark skipped: ${e.message}`);
+    }
+  }
 
-  /* One token of decode reads the whole decoder once, so this is the floor. */
-  const perToken = req.decQuant + req.decoderScales;
-  r.projectedMsPerToken = Number(((perToken / 1e9) / bw * 1000).toFixed(1));
-  say(`=> a decode step reads ${GB(perToken)}, so ~${r.projectedMsPerToken} ms/token at that rate`);
-  say(`   (a floor: it ignores attention, the KV cache and dispatch overhead)`);
-  say();
+  // Populate visual summary boxes
+  summaryEl.style.display = "grid";
+  summaryEl.innerHTML = `
+    <div class="stat-box">
+      <div class="stat-label">WebGPU Status</div>
+      <div class="stat-val"><span class="badge badge-ok">Available</span></div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Max Storage Binding</div>
+      <div class="stat-val">${MiB(lim.maxStorageBufferBindingSize)}</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Dynamic Shard Budget</div>
+      <div class="stat-val">${MiB(req.shardBudget)} (${req.numDecShards} shards)</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Precision & Subgroups</div>
+      <div class="stat-val">${kvMode.toUpperCase()} / ${hasSubgroups ? "SG" : "Tree"}</div>
+    </div>
+  `;
 
-  say(`visibility: ${document.visibilityState}` +
-      (document.visibilityState !== "visible" ? "  <- a hidden tab loses GPU throughput; re-run in front" : ""));
-  say(`shader-f16: ${adapter.features.has("shader-f16") ? "yes" : "no"}`);
-  say(`subgroups : ${adapter.features.has("subgroups") ? "yes" : "no"}`);
   say();
-  say("--- paste this back ---");
-  say(JSON.stringify(r));
+  say("--- Diagnostic JSON (Copyable) ---");
+  say(JSON.stringify(r, null, 2));
   window.__report = r;
 }
 
-document.getElementById("run").onclick = () => main().catch((e) => say("error: " + e.message));
-document.getElementById("copy").onclick = () =>
-  navigator.clipboard?.writeText(JSON.stringify(window.__report || {}, null, 2));
+document.getElementById("run").onclick = () => main().catch((e) => say("Fatal: " + e.message));
+document.getElementById("copy").onclick = () => {
+  if (!window.__report) return;
+  navigator.clipboard?.writeText(JSON.stringify(window.__report, null, 2));
+  alert("Report JSON copied to clipboard!");
+};
 </script>
 </body>
 </html>

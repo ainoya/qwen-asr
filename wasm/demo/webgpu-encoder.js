@@ -627,86 +627,209 @@ export class WebGPUEncoder {
       console.error(`GPU device lost (${this.lost})`);
       report(`GPU device lost (${this.lost}); falling back to wasm`);
     });
-    this.device.addEventListener("uncapturederror", (e) => {
-      console.error("gpu error:", e.error.message);
-      report("gpu error: " + e.error.message);
-    });
+    if (this.device.addEventListener) {
+      if (this._onUncapturedError && this.device.removeEventListener) {
+        try { this.device.removeEventListener("uncapturederror", this._onUncapturedError); } catch (_) {}
+      }
+      this._onUncapturedError = (e) => {
+        console.error("gpu error:", e.error.message);
+        report("gpu error: " + e.error.message);
+      };
+      this.device.addEventListener("uncapturederror", this._onUncapturedError);
+    }
 
     await this.loadWeights(report);
-    await this.buildPipelines();
-    this.ready = true;
+    await this.finishInit();
+  }
+
+  allocateStorageBuffers(opts = {}) {
+    this.destroyed = false;
+    try {
+      const M = this.M;
+      if (opts.device && !this.device) {
+        this.device = opts.device;
+        this.adapter = opts.adapter || this.adapter;
+        this.hasTimestamps = this.device.features?.has?.("timestamp-query");
+        this.sgExact32 = this.device.features?.has?.("subgroups") &&
+          (this.adapter?.info?.subgroupMinSize === 32) && (this.adapter?.info?.subgroupMaxSize === 32);
+        if (this.device?.addEventListener) {
+          if (this._onUncapturedError && this.device.removeEventListener) {
+            try { this.device.removeEventListener("uncapturederror", this._onUncapturedError); } catch (_) {}
+          }
+          this._onUncapturedError = (e) => {
+            console.error("gpu error:", e.error.message);
+          };
+          this.device.addEventListener("uncapturederror", this._onUncapturedError);
+        }
+      }
+      const device = this.device;
+      if (!device) throw new Error("WebGPUEncoder: device must be initialized before allocateStorageBuffers");
+
+      // 1. Resolve shapes
+      if (opts.shape) {
+        this.dModel = opts.shape.dModel;
+        this.layers = opts.shape.layers;
+        this.heads = opts.shape.heads;
+        this.headDim = opts.shape.headDim;
+        this.ffnDim = opts.shape.ffnDim;
+        this.outDim = opts.shape.outDim;
+        this.nWindow = opts.shape.nWindow || 50;
+        this.nWindowInfer = opts.shape.nWindowInfer || 800;
+        this.chunkSize = opts.shape.chunkSize || 100;
+        this.convProjDim = opts.shape.convProjDim || 7680;
+        this.convHidden = opts.shape.convHidden || 480;
+      } else if (!this.dModel) {
+        if (opts.header) {
+          const is17b = opts.header["thinker.model.layers.0.input_layernorm.weight"]?.shape?.[0] === 2048;
+          this.dModel = is17b ? 1024 : 896;
+          let l = 0;
+          while (opts.header[`thinker.audio_tower.layers.${l}.self_attn.q_proj.weight.q8`]) l++;
+          this.layers = l || (is17b ? 24 : 18);
+          this.heads = is17b ? 16 : 14;
+          this.headDim = 64;
+          this.ffnDim = is17b ? 4096 : 3584;
+          this.outDim = is17b ? 2048 : 1024;
+          this.nWindow = 50;
+          this.nWindowInfer = 800;
+          this.chunkSize = 100;
+          this.convProjDim = is17b ? 7680 : 6720;
+          this.convHidden = opts.header["thinker.audio_tower.conv2d1.bias"]?.shape?.[0] || 480;
+        } else {
+          const shPtr = M._qwen_wasm_alloc(16 * 4) >>> 0;
+          if (M._qwen_wasm_enc_shape(shPtr) < 0) throw new Error("encoder shape unavailable");
+          const sh = new Int32Array(freshHeap(M).HEAPU8.buffer, shPtr, 16).slice();
+          M._qwen_wasm_release(shPtr);
+          this.dModel = sh[0];
+          this.layers = sh[1];
+          this.heads = sh[2];
+          this.headDim = sh[3];
+          this.ffnDim = sh[4];
+          this.outDim = sh[5];
+          this.nWindow = sh[6];
+          this.nWindowInfer = sh[7];
+          this.chunkSize = sh[8];
+          this.convProjDim = sh[9];
+          this.convHidden = sh[10];
+        }
+      }
+
+      const down = (w) => Math.floor((w + 2 - 3) / 2) + 1;
+      this.tokensPerChunk = down(down(down(this.chunkSize)));
+      this.window = this.tokensPerChunk * Math.floor(this.nWindowInfer / this.chunkSize);
+      this.maxPeT = 0;
+      this.ensurePeTable(16);
+      this.convGroup = 8;
+
+      // 2. Dynamic SHARD_BUDGET
+      const maxBinding = this.adapter?.limits?.maxStorageBufferBindingSize ||
+                         this.device?.limits?.maxStorageBufferBindingSize ||
+                         (128 << 20);
+      const SHARD_BUDGET = Math.min(opts.shardBudget || (256 << 20), maxBinding);
+      const shards = [{ bytes: 0 }];
+
+      // 3. Resolve records
+      let recs = opts.entries || this.weightSource?.entries;
+      if (!recs) {
+        const MAXD = 1024;
+        const dPtr = M._qwen_wasm_alloc(MAXD * 8 * 4) >>> 0;
+        const n = M._qwen_wasm_enc_desc(dPtr, MAXD);
+        if (n < 0) { M._qwen_wasm_release(dPtr); throw new Error("encoder weights unavailable"); }
+        const d = new Uint32Array(freshHeap(M).HEAPU8.buffer, dPtr, n * 8).slice();
+        M._qwen_wasm_release(dPtr);
+        recs = [];
+        for (let i = 0; i < n; i++) {
+          const e = d.subarray(i * 8, i * 8 + 8);
+          recs.push({ kind: e[0], layer: e[1], rows: e[2], cols: e[3],
+                      qPtr: e[4], sPtr: e[5], fPtr: e[6], count: e[7] });
+        }
+      }
+
+      let qBytes = 0, sFloats = 0, vFloats = 0;
+      const entries = [];
+      for (const rec of recs) {
+        if (rec.qPtr || rec.qoff != null) {
+          if (rec.cols % 64 !== 0) throw new Error(`kind ${rec.kind}: cols ${rec.cols} not a multiple of 64`);
+          const nq = rec.rows * rec.cols;
+          let sh = shards[shards.length - 1];
+          if (sh.bytes > 0 && sh.bytes + nq > SHARD_BUDGET) {
+            shards.push({ bytes: 0 });
+            sh = shards[shards.length - 1];
+          }
+          rec.shard = shards.length - 1;
+          rec.wordBase = sh.bytes / 4;
+          rec.scaleBase = sFloats;
+          sh.bytes += nq;
+          qBytes += nq;
+          sFloats += rec.rows * (rec.cols / 64);
+        } else if ((rec.fPtr || rec.foff != null) && rec.count) {
+          rec.vecBase = vFloats;
+          vFloats += rec.count;
+        } else {
+          throw new Error(`kind ${rec.kind}: unsupported weight record`);
+        }
+        entries.push(rec);
+      }
+      this.entries = entries;
+      this.zeroVec = vFloats;
+      vFloats += Math.max(this.dModel, this.outDim);
+
+      const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+      this.bufQuants = [];
+      for (const sh of shards) {
+        this.bufQuants.push(this.device.createBuffer({ size: Math.max(4, sh.bytes), usage }));
+      }
+      this.shardCount = shards.length;
+      this.shards = shards;
+      this.bufScales = this.device.createBuffer({ size: Math.max(4, sFloats * 4), usage });
+      this.bufVecs = this.device.createBuffer({ size: Math.max(4, vFloats * 4), usage });
+      this.weightBytes = qBytes + sFloats * 4 + vFloats * 4;
+
+      return {
+        bufQuants: this.bufQuants,
+        bufScales: this.bufScales,
+        bufVecs: this.bufVecs,
+        entries: this.entries,
+        shards,
+        weightBytes: this.weightBytes,
+      };
+    } catch (err) {
+      this.destroy();
+      throw err;
+    }
+  }
+
+  async finishInit() {
+    if (this.destroyed) return;
+    if (this.ready) return;
+    if (this._initPromise) return this._initPromise;
+
+    this._initPromise = (async () => {
+      try {
+        if (this.destroyed) return;
+        await this.buildPipelines();
+        if (this.destroyed) return;
+        this.ready = true;
+      } finally {
+        this._initPromise = null;
+        this._finishInitPromise = null;
+      }
+    })();
+    this._finishInitPromise = this._initPromise;
+    return this._initPromise;
   }
 
   /* Read the descriptor table and pack every weight into three buffers:
    * int8 quants, their f32 scales, and the plain f32 vectors. */
   async loadWeights(report) {
     const M = this.M;
-    /* Either the C descriptor table (weights in the wasm heap) or an injected
-     * weightSource whose records carry file offsets and an async reader; see
-     * webgpu-decoder.js. Records must arrive in the C emission order. */
-    let recs;
-    if (this.weightSource) {
-      recs = this.weightSource.entries;
-    } else {
-      const MAXD = 1024;
-      const dPtr = M._qwen_wasm_alloc(MAXD * 8 * 4) >>> 0;
-      const n = M._qwen_wasm_enc_desc(dPtr, MAXD);
-      if (n < 0) { M._qwen_wasm_release(dPtr); throw new Error("encoder weights unavailable"); }
-      const d = new Uint32Array(freshHeap(M).HEAPU8.buffer, dPtr, n * 8).slice();
-      M._qwen_wasm_release(dPtr);
-      recs = [];
-      for (let i = 0; i < n; i++) {
-        const e = d.subarray(i * 8, i * 8 + 8);
-        recs.push({ kind: e[0], layer: e[1], rows: e[2], cols: e[3],
-                    qPtr: e[4], sPtr: e[5], fPtr: e[6], count: e[7] });
-      }
+    if (!this.bufQuants) {
+      this.allocateStorageBuffers({
+        shardBudget: this.opts?.shardBudget,
+        entries: this.weightSource?.entries,
+      });
     }
 
-    /* Same shard budget as the decoder, and for the same reason: one binding
-     * holding all 313 MB needs a limit tier that not every device offers. No
-     * encoder matrix is larger than 4 MB, so nothing has to be split. */
-    const SHARD_BUDGET = 256 << 20;
-    const shards = [{ bytes: 0 }];
-
-    let qBytes = 0, sFloats = 0, vFloats = 0;
-    const entries = [];
-    /* The conv-out projection has no bias, but the GEMM always adds one, so
-     * reserve a run of zeros for it rather than branching in the shader. */
-    for (const rec of recs) {
-      if (rec.qPtr || rec.qoff != null) {
-        if (rec.cols % 64 !== 0) throw new Error(`kind ${rec.kind}: cols ${rec.cols} not a multiple of 64`);
-        const nq = rec.rows * rec.cols;
-        let sh = shards[shards.length - 1];
-        if (sh.bytes > 0 && sh.bytes + nq > SHARD_BUDGET) {
-          shards.push({ bytes: 0 });
-          sh = shards[shards.length - 1];
-        }
-        rec.shard = shards.length - 1;
-        rec.wordBase = sh.bytes / 4;
-        rec.scaleBase = sFloats;
-        sh.bytes += nq;
-        qBytes += nq;
-        sFloats += rec.rows * (rec.cols / 64);
-      } else if ((rec.fPtr || rec.foff != null) && rec.count) {
-        rec.vecBase = vFloats;
-        vFloats += rec.count;
-      } else {
-        throw new Error(`kind ${rec.kind}: f32 matrices are not supported on the GPU path`);
-      }
-      entries.push(rec);
-    }
-    this.entries = entries;
-    this.zeroVec = vFloats;
-    vFloats += Math.max(this.dModel, this.outDim);
-
-    report(`allocating ${((qBytes + sFloats * 4 + vFloats * 4) / 1e9).toFixed(2)} GB on the GPU...`);
-    const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
-    this.bufQuants = shards.map((sh) =>
-      this.device.createBuffer({ size: Math.max(4, sh.bytes), usage }));
-    this.shardCount = shards.length;
-    this.bufScales = this.device.createBuffer({ size: Math.max(4, sFloats * 4), usage });
-    this.bufVecs = this.device.createBuffer({ size: Math.max(4, vFloats * 4), usage });
-    this.weightBytes = qBytes + sFloats * 4 + vFloats * 4;
+    report(`allocating ${(this.weightBytes / 1e9).toFixed(2)} GB on the GPU...`);
 
     const src = this.weightSource;
     const put = async (buf, dstOff, off, len) => {
@@ -767,25 +890,44 @@ export class WebGPUEncoder {
   }
 
   async buildPipelines() {
+    if (this.destroyed) return;
     const layout = this.pipelineLayout();
     const mk = async (code, label) => {
+      if (this.destroyed) return null;
       const mod = this.device.createShaderModule({ code });
       const info = await mod.getCompilationInfo?.();
+      if (this.destroyed) return null;
       const errs = (info?.messages || []).filter((m) => m.type === "error");
       if (errs.length) throw new Error(`${label}: ${errs.map((m) => `${m.lineNum}: ${m.message}`).join("; ")}`);
+      if (this.destroyed) return null;
       const pipe = this.device.createComputePipeline({
         layout, compute: { module: mod, entryPoint: "main" },
       });
       pipe.label = label;
       return pipe;
     };
-    this.pipeLN = await mk(LN_WGSL, "layernorm");
-    this.pipeMatmul = await mk(MATMUL_WGSL, "matmul");
-    this.pipeAttn = await mk(ATTN_WGSL, "attention");
-    this.pipeAttnSg = this.sgExact32 ? await mk(ATTN_SG_WGSL, "attention_sg") : null;
-    this.pipeConv = await mk(CONV_WGSL, "conv2d");
-    this.pipeReshape = await mk(RESHAPE_WGSL, "reshape");
-    this.pipeAdd = await mk(ADD_WGSL, "add");
+    const pLN = await mk(LN_WGSL, "layernorm");
+    if (this.destroyed) return;
+    const pMatmul = await mk(MATMUL_WGSL, "matmul");
+    if (this.destroyed) return;
+    const pAttn = await mk(ATTN_WGSL, "attention");
+    if (this.destroyed) return;
+    const pAttnSg = this.sgExact32 ? await mk(ATTN_SG_WGSL, "attention_sg") : null;
+    if (this.destroyed) return;
+    const pConv = await mk(CONV_WGSL, "conv2d");
+    if (this.destroyed) return;
+    const pReshape = await mk(RESHAPE_WGSL, "reshape");
+    if (this.destroyed) return;
+    const pAdd = await mk(ADD_WGSL, "add");
+    if (this.destroyed) return;
+
+    this.pipeLN = pLN;
+    this.pipeMatmul = pMatmul;
+    this.pipeAttn = pAttn;
+    this.pipeAttnSg = pAttnSg;
+    this.pipeConv = pConv;
+    this.pipeReshape = pReshape;
+    this.pipeAdd = pAdd;
   }
 
   /* Activation regions. The transformer's are all [rows][seqPad] so its
@@ -1283,5 +1425,159 @@ export class WebGPUEncoder {
       for (let i = 0; i < this.outDim; i++)
         out[t * this.outDim + i] = flat[i * this.seqPad + t];
     return out;
+  }
+
+  /**
+   * Returns the dynamic sum of bytes across all active, non-destroyed GPU storage buffers.
+   * Dynamically sums bufQuants, bufScales, bufVecs, bufConv1Out, bufConv2Out, and bufAct.
+   */
+  getActiveGpuBytes() {
+    if (this.destroyed) return 0;
+    let bytes = 0;
+    if (this.bufQuants && Array.isArray(this.bufQuants)) {
+      for (const b of this.bufQuants) {
+        if (b && !b.destroyed && typeof b.size === "number") {
+          bytes += b.size;
+        }
+      }
+    }
+    const singleBuffers = [
+      this.bufScales,
+      this.bufVecs,
+      this.bufConv1Out,
+      this.bufConv2Out,
+      this.bufAct,
+    ];
+    for (const b of singleBuffers) {
+      if (b && !b.destroyed && typeof b.size === "number") {
+        bytes += b.size;
+      }
+    }
+    return bytes;
+  }
+
+  /**
+   * Explicitly and idempotently releases all WebGPU GPUBuffer instances, bind groups,
+   * pipelines, host tables, and internal state.
+   */
+  destroy() {
+    this.ready = false;
+    this.destroyed = true;
+    this._initPromise = null;
+    this._finishInitPromise = null;
+
+    if (this.device && this._onUncapturedError) {
+      try {
+        if (typeof this.device.removeEventListener === "function") {
+          this.device.removeEventListener("uncapturederror", this._onUncapturedError);
+        }
+      } catch (_) {}
+      this._onUncapturedError = null;
+    }
+
+    // 1. Destroy quantized weight storage buffers (array of buffers, one per shard)
+    if (this.bufQuants && Array.isArray(this.bufQuants)) {
+      for (const b of this.bufQuants) {
+        try {
+          if (b) {
+            b.destroyed = true;
+            if (typeof b.destroy === "function") b.destroy();
+          }
+        } catch (_) {}
+      }
+      this.bufQuants = null;
+    }
+
+    // 2. Destroy scales and vector bias storage buffers
+    try {
+      if (this.bufScales) {
+        this.bufScales.destroyed = true;
+        if (typeof this.bufScales.destroy === "function") this.bufScales.destroy();
+      }
+    } catch (_) {}
+    this.bufScales = null;
+
+    try {
+      if (this.bufVecs) {
+        this.bufVecs.destroyed = true;
+        if (typeof this.bufVecs.destroy === "function") this.bufVecs.destroy();
+      }
+    } catch (_) {}
+    this.bufVecs = null;
+
+    try {
+      if (this.bufConv1Out) {
+        this.bufConv1Out.destroyed = true;
+        if (typeof this.bufConv1Out.destroy === "function") this.bufConv1Out.destroy();
+      }
+    } catch (_) {}
+    this.bufConv1Out = null;
+
+    try {
+      if (this.bufConv2Out) {
+        this.bufConv2Out.destroyed = true;
+        if (typeof this.bufConv2Out.destroy === "function") this.bufConv2Out.destroy();
+      }
+    } catch (_) {}
+    this.bufConv2Out = null;
+
+    // 3. Destroy activation and attention scratch buffers
+    try {
+      if (this.bufAct) {
+        this.bufAct.destroyed = true;
+        if (typeof this.bufAct.destroy === "function") this.bufAct.destroy();
+      }
+    } catch (_) {}
+    this.bufAct = null;
+
+    try {
+      if (this.bufScratch && typeof this.bufScratch.destroy === "function") this.bufScratch.destroy();
+    } catch (_) {}
+    this.bufScratch = null;
+
+    // 4. Destroy uniform parameter and readback staging buffers
+    try {
+      if (this.bufParams && typeof this.bufParams.destroy === "function") this.bufParams.destroy();
+    } catch (_) {}
+    this.bufParams = null;
+
+    try {
+      if (this.readBuf) {
+        try { this.readBuf.unmap(); } catch (_) {}
+        if (typeof this.readBuf.destroy === "function") this.readBuf.destroy();
+      }
+    } catch (_) {}
+    this.readBuf = null;
+
+    // 5. Clear bind groups cache, layouts, and pipelines
+    if (this.bindCache) {
+      try { this.bindCache.clear(); } catch (_) {}
+      this.bindCache = null;
+    }
+    this._bgl = null;
+    this.pipe = null;
+    this.pipeTree = null;
+
+    // 6. Clear host parameter arrays, lookup entries, and PE tables
+    this.host = null;
+    this.hostU = null;
+    this.hostF = null;
+    this.peTable = null;
+    this.entries = null;
+    this.shards = null;
+    this.steps = null;
+    this.slotDefs = null;
+    this.slotShard = null;
+
+    // 7. Reset capacity tracking
+    this.actCapBytes = 0;
+    this.scratchCapBytes = 0;
+    this.paramsCapBytes = 0;
+    this.readCapBytes = 0;
+    this.maxPeT = 0;
+
+    // 8. Mark lifecycle state
+    this.ready = false;
+    this.destroyed = true;
   }
 }

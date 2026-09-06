@@ -27,6 +27,8 @@ let sampleBuf = 0;
 let sampleCap = 0;
 let poller = null;
 let gpu = null, encoder = null;
+let gpuDevice = null, gpuAdapter = null;
+let isDeviceLost = false;
 /* Set when the wasm image was reduced because the GPU owns the transformer
  * weights; a GPU failure then means reloading with the full image, since the
  * CPU has nothing to decode with. */
@@ -268,78 +270,73 @@ async function fetchModelToOpfs(url, total) {
  * prompt assembly reads a small cached set of embedding rows back on demand. */
 const DROP_RE = /^thinker\.model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate_up|down_proj))\.weight\.q8s?$|^thinker\.model\.embed_tokens\.weight\.q8s?$|^thinker\.audio_tower\./;
 
-/* Random-access source for the packed model: the OPFS cache when it can hold
- * the file, else a JS ArrayBuffer held only until the GPU upload finishes -
- * JS memory, unlike wasm memory, is returned when dropped. (Some embedded
- * profiles cap OPFS below the model size; this machine's pane refuses writes
- * past ~2.08 GB with a 2.18 GB model.) */
-async function acquireModelSource(url, total) {
-  try {
-    const handle = await fetchModelToOpfs(url, total);
-    const file = await handle.getFile();
-    if (file.size === total)
-      return { read: (o, n) => file.slice(o, o + n).arrayBuffer(), transient: null };
-  } catch (e) {
-    log(`OPFS cache unavailable (${e.message}); holding the model in JS memory during load`, "err");
-  }
-  /* One ArrayBuffer cannot hold the model (Chrome caps them near 2^31), so
-   * the transient copy is an array of 256 MB chunks. */
-  const CB = 256 << 20;
-  const chunks = [];
-  for (let o = 0; o < total; o += CB) chunks.push(new Uint8Array(Math.min(CB, total - o)));
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
-  const reader = res.body.getReader();
-  let off = 0, lastReport = 0;
-  for (;;) {
+/* Direct streaming model loader: weights stream directly to WebGPU storage buffers
+ * and a 0.5 MB reduced norm image in WASM linear memory. No transient 2.18 GB
+ * array is held in JS memory, keeping peak host memory < 100 MB. */
+
+/**
+ * Phase 1: Reads the initial safetensors header from the stream reader.
+ * Accumulates only until dataBase (8 + hlen ~ 122,688 bytes) is reached.
+ * Returns the parsed header, dataBase offset, and any excess bytes from the chunk.
+ */
+async function parseSafetensorsHeaderStream(reader) {
+  let chunks = [];
+  let totalBytes = 0;
+
+  while (totalBytes < 8) {
     const { done, value } = await reader.read();
-    if (done) break;
-    let vo = 0;
-    while (vo < value.length) {
-      const ci = Math.floor((off + vo) / CB), co = (off + vo) % CB;
-      const n = Math.min(value.length - vo, CB - co);
-      chunks[ci].set(value.subarray(vo, vo + n), co);
-      vo += n;
-    }
-    off += value.length;
-    if (off - lastReport > 48 * 1024 * 1024) {
-      lastReport = off;
-      $("barfill").style.width = (off / total * 100).toFixed(1) + "%";
-      setStatus(`downloading model ${(off / 1e9).toFixed(2)} / ${(total / 1e9).toFixed(2)} GB`);
-      await tick();
-    }
+    if (done) throw new Error("Stream closed before reading safetensors header length");
+    chunks.push(value);
+    totalBytes += value.length;
   }
-  if (off !== total) throw new Error(`model truncated: ${off} of ${total}`);
-  const read = (o, n) => {
-    const ci = Math.floor(o / CB), co = o % CB;
-    if (co + n <= CB) return Promise.resolve(chunks[ci].subarray(co, co + n));
-    const out = new Uint8Array(n);          /* spans a chunk boundary: assemble */
-    let done2 = 0;
-    while (done2 < n) {
-      const c = Math.floor((o + done2) / CB), cc = (o + done2) % CB;
-      const m = Math.min(n - done2, CB - cc);
-      out.set(chunks[c].subarray(cc, cc + m), done2);
-      done2 += m;
-    }
-    return Promise.resolve(out);
-  };
-  return { read, transient: chunks };
+
+  let buf = new Uint8Array(totalBytes);
+  let off = 0;
+  for (const c of chunks) {
+    buf.set(c, off);
+    off += c.length;
+  }
+  chunks = [buf];
+
+  const headerLen = Number(new DataView(buf.buffer, buf.byteOffset, 8).getBigUint64(0, true));
+  if (headerLen <= 0 || headerLen > 50 * 1024 * 1024) {
+    throw new Error(`Invalid safetensors header length: ${headerLen}`);
+  }
+
+  const headerEnd = 8 + headerLen;
+
+  while (totalBytes < headerEnd) {
+    const { done, value } = await reader.read();
+    if (done) throw new Error(`Stream closed while reading safetensors header (${totalBytes}/${headerEnd} bytes)`);
+    chunks.push(value);
+    totalBytes += value.length;
+  }
+
+  buf = new Uint8Array(totalBytes);
+  off = 0;
+  for (const c of chunks) {
+    buf.set(c, off);
+    off += c.length;
+  }
+
+  const headerJsonBytes = buf.subarray(8, headerEnd);
+  const headerJsonStr = new TextDecoder("utf-8").decode(headerJsonBytes);
+  const header = JSON.parse(headerJsonStr);
+
+  const dataBase = headerEnd;
+  const leftover = buf.subarray(headerEnd);
+
+  return { header, headerLen, dataBase, leftover };
 }
 
-async function loadGpuResident(url, total, threads) {
-  const src = await acquireModelSource(url, total);
-  const read = src.read;
-
-  const asU8 = (b) => b instanceof Uint8Array ? b : new Uint8Array(b);
-  const h8 = asU8(await read(0, 8));
-  const hlen = Number(new DataView(h8.buffer, h8.byteOffset, 8).getBigUint64(0, true));
-  const header = JSON.parse(new TextDecoder().decode(asU8(await read(8, hlen))));
-  const dataBase = 8 + hlen;
-
-  /* Reduced image: same format, GPU-owned tensors left out. */
+/**
+ * Phase 1b: Builds the reduced safetensors metadata (113 norm tensors) and allocates WASM buffer.
+ */
+function prepareWasmReducedImage(header, Module) {
   const kept = Object.entries(header)
     .filter(([name]) => name !== "__metadata__" && !DROP_RE.test(name))
     .sort((a, b) => a[1].data_offsets[0] - b[1].data_offsets[0]);
+
   const newHeader = {};
   let dataOff = 0;
   for (const [name, t] of kept) {
@@ -348,69 +345,59 @@ async function loadGpuResident(url, total, threads) {
     newHeader[name] = { dtype: t.dtype, shape: t.shape, data_offsets: [dataOff, dataOff + size] };
     dataOff += size;
   }
+
   let hjson = new TextEncoder().encode(JSON.stringify(newHeader));
-  const hpad = Math.ceil(hjson.length / 64) * 64;   /* keep the data 64-aligned */
-  const padded = new Uint8Array(hpad).fill(0x20);
-  padded.set(hjson);
-  hjson = padded;
+  const hpad = Math.ceil(hjson.length / 64) * 64; // keep the data 64-aligned
+  const paddedHjson = new Uint8Array(hpad).fill(0x20); // ASCII space padding
+  paddedHjson.set(hjson);
 
-  const reducedLen = 8 + hjson.length + dataOff;
-  const reducedSize = reducedLen < 100e6
-    ? `${(reducedLen / 1e6).toFixed(1)} MB`
-    : `${(reducedLen / 1e9).toFixed(2)} GB`;
-  setStatus(`building the reduced image (${reducedSize} in wasm)...`);
-  const ptr = P(Module._qwen_wasm_alloc(reducedLen));
-  if (!ptr) throw new Error(`could not allocate ${reducedLen} bytes of wasm memory`);
-  /* No cached view: every heap access re-validates (freshHeap). */
-  new DataView(freshHeap(Module).HEAPU8.buffer, ptr, 8)
-    .setBigUint64(0, BigInt(hjson.length), true);
-  freshHeap(Module).HEAPU8.set(hjson, ptr + 8);
-  let copied = 0, lastReport = 0;
+  const reducedLen = 8 + paddedHjson.length + dataOff;
+  const reducedPtr = P(Module._qwen_wasm_alloc(reducedLen));
+  if (!reducedPtr) throw new Error(`Could not allocate ${reducedLen} bytes in WASM memory`);
+
+  // Write 8-byte header size (little-endian uint64)
+  new DataView(freshHeap(Module).HEAPU8.buffer, reducedPtr, 8)
+    .setBigUint64(0, BigInt(paddedHjson.length), true);
+
+  // Write padded JSON header bytes
+  freshHeap(Module).HEAPU8.set(paddedHjson, reducedPtr + 8);
+
+  const wasmDataBase = reducedPtr + 8 + paddedHjson.length;
+  const wasmNormMap = new Map();
   for (const [name, t] of kept) {
-    const size = t.data_offsets[1] - t.data_offsets[0];
-    const srcOff = dataBase + t.data_offsets[0];
-    const dst = ptr + 8 + hjson.length + newHeader[name].data_offsets[0];
-    for (let off = 0; off < size; off += 64 << 20) {
-      const n = Math.min(64 << 20, size - off);
-      freshHeap(Module).HEAPU8.set(asU8(await read(srcOff + off, n)), dst + off);
-      copied += n;
-      if (copied - lastReport > 128 << 20) {
-        lastReport = copied;
-        $("barfill").style.width = (copied / dataOff * 100).toFixed(1) + "%";
-        await tick();
-      }
-    }
+    wasmNormMap.set(name, wasmDataBase + newHeader[name].data_offsets[0]);
   }
-  $("barfill").style.width = "100%";
 
-  /* Decoder weight source: entries in exactly the order the C descriptor
-   * table would emit them - layers 0..N x (q, k, v, o, gate_up, down), then
-   * the tied embedding. Offsets are absolute file positions. */
+  return { reducedPtr, reducedLen, kept, newHeader, wasmNormMap };
+}
+
+/**
+ * Extracts Q8 and vector descriptors from safetensors header.
+ */
+function extractModelDescriptorsFromHeader(header, dataBase) {
   const abs = (t) => dataBase + t.data_offsets[0];
-  const len = (t) => t.data_offsets[1] - t.data_offsets[0];
   const MATS = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
                 "self_attn.o_proj", "mlp.gate_up", "mlp.down_proj"];
-  let layers = 0;
-  while (header[`thinker.model.layers.${layers}.self_attn.q_proj.weight.q8`]) layers++;
-  if (!layers) throw new Error("no decoder layers in the model header");
-  const entries = [];
-  for (let l = 0; l < layers; l++) {
+  let decLayers = 0;
+  while (header[`thinker.model.layers.${decLayers}.self_attn.q_proj.weight.q8`]) decLayers++;
+  if (!decLayers) throw new Error("no decoder layers in the model header");
+
+  const decEntries = [];
+  for (let l = 0; l < decLayers; l++) {
     for (let kind = 0; kind < 6; kind++) {
       const base = `thinker.model.layers.${l}.${MATS[kind]}.weight`;
       const q = header[`${base}.q8`], sc = header[`${base}.q8s`];
       if (!q || !sc) throw new Error(`missing ${base}.q8 in the model header`);
-      entries.push({ kind, layer: l, rows: q.shape[0], cols: q.shape[1],
-                     qoff: abs(q), soff: abs(sc) });
+      decEntries.push({ kind, layer: l, rows: q.shape[0], cols: q.shape[1],
+                        qoff: abs(q), soff: abs(sc) });
     }
   }
   const emb = header["thinker.model.embed_tokens.weight.q8"];
   const embS = header["thinker.model.embed_tokens.weight.q8s"];
   if (!emb || !embS) throw new Error("missing embed_tokens.q8 in the model header");
-  entries.push({ kind: 6, layer: 0, rows: emb.shape[0], cols: emb.shape[1],
-                 qoff: abs(emb), soff: abs(embS) });
+  decEntries.push({ kind: 6, layer: 0, rows: emb.shape[0], cols: emb.shape[1],
+                    qoff: abs(emb), soff: abs(embS) });
 
-  /* Encoder records, in the C emission order (see qwen_wasm_enc_desc).
-   * Kinds are positional: vec entries carry a count, mats carry rows/cols. */
   const T = "thinker.audio_tower.";
   const need = (n) => {
     const t = header[n];
@@ -434,7 +421,7 @@ async function loadGpuResident(url, total, threads) {
   if (!encLayers) throw new Error("no encoder layers in the model header");
   for (let l = 0; l < encLayers; l++) {
     const L = `${T}layers.${l}.`;
-    ek = 7;   /* per-layer kinds restart at E_ATTN_NORM_W */
+    ek = 7;
     const lv = (name) => { const t = need(name);
       encEntries.push({ kind: ek++, layer: l, count: numel(t), foff: abs(t) }); };
     const lm = (name) => { const q = need(name + ".q8"), sc = need(name + ".q8s");
@@ -454,20 +441,539 @@ async function loadGpuResident(url, total, threads) {
   mat(T + "proj1.weight"); vec(T + "proj1.bias");
   mat(T + "proj2.weight"); vec(T + "proj2.bias");
 
-  gpuWeightSource = { entries, encEntries, read, transient: src.transient };
+  return { decEntries, encEntries, decLayers, encLayers };
+}
 
-  setStatus("attaching the reduced image...");
+/**
+ * Builds the contiguous interval dispatch table mapping each file byte range [start, end)
+ * directly to its destination WebGPU buffer or WASM linear memory offset.
+ */
+function buildIntervalDispatchTable(header, dataBase, decoder, encoder, wasmNormMap) {
+  const intervals = [];
+
+  // 1. Audio Tower (Encoder)
+  for (const ent of encoder.entries) {
+    if (ent.qoff != null) {
+      const qSize = ent.rows * ent.cols;
+      intervals.push({
+        start: ent.qoff,
+        end: ent.qoff + qSize,
+        target: {
+          gpuBuffer: encoder.bufQuants[ent.shard],
+          gpuOffset: ent.wordBase * 4,
+        },
+      });
+      const sSize = ent.rows * (ent.cols / 64) * 4;
+      intervals.push({
+        start: ent.soff,
+        end: ent.soff + sSize,
+        target: {
+          gpuBuffer: encoder.bufScales,
+          gpuOffset: ent.scaleBase * 4,
+        },
+      });
+    } else if (ent.foff != null) {
+      const fSize = ent.count * 4;
+      intervals.push({
+        start: ent.foff,
+        end: ent.foff + fSize,
+        target: {
+          gpuBuffer: encoder.bufVecs,
+          gpuOffset: ent.vecBase * 4,
+        },
+      });
+    }
+  }
+
+  // 2. Decoder Layers & Tied Embedding
+  for (const w of decoder.wmap.values()) {
+    if (w.pieces) {
+      for (const p of w.pieces) {
+        intervals.push({
+          start: p.qoff,
+          end: p.qoff + p.nq,
+          target: {
+            gpuBuffer: decoder.bufQuants[p.shard],
+            gpuOffset: p.wordBase * 4,
+          },
+        });
+      }
+    } else {
+      intervals.push({
+        start: w.qoff,
+        end: w.qoff + w.nq,
+        target: {
+          gpuBuffer: decoder.bufQuants[w.shard],
+          gpuOffset: w.wordBase * 4,
+        },
+      });
+    }
+    const sSize = (w.nq / 64) * 4;
+    intervals.push({
+      start: w.soff,
+      end: w.soff + sSize,
+      target: {
+        gpuBuffer: decoder.bufScale,
+        gpuOffset: w.scaleBase * 4,
+      },
+    });
+  }
+
+  // 3. Norm Weights (Dual target: WebGPU bufNorm + WASM Reduced Image)
+  for (const [key, n] of decoder.nmap.entries()) {
+    const [kindStr, layerStr] = key.split(":");
+    const kind = Number(kindStr), layer = Number(layerStr);
+    let normName;
+    if (kind === 4) {
+      normName = "thinker.model.norm.weight";
+    } else {
+      const suffixes = [
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+      ];
+      normName = `thinker.model.layers.${layer}.${suffixes[kind]}`;
+    }
+
+    const t = header[normName];
+    if (!t) throw new Error(`Norm tensor missing from header: ${normName}`);
+    const start = dataBase + t.data_offsets[0];
+    const end = dataBase + t.data_offsets[1];
+    const wasmPtr = wasmNormMap ? wasmNormMap.get(normName) : undefined;
+
+    intervals.push({
+      start,
+      end,
+      target: {
+        gpuBuffer: decoder.bufNorm,
+        gpuOffset: n.base * 4,
+        wasmPtr,
+      },
+    });
+  }
+
+  intervals.sort((a, b) => a.start - b.start);
+  return intervals;
+}
+
+/**
+ * High-performance streaming interval dispatcher.
+ */
+class IntervalDispatcher {
+  constructor(intervals, device, Module) {
+    this.intervals = intervals;
+    this.device = device;
+    this.Module = Module;
+    this.currentIndex = 0;
+    this.bytesWritten = 0;
+  }
+
+  dispatch(chunk, chunkStart) {
+    const chunkEnd = chunkStart + chunk.length;
+    let i = this.currentIndex;
+
+    while (i < this.intervals.length && this.intervals[i].end <= chunkStart) {
+      i++;
+    }
+    this.currentIndex = i;
+
+    while (i < this.intervals.length && this.intervals[i].start < chunkEnd) {
+      const inv = this.intervals[i];
+      const overlapStart = Math.max(chunkStart, inv.start);
+      const overlapEnd = Math.min(chunkEnd, inv.end);
+      const overlapLen = overlapEnd - overlapStart;
+
+      if (overlapLen > 0) {
+        const chunkOffset = overlapStart - chunkStart;
+        const slice = chunk.subarray(chunkOffset, chunkOffset + overlapLen);
+        const targetOffset = overlapStart - inv.start;
+
+        const t = inv.target;
+        if (t.gpuBuffer) {
+          this.device.queue.writeBuffer(
+            t.gpuBuffer,
+            t.gpuOffset + targetOffset,
+            slice
+          );
+        }
+        if (t.wasmPtr != null) {
+          freshHeap(this.Module).HEAPU8.set(slice, t.wasmPtr + targetOffset);
+        }
+        this.bytesWritten += overlapLen;
+      }
+      i++;
+    }
+  }
+}
+
+/**
+ * Phase 2: Streams all remaining chunks directly into WebGPU and WASM target buffers.
+ */
+async function streamChunksToTargets({
+  reader,
+  dispatcher,
+  initialFileOffset,
+  totalBytes,
+  device,
+  excessChunk,
+  reportProgress = () => {},
+}) {
+  let fileOffset = initialFileOffset;
+  let bytesSinceSync = 0;
+  let lastReport = fileOffset;
+  const SYNC_INTERVAL = 48 * 1024 * 1024; // 48 MB staging throttle
+
+  let alignRemainder = null; // Cross-chunk remainder scratchpad (< 4 bytes)
+
+  async function processAlignedChunk(rawChunk) {
+    let chunk = rawChunk;
+    if (alignRemainder !== null) {
+      const merged = new Uint8Array(alignRemainder.length + rawChunk.length);
+      merged.set(alignRemainder, 0);
+      merged.set(rawChunk, alignRemainder.length);
+      chunk = merged;
+      alignRemainder = null;
+    }
+
+    const unalignedTail = chunk.length % 4;
+    let alignedChunk = chunk;
+    if (unalignedTail !== 0) {
+      const alignedLen = chunk.length - unalignedTail;
+      alignRemainder = chunk.slice(alignedLen);
+      alignedChunk = chunk.subarray(0, alignedLen);
+    }
+
+    if (alignedChunk.length > 0) {
+      dispatcher.dispatch(alignedChunk, fileOffset);
+      fileOffset += alignedChunk.length;
+      bytesSinceSync += alignedChunk.length;
+    }
+
+    if (bytesSinceSync >= SYNC_INTERVAL) {
+      bytesSinceSync = 0;
+      await device.queue.onSubmittedWorkDone();
+      await tick(); // Allow GC sweep and UI render
+    }
+
+    if (fileOffset - lastReport >= 16 * 1024 * 1024) {
+      lastReport = fileOffset;
+      reportProgress(fileOffset, totalBytes);
+      await tick();
+    }
+  }
+
+  // 1. Process any excess bytes read during Phase 1
+  if (excessChunk && excessChunk.length > 0) {
+    await processAlignedChunk(excessChunk);
+    excessChunk = null;
+  }
+
+  // 2. Stream loop
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    await processAlignedChunk(value);
+  }
+
+  // 3. Final validation and staging flush
+  if (alignRemainder && alignRemainder.length > 0) {
+    throw new Error(`Model stream truncated with ${alignRemainder.length} unaligned bytes`);
+  }
+  if (fileOffset !== totalBytes) {
+    throw new Error(`Model stream truncated: received ${fileOffset} of ${totalBytes} bytes`);
+  }
+
+  await device.queue.onSubmittedWorkDone();
+  reportProgress(totalBytes, totalBytes);
+}
+
+/**
+ * Installs WebGPU hooks for embedding lookup, audio tower encoding, and decode loop.
+ */
+function setupGpuHooks(gpu, encoder, Module) {
+  gpu.prepareEmbeddingLookup();
+  const embedCache = new Map();
+  const EMBED_CACHE_ROWS = 256;
+  Module.__gpuEmbedMany = async (idsPtr, n, dst, dim, req) => {
+    try {
+      idsPtr = idsPtr >>> 0;
+      dst = dst >>> 0;
+      const ids = new Int32Array(freshHeap(Module).HEAPU8.buffer, idsPtr, n).slice();
+      const missing = [];
+      const seen = new Set();
+      for (const id of ids) {
+        if (!embedCache.has(id) && !seen.has(id)) {
+          seen.add(id);
+          missing.push(id);
+        }
+      }
+      const fresh = new Map();
+      if (missing.length) {
+        const rows = await gpu.readTokenEmbeddings(missing);
+        if (rows.length !== missing.length * dim)
+          throw new Error(`embedding batch width ${rows.length}, expected ${missing.length * dim}`);
+        for (let i = 0; i < missing.length; i++)
+          fresh.set(missing[i], rows.slice(i * dim, (i + 1) * dim));
+      }
+      const base = f32idx(dst);
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        const row = embedCache.get(id) || fresh.get(id);
+        if (!row) throw new Error(`embedding row ${id} unavailable`);
+        freshHeap(Module).HEAPF32.set(row, base + i * dim);
+        if (embedCache.has(id)) embedCache.delete(id);
+        embedCache.set(id, row);
+        if (embedCache.size > EMBED_CACHE_ROWS)
+          embedCache.delete(embedCache.keys().next().value);
+      }
+      Module._qwen_wasm_embed_hook_done(req, 1);
+    } catch (err) {
+      console.error("gpu embedding hook:", err);
+      Module._qwen_wasm_embed_hook_done(req, 0);
+    }
+  };
+  Module._qwen_wasm_set_gpu_embedder(1);
+
+  if (encoder) {
+    Module.__gpuEncode = async (melPtr, frames) => {
+      const hs = window.__hookStats || (window.__hookStats = {dec: 0, decMs: 0, decArrive: 0, enc: 0, encMs: 0});
+      const et0 = performance.now();
+      hs.enc++;
+      try {
+        encoder.hookCalls = (encoder.hookCalls || 0) + 1;
+        const out = await encoder.runFromMel(melPtr, frames);
+        const p = P(Module._qwen_wasm_alloc(out.byteLength));
+        if (!p) throw new Error("out of wasm memory for the encoder output");
+        freshHeap(Module).HEAPF32.set(out, f32idx(p));
+        Module._qwen_wasm_enc_hook_done(p, encoder.tokens);
+        hs.encMs += performance.now() - et0;
+        (hs.encProfiles || (hs.encProfiles = [])).push(
+          {runMs: Math.round(encoder.runMs), wallMs: Math.round(performance.now() - et0)});
+      } catch (err) {
+        encoder.hookFails = (encoder.hookFails || 0) + 1;
+        if (encoder.hookFails <= 2)
+          log(`GPU tower failed mid-stream (${err.message}); falling back`, "err");
+        Module._qwen_wasm_enc_hook_done(0, 0);
+      }
+    };
+  }
+
+  Module.__gpuDecode = async (embedsPtr, totalSeq, reuseLen, maxNew) => {
+    const hs = window.__hookStats || (window.__hookStats = {dec: 0, decMs: 0, decArrive: 0, enc: 0, encMs: 0});
+    const t0 = performance.now();
+    hs.dec++;
+    try {
+      if (!gpu) throw new Error("no GPU decoder");
+      embedsPtr = embedsPtr >>> 0;
+      const r = reuseLen > 0
+        ? await gpu.prefillSuffixAndGenerate(embedsPtr, totalSeq, reuseLen, maxNew - 1, null)
+        : await gpu.prefillAndGenerate(embedsPtr, totalSeq, maxNew - 1, null);
+      const ids = (r.ids || []).slice(0, maxNew);
+      const p = P(Module._qwen_wasm_alloc(Math.max(ids.length, 1) * 4));
+      if (!p) throw new Error("out of wasm memory for the token ids");
+      new Int32Array(freshHeap(Module).HEAPU8.buffer, p, ids.length).set(ids);
+      Module._qwen_wasm_dec_hook_done(p, ids.length);
+      Module._qwen_wasm_release(p);
+      hs.decMs += performance.now() - t0;
+      (hs.decProfiles || (hs.decProfiles = [])).push(gpu.lastProfile ||
+        {prefillMs: Math.round(gpu.prefillMs)});
+    } catch (err) {
+      console.error("gpu decode hook:", err);
+      gpu && (gpu.hookFails = (gpu.hookFails || 0) + 1);
+      if (!gpu || gpu.hookFails <= 2)
+        log(`GPU decode failed mid-stream (${err && err.message}); falling back`, "err");
+      Module._qwen_wasm_dec_hook_done(0, -1);
+    }
+  };
+}
+
+/**
+ * Cleanly releases all WebGPU decoder, encoder, and hook resources.
+ * Idempotent: safe to invoke repeatedly or when resources are null.
+ */
+function cleanupGpuResources({ markLost = false, reason = "" } = {}) {
+  if (gpu) {
+    try {
+      gpu.destroy();
+    } catch (e) {
+      console.warn("Failed to destroy WebGPUDecoder:", e);
+    }
+    gpu = null;
+  }
+  if (encoder) {
+    try {
+      encoder.destroy();
+    } catch (e) {
+      console.warn("Failed to destroy WebGPUEncoder:", e);
+    }
+    encoder = null;
+  }
+  if (markLost) {
+    isDeviceLost = true;
+    gpuDevice = null;
+    gpuAdapter = null;
+  }
+
+  if (typeof Module !== "undefined" && Module) {
+    Module.__gpuEncode = null;
+    Module.__gpuDecode = null;
+    Module.__gpuEmbedMany = null;
+    try { Module._qwen_wasm_set_gpu_encoder?.(0); } catch (_) {}
+    try { Module._qwen_wasm_set_gpu_decoder?.(0); } catch (_) {}
+    try { Module._qwen_wasm_set_gpu_embedder?.(0); } catch (_) {}
+  }
+  if (typeof window !== "undefined") {
+    if (window.__gpu) window.__gpu = null;
+    if (window.__enc) window.__enc = null;
+  }
+}
+
+/**
+ * Attaches device.lost promise listener to trigger immediate resource teardown
+ * and diagnostic notification.
+ */
+function attachDeviceLostHandler(device) {
+  if (!device || !device.lost) return;
+  device.lost.then((info) => {
+    const reason = info.reason || "unknown";
+    const msg = info.message || "";
+    const detail = `WebGPU device lost (${reason}${msg ? ": " + msg : ""})`;
+    console.error(detail);
+    log(detail, "err");
+    setStatus(`GPU device lost (${reason})`);
+
+    cleanupGpuResources({ markLost: true, reason });
+
+    if (gpuResidentActive) {
+      log("GPU device lost with GPU-resident weights; reloading with full image...", "err");
+      sessionStorage.setItem("qwenFullImage", "1");
+      const alertMsg = "WebGPU device was lost by the browser (Metal reset / memory pressure). " +
+                       "Because model weights were resident on GPU, reloading the page is required.";
+      if (typeof alert === "function") {
+        try { alert(alertMsg); } catch (_) {}
+      }
+      location.reload();
+      return;
+    }
+
+    if ($("backend")) $("backend").value = "cpu";
+    log("WebGPU lost: switched backend to CPU (wasm).", "warn");
+  });
+}
+
+/**
+ * Direct-to-GPU streaming weight loader: completely eliminates the 2.18 GB chunks array.
+ */
+async function loadGpuResidentDirect(url, total, threads) {
+  cleanupGpuResources();
+  let adapter = gpuAdapter;
+  let device = gpuDevice;
+  if (!device || isDeviceLost) {
+    adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    if (!adapter) throw new Error("no WebGPU adapter");
+    const lim = adapter.limits;
+    const cap = (typeof window !== "undefined" && window.__gpuBindingCap) || lim.maxStorageBufferBindingSize;
+    const wantBinding = Math.min(cap, lim.maxStorageBufferBindingSize, 1 << 30);
+    const wantFeatures = ["subgroups", "shader-f16", "timestamp-query"].filter((f) => adapter.features.has(f));
+    device = await adapter.requestDevice({
+      requiredFeatures: wantFeatures,
+      requiredLimits: {
+        maxBufferSize: wantBinding,
+        maxStorageBufferBindingSize: wantBinding,
+        maxComputeWorkgroupStorageSize: Math.min(lim.maxComputeWorkgroupStorageSize, 32768),
+      },
+    });
+    gpuAdapter = adapter;
+    gpuDevice = device;
+    isDeviceLost = false;
+    attachDeviceLostHandler(device);
+  }
+
+  // 1. Open stream
+  setStatus("connecting to model stream...");
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  const reader = res.body.getReader();
+
+  // 2. Phase 1: Parse Safetensors Header
+  setStatus("parsing model header...");
+  const { header, dataBase, leftover } = await parseSafetensorsHeaderStream(reader);
+
+  // 3. Prepare reduced WASM norm image
+  setStatus("preparing reduced norm image in WASM...");
+  const reduced = prepareWasmReducedImage(header, Module);
+
+  // 4. Pre-allocate WebGPU storage buffers
+  setStatus("pre-allocating WebGPU storage buffers...");
+  const { decEntries, encEntries } = extractModelDescriptorsFromHeader(header, dataBase);
+
+  const shardBudget = Math.min(256 << 20, device.limits?.maxStorageBufferBindingSize || (256 << 20));
+
+  gpu = new WebGPUDecoder(Module, { device, adapter });
+  gpu.allocateStorageBuffers({
+    device,
+    adapter,
+    header,
+    entries: decEntries,
+    shardBudget,
+  });
+
+  encoder = new WebGPUEncoder(Module, { device, adapter });
+  encoder.allocateStorageBuffers({
+    device,
+    adapter,
+    header,
+    entries: encEntries,
+    shardBudget,
+  });
+
+  // 5. Build interval dispatch table
+  const intervals = buildIntervalDispatchTable(header, dataBase, gpu, encoder, reduced.wasmNormMap);
+  const dispatcher = new IntervalDispatcher(intervals, device, Module);
+
+  // 6. Phase 2: Direct streaming ingestion
+  setStatus("streaming model weights directly to WebGPU...");
+  await streamChunksToTargets({
+    reader,
+    dispatcher,
+    initialFileOffset: dataBase,
+    totalBytes: total,
+    device,
+    excessChunk: leftover,
+    reportProgress: (cur, tot) => {
+      if ($("barfill")) $("barfill").style.width = `${(cur / tot * 100).toFixed(1)}%`;
+      setStatus(`downloading model ${(cur / 1e9).toFixed(2)} / ${(tot / 1e9).toFixed(2)} GB`);
+    },
+  });
+
+  // 7. Attach reduced image in WASM
+  setStatus("attaching the reduced image in WASM...");
   Module._qwen_wasm_set_gpu_resident(1);
   const dir = cstr("/model");
-  const rc = Module._qwen_wasm_init(ptr, reducedLen, dir, threads, 0);
+  const rc = Module._qwen_wasm_init(reduced.reducedPtr, reduced.reducedLen, dir, threads, 0);
   Module._qwen_wasm_release(dir);
   if (rc !== 0) throw new Error("qwen_wasm_init failed on the reduced image");
   gpuResidentActive = true;
-  log(`gpu-resident load: ${reducedSize} in wasm instead of ${(total / 1e9).toFixed(2)} GB`);
+
+  // 8. Finalize WebGPU decoder and encoder pipelines
+  setStatus("compiling WebGPU decoder pipelines...");
+  await gpu.finishInit((m) => setStatus(m));
+
+  setStatus("compiling WebGPU audio tower pipelines...");
+  await encoder.finishInit();
+
+  setupGpuHooks(gpu, encoder, Module);
+
+  log(`gpu-resident load: ${(reduced.reducedLen / 1e6).toFixed(2)} MB in wasm instead of ${(total / 1e9).toFixed(2)} GB`);
+  log(`GPU-resident direct stream complete: ${((gpu.weightBytes + encoder.weightBytes) / 1e9).toFixed(2)} GB on WebGPU`);
 }
+
+const loadGpuResident = loadGpuResidentDirect;
 
 $("load").onclick = async () => {
   $("load").disabled = true;
+  cleanupGpuResources();
   const t0 = performance.now();
   try {
     setStatus("instantiating wasm...");
@@ -526,7 +1032,7 @@ $("load").onclick = async () => {
       if (rc !== 0) throw new Error("qwen_wasm_init failed");
     }
 
-    if ($("backend").value === "gpu") {
+    if ($("backend").value === "gpu" && !gpuResidentActive) {
       {
         setStatus("uploading weights to the GPU...");
         gpu = new WebGPUDecoder(Module);
@@ -703,13 +1209,117 @@ $("load").onclick = async () => {
   }
 };
 
+/* ---------------- audio & context management ---------------- */
+
+let sharedAudioCtx = null;
+let workletModuleLoaded = false;
+let isAudioInterrupted = false;
+
+function getOrCreateAudioContext() {
+  if (!sharedAudioCtx || sharedAudioCtx.state === "closed") {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) {
+      throw new Error("Web Audio API is not supported in this browser");
+    }
+    try {
+      // Prefer 16 kHz if supported by the browser engine
+      sharedAudioCtx = new AudioCtx({ sampleRate: 16000 });
+    } catch (_) {
+      // iOS Safari throws NotSupportedError on non-hardware rates; fallback to hardware rate
+      sharedAudioCtx = new AudioCtx();
+    }
+    workletModuleLoaded = false;
+
+    // Track audio hardware interruptions on iOS Safari
+    sharedAudioCtx.onstatechange = () => {
+      const state = sharedAudioCtx ? sharedAudioCtx.state : "closed";
+      if (state === "interrupted" || state === "suspended") {
+        isAudioInterrupted = true;
+        if (micStream) {
+          log(`audio interrupted (${state})`, "warn");
+        }
+      } else if (state === "running") {
+        isAudioInterrupted = false;
+      }
+    };
+  }
+  return sharedAudioCtx;
+}
+
+// Global one-time user gesture listener to warm up AudioContext on iOS Safari
+function initAudioUnlockGesture() {
+  if (typeof window === "undefined" || typeof window.addEventListener !== "function") {
+    return;
+  }
+  const unlock = () => {
+    try {
+      const ctx = getOrCreateAudioContext();
+      if (ctx && ctx.state === "suspended") {
+        ctx.resume().catch(() => {});
+      }
+    } catch (_) {}
+  };
+  window.addEventListener("pointerdown", unlock, { once: true, passive: true });
+  window.addEventListener("touchend", unlock, { once: true, passive: true });
+  window.addEventListener("click", unlock, { once: true, passive: true });
+}
+if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+  initAudioUnlockGesture();
+}
+
+// Handle tab visibility changes and iOS backgrounding interruptions
+if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      if (micStream) {
+        isAudioInterrupted = true;
+      }
+    } else {
+      // Attempt auto-resume when returning to the tab
+      if (sharedAudioCtx && (sharedAudioCtx.state === "suspended" || sharedAudioCtx.state === "interrupted")) {
+        sharedAudioCtx.resume().catch((err) => {
+          // Programmatic resume may require user gesture on iOS; arm next user touch
+          const resumeOnUserTouch = () => {
+            if (sharedAudioCtx && (sharedAudioCtx.state === "suspended" || sharedAudioCtx.state === "interrupted")) {
+              sharedAudioCtx.resume().catch(() => {});
+            }
+          };
+          if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+            window.addEventListener("touchend", resumeOnUserTouch, { once: true, passive: true });
+            window.addEventListener("click", resumeOnUserTouch, { once: true, passive: true });
+          }
+        });
+      }
+    }
+  });
+}
+
 /* ---------------- batch ---------------- */
 
 async function decodeTo16k(bytes) {
-  const probe = new AudioContext();
-  const decoded = await probe.decodeAudioData(bytes.slice(0));
-  probe.close();
-  const off = new OfflineAudioContext(1, Math.ceil(decoded.duration * 16000), 16000);
+  const ctx = getOrCreateAudioContext();
+  const buf = (bytes instanceof ArrayBuffer)
+    ? bytes.slice(0)
+    : (bytes.buffer ? bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) : bytes.slice(0));
+
+  let decoded;
+  try {
+    decoded = await ctx.decodeAudioData(buf);
+  } catch (err) {
+    if (ctx.state === "closed") {
+      sharedAudioCtx = null;
+      const retryCtx = getOrCreateAudioContext();
+      const retryBuf = (bytes instanceof ArrayBuffer)
+        ? bytes.slice(0)
+        : (bytes.buffer ? bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) : bytes.slice(0));
+      decoded = await retryCtx.decodeAudioData(retryBuf);
+    } else {
+      throw err;
+    }
+  }
+
+  const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const off = new OfflineCtx(1, Math.ceil(decoded.duration * 16000), 16000);
   const src = off.createBufferSource();
   src.buffer = decoded;
   src.connect(off.destination);
@@ -801,7 +1411,8 @@ async function runBatch(bytes, label) {
     } catch (e) {
       /* A lost device is recoverable by giving up on the GPU, so do that and
        * finish the job rather than leaving the user with nothing. */
-      if (gpu?.lost || encoder?.lost) {
+      if (gpu?.lost || encoder?.lost || isDeviceLost) {
+        cleanupGpuResources({ markLost: true });
         if (gpuResidentActive) {
           /* The CPU has no transformer weights to retry with; reload with the
            * full image (it comes straight from the OPFS cache). */
@@ -810,14 +1421,7 @@ async function runBatch(bytes, label) {
           location.reload();
           return;
         }
-        log(`GPU unavailable (${gpu?.lost || encoder?.lost}); retrying on the cpu`, "err");
-        gpu = null; encoder = null;
-        Module.__gpuEncode = null;
-        Module.__gpuDecode = null;
-        Module.__gpuEmbedMany = null;
-        Module._qwen_wasm_set_gpu_encoder(0);
-        Module._qwen_wasm_set_gpu_decoder(0);
-        Module._qwen_wasm_set_gpu_embedder(0);
+        log(`GPU unavailable; retrying on the cpu`, "err");
         $("backend").value = "cpu";
         busy = false;
         return runBatch(bytes, label);
@@ -880,6 +1484,15 @@ let audioCtx = null, micStream = null, micNode = null, streamedSamples = 0;
 $("mic").onclick = async () => {
   if (!ready || busy) return;
 
+  // 1. Synchronously obtain AudioContext and invoke resume() directly within user gesture stack
+  const ctx = getOrCreateAudioContext();
+  audioCtx = ctx;
+  if (audioCtx.state === "suspended" || audioCtx.state === "interrupted") {
+    audioCtx.resume().catch((err) => {
+      log("audioCtx.resume() warning: " + err.message, "warn");
+    });
+  }
+
   busy = true;
   streamedSamples = 0;
   $("out").textContent = "";
@@ -888,11 +1501,18 @@ $("mic").onclick = async () => {
   sendSettings();
 
   try {
-    audioCtx = new AudioContext({ sampleRate: 16000 });
-    await audioCtx.audioWorklet.addModule("mic-worklet.js");
+    if (!workletModuleLoaded) {
+      await audioCtx.audioWorklet.addModule("mic-worklet.js");
+      workletModuleLoaded = true;
+    }
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
     });
+
+    // In iOS Safari, route changes during getUserMedia can suspend the context; re-ensure running
+    if (audioCtx.state === "suspended" || audioCtx.state === "interrupted") {
+      await audioCtx.resume();
+    }
 
     if (Module._qwen_wasm_stream_start() !== 0) throw new Error("stream start failed");
 
@@ -919,6 +1539,14 @@ $("mic").onclick = async () => {
     setStatus("listening");
   } catch (e) {
     busy = false;
+    if (micStream) {
+      micStream.getTracks().forEach((t) => t.stop());
+      micStream = null;
+    }
+    if (micNode) {
+      micNode.disconnect();
+      micNode = null;
+    }
     log("mic error: " + e.message, "err");
     setStatus("failed");
   }
@@ -928,10 +1556,20 @@ $("micstop").onclick = async () => {
   $("micstop").classList.add("hide");
   $("mic").classList.remove("hide");
   setStatus("finishing...");
-  if (micNode) micNode.disconnect();
-  if (micStream) micStream.getTracks().forEach((t) => t.stop());
-  if (audioCtx) await audioCtx.close();
-  micNode = micStream = audioCtx = null;
+  if (micNode) {
+    micNode.disconnect();
+    micNode = null;
+  }
+  if (micStream) {
+    micStream.getTracks().forEach((t) => t.stop());
+    micStream = null;
+  }
+  // Suspend context instead of closing to preserve it for subsequent recording/decoding
+  if (audioCtx && audioCtx.state === "running") {
+    try {
+      await audioCtx.suspend();
+    } catch (_) {}
+  }
   $("lvlfill").style.width = "0";
 
 await (async () => {
@@ -1011,14 +1649,20 @@ $("simstream").onclick = async () => {
 
 /* ---------------- tabs ---------------- */
 
-$("tab-batch").onclick = () => {
-  $("tab-batch").classList.add("on"); $("tab-live").classList.remove("on");
-  $("pane-batch").classList.remove("hide"); $("pane-live").classList.add("hide");
-};
-$("tab-live").onclick = () => {
-  $("tab-live").classList.add("on"); $("tab-batch").classList.remove("on");
-  $("pane-live").classList.remove("hide"); $("pane-batch").classList.add("hide");
-};
+if ($("tab-batch")) {
+  $("tab-batch").onclick = () => {
+    $("tab-batch").classList.add("on"); if ($("tab-live")) $("tab-live").classList.remove("on");
+    if ($("pane-batch")) $("pane-batch").classList.remove("hide");
+    if ($("pane-live")) $("pane-live").classList.add("hide");
+  };
+}
+if ($("tab-live")) {
+  $("tab-live").onclick = () => {
+    $("tab-live").classList.add("on"); if ($("tab-batch")) $("tab-batch").classList.remove("on");
+    if ($("pane-live")) $("pane-live").classList.remove("hide");
+    if ($("pane-batch")) $("pane-batch").classList.add("hide");
+  };
+}
 
 $("threads").value = String(defaultThreads);
 
@@ -1026,3 +1670,29 @@ if (!self.crossOriginIsolated) {
   log("warning: page is not cross-origin isolated, so SharedArrayBuffer (and " +
       "therefore multithreading) is unavailable. Serve with wasm/serve.py.", "err");
 }
+
+/* ==========================================================================
+ * Exports & Global Test Harness Attachments
+ * ========================================================================== */
+if (typeof window !== "undefined") {
+  window.parseSafetensorsHeaderStream = parseSafetensorsHeaderStream;
+  window.prepareWasmReducedImage = prepareWasmReducedImage;
+  window.extractModelDescriptorsFromHeader = extractModelDescriptorsFromHeader;
+  window.buildIntervalDispatchTable = buildIntervalDispatchTable;
+  window.IntervalDispatcher = IntervalDispatcher;
+  window.streamChunksToTargets = streamChunksToTargets;
+  window.loadGpuResidentDirect = loadGpuResidentDirect;
+  window.loadGpuResident = loadGpuResident;
+}
+
+export {
+  parseSafetensorsHeaderStream,
+  prepareWasmReducedImage,
+  extractModelDescriptorsFromHeader,
+  buildIntervalDispatchTable,
+  IntervalDispatcher,
+  streamChunksToTargets,
+  loadGpuResidentDirect,
+  loadGpuResident,
+};
+

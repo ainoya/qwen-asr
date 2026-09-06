@@ -119,6 +119,11 @@ fn q8rowF(wordBase : u32, scaleBase : u32, nwords : u32, xOff : u32,
 
 `;
 
+const ROW_Q8 = "q8row(P.wordBase + row * nwords, P.scaleBase + row * (P.cols / 64u), " +
+               "nwords, P.a, P.b, lid.x, WG)";
+const ROW_F32 = "q8rowF(P.wordBase + row * nwords, P.scaleBase + row * (P.cols / 64u), " +
+                "nwords, P.xOff, lid.x, WG)";
+
 /* y[row] = W[row] . x, with `pos` reused as the accumulate flag. */
 const MATVEC_WGSL = HEADER + `
 const WG : u32 = $WG$u;
@@ -1510,13 +1515,53 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 /* ------------------------------------------------------------------ backend */
 
 export class WebGPUDecoder {
-  constructor(Module) {
+  constructor(Module, opts = {}) {
     this.M = Module;
+    this.opts = opts;
     this.ready = false;
+    if (opts.device) this.setupDevice(opts.device, opts.adapter);
+  }
+
+  setupDevice(device, adapter, wantFeatures = []) {
+    this.device = device;
+    this.adapter = adapter || this.adapter;
+    this.hasSubgroups = wantFeatures.includes("subgroups") || !!(device?.features?.has("subgroups"));
+    this.hasTimestamps = wantFeatures.includes("timestamp-query") || !!(device?.features?.has("timestamp-query"));
+    this.hasF16 = wantFeatures.includes("shader-f16") || !!(device?.features?.has("shader-f16"));
+    this.kvF16 = this.hasF16 && this.kvF16Pref !== false && typeof Float16Array !== "undefined";
+    this.kvBytes = this.kvF16 ? 2 : 4;
+    this.maxDim = device.limits ? device.limits.maxComputeWorkgroupsPerDimension : 65535;
+    this.adapterInfo = adapter?.info || {};
+    if (device.lost) {
+      device.lost.then((info) => {
+        this.lost = info.reason || "unknown";
+        const m = `GPU device lost (${this.lost}); falling back to wasm`;
+        console.error(m);
+        if (this.onError) this.onError(m);
+      });
+    }
+    if (device.addEventListener) {
+      if (this._onUncapturedError && device.removeEventListener) {
+        try { device.removeEventListener("uncapturederror", this._onUncapturedError); } catch (_) {}
+      }
+      this._onUncapturedError = (e) => {
+        console.error("gpu:", e.error.message);
+        if (this.onError) this.onError("gpu error: " + e.error.message);
+      };
+      device.addEventListener("uncapturederror", this._onUncapturedError);
+    }
   }
 
   static async probe() {
-    if (!navigator.gpu) return { ok: false, why: "navigator.gpu is missing" };
+    if (!navigator.gpu) {
+      const isIOS = typeof navigator !== "undefined" &&
+        (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
+         (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+      const why = isIOS
+        ? "navigator.gpu is missing. Enable WebGPU in iOS Settings: Apps > Safari > Advanced > Feature Flags > WebGPU"
+        : "navigator.gpu is missing";
+      return { ok: false, why, isIOS };
+    }
     try {
       const a = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
       if (!a) return { ok: false, why: "no adapter" };
@@ -1531,268 +1576,8 @@ export class WebGPUDecoder {
     }
   }
 
-  async init(report = () => {}) {
-    const M = this.M;
-
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (!adapter) throw new Error("no WebGPU adapter");
-    const lim = adapter.limits;
-
-    /* ---- shape ---- */
-    const shPtr = M._qwen_wasm_alloc(10 * 4) >>> 0;
-    if (M._qwen_wasm_model_shape(shPtr) < 0) throw new Error("model shape unavailable");
-    const sh = new Int32Array(freshHeap(M).HEAPU8.buffer, shPtr, 10).slice();
-    M._qwen_wasm_release(shPtr);
-    const cfg = {
-      layers: sh[0], hidden: sh[1], heads: sh[2], kvHeads: sh[3], headDim: sh[4],
-      inter: sh[5], vocab: sh[6], imEnd: sh[7], endOfText: sh[8], asrText: sh[9],
-    };
-    cfg.qDim = cfg.heads * cfg.headDim;
-    cfg.kvDim = cfg.kvHeads * cfg.headDim;
-    cfg.headsPerKv = cfg.heads / cfg.kvHeads;
-    this.cfg = cfg;
-    this.eps = M._qwen_wasm_rms_eps();
-    this.theta = M._qwen_wasm_rope_theta();
-
-    /* ---- weight tables ----
-     *
-     * Two sources: the C descriptor tables (weights resident in the wasm
-     * heap, the default), or an injected `weightSource` whose entries carry
-     * file offsets and an async reader - the gpu-resident load path, where
-     * the transformer weights never enter wasm memory at all and are
-     * uploaded straight from the cached model file. Entries must arrive in
-     * the same order the C table would emit them. */
-    const MAXD = 8 * cfg.layers + 8;
-    const dPtr = M._qwen_wasm_alloc(MAXD * 8 * 4) >>> 0;
-    let qEntries;
-    if (this.weightSource) {
-      qEntries = this.weightSource.entries;
-    } else {
-      const nQ = M._qwen_wasm_q8_desc(dPtr, MAXD);
-      if (nQ < 0) {
-        M._qwen_wasm_release(dPtr);
-        throw new Error("decoder is not Q8 quantized (use the packed model)");
-      }
-      const qd = new Uint32Array(freshHeap(M).HEAPU8.buffer, dPtr, nQ * 6).slice();
-      qEntries = [];
-      for (let i = 0; i < nQ; i++) {
-        const [kind, layer, rows, cols, qptr, sptr] = qd.subarray(i * 6, i * 6 + 6);
-        qEntries.push({ kind, layer, rows, cols, qptr, sptr });
-      }
-    }
-    const nF = M._qwen_wasm_f32_desc(dPtr, MAXD * 2);
-    if (nF < 0) {
-      M._qwen_wasm_release(dPtr);
-      throw new Error("norm weights unavailable");
-    }
-    const fd = new Uint32Array(freshHeap(M).HEAPU8.buffer, dPtr, nF * 4).slice();
-    M._qwen_wasm_release(dPtr);
-
-    /* Weights are packed into shards rather than one buffer.
-     *
-     * All of them in one binding is 1.72 GB, and WebGPU only guarantees
-     * maxStorageBufferBindingSize of 128 MiB. Chromium exposes tiers above
-     * that - roughly 1 GiB, 2 GiB, 4 GiB - so a single binding of 1.72 GB
-     * needs the 2 GiB tier and simply cannot be created below it, whatever the
-     * GPU is worth. Sharding drops the largest binding to SHARD_BUDGET and
-     * brings the 1 GiB tier into range, which is where most desktop GPUs sit.
-     *
-     * 128 MiB is not a useful target for this model: the KV cache alone is
-     * 224 KiB per token, so a 1600-token context needs a 360 MB binding no
-     * amount of weight sharding can avoid.
-     *
-     * A matrix is never split across shards, so the matmul kernels are
-     * unchanged and only need the right shard bound. The tied embedding is the
-     * exception - 311 MB on its own - and is split by row range, which the
-     * logits and embedding kernels handle explicitly. */
-    const SHARD_BUDGET = 256 << 20;
-
-    let scaleFloats = 0, quantBytes = 0;
-    const wmap = new Map();
-    const shards = [{ bytes: 0 }];
-    const openShard = (need) => {
-      let sh = shards[shards.length - 1];
-      if (sh.bytes > 0 && sh.bytes + need > SHARD_BUDGET) {
-        shards.push({ bytes: 0 });
-        sh = shards[shards.length - 1];
-      }
-      return sh;
-    };
-
-    for (const ent of qEntries) {
-      const { kind, layer, rows, cols } = ent;
-      const nq = rows * cols;
-      const scaleBase = scaleFloats;
-
-      if (nq > SHARD_BUDGET) {
-        /* Only the embedding gets here. Split by whole rows so each piece is
-         * still a contiguous [rows][cols] matrix. */
-        const rowsPer = Math.floor(SHARD_BUDGET / cols);
-        const pieces = [];
-        for (let r0 = 0; r0 < rows; r0 += rowsPer) {
-          const n = Math.min(rowsPer, rows - r0);
-          const sh = openShard(n * cols);
-          pieces.push({
-            shard: shards.length - 1,
-            wordBase: sh.bytes / 4,
-            rowBase: r0, rowCount: n,
-            scaleBase: scaleBase + (r0 * cols) / 64,
-            qptr: ent.qptr != null ? ent.qptr + r0 * cols : undefined,
-            qoff: ent.qoff != null ? ent.qoff + r0 * cols : undefined,
-            nq: n * cols,
-          });
-          sh.bytes += n * cols;
-        }
-        wmap.set(`${kind}:${layer}`, { rows, cols, scaleBase,
-          sptr: ent.sptr, soff: ent.soff, nq, pieces });
-      } else {
-        const sh = openShard(nq);
-        wmap.set(`${kind}:${layer}`, {
-          rows, cols, qptr: ent.qptr, qoff: ent.qoff,
-          sptr: ent.sptr, soff: ent.soff, nq, scaleBase,
-          shard: shards.length - 1, wordBase: sh.bytes / 4,
-        });
-        sh.bytes += nq;
-      }
-      quantBytes += nq;
-      scaleFloats += nq / 64;
-    }
-
-    const biggestShard = Math.max(...shards.map((s) => s.bytes));
-    /* Ask only for what the largest single binding actually needs. The KV
-     * cache is allocated later and can be the biggest of them at long
-     * contexts, so leave room for it rather than sizing to the shards alone. */
-    /* Simulate a lesser device: window.__gpuBindingCap caps what we ask for,
-     * which is how the 1 GiB tier gets tested on a machine that offers 4. */
-    const cap = (typeof window !== "undefined" && window.__gpuBindingCap) ||
-                lim.maxStorageBufferBindingSize;
-    const wantBinding = Math.min(cap, lim.maxStorageBufferBindingSize,
-                                 Math.max(biggestShard, scaleFloats * 4, 1 << 30));
-    if (biggestShard > lim.maxStorageBufferBindingSize) {
-      throw new Error(`a weight shard needs ${(biggestShard / 1e6).toFixed(0)} MB, adapter caps ` +
-                      `storage bindings at ${(lim.maxStorageBufferBindingSize / 1e6).toFixed(0)} MB`);
-    }
-
-    /* Optional features, taken when the adapter has them: subgroups for the
-     * matvec reductions, timestamps for the per-kernel profiler. shader-f16 is
-     * requested so experiments can use it without a second device. */
-    const wantFeatures = ["subgroups", "shader-f16", "timestamp-query"]
-      .filter((f) => adapter.features.has(f));
-    const device = await adapter.requestDevice({
-      requiredFeatures: wantFeatures,
-      requiredLimits: {
-        maxBufferSize: wantBinding,
-        maxStorageBufferBindingSize: wantBinding,
-        /* Headroom for tile experiments: the default limit is 16 KB, and an
-         * over-limit pipeline does not throw at creation - it fails at
-         * dispatch time, silently, as an invalid command buffer. */
-        maxComputeWorkgroupStorageSize:
-          Math.min(adapter.limits.maxComputeWorkgroupStorageSize, 32768),
-      },
-    });
-    this.hasSubgroups = wantFeatures.includes("subgroups");
-    this.hasTimestamps = wantFeatures.includes("timestamp-query");
-    this.hasF16 = wantFeatures.includes("shader-f16");
-    /* KV cache storage type. f16 halves the biggest allocation this backend
-     * makes - the cache is what dominates once weights are sharded - and K/V
-     * live after a norm, so their range is tame. Research agrees the format
-     * has margin to spare (int8 KV caches measure as quality-neutral; f16 is
-     * gentler still). Accumulation stays f32 in every kernel. Set kvF16Pref =
-     * false before init() to keep f32 - the CPU-comparison harness does, since
-     * bitwise identity with the wasm decoder cannot survive rounded KV. */
-    this.kvF16 = this.hasF16 && this.kvF16Pref !== false &&
-                 typeof Float16Array !== "undefined";
-    this.kvBytes = this.kvF16 ? 2 : 4;
-    this.device = device;
-    this.adapter = adapter;
-    this.maxDim = device.limits.maxComputeWorkgroupsPerDimension;
-    this.adapterInfo = adapter.info || {};
-    /* Surface these: a missing buffer usage flag makes writeBuffer a silent
-     * no-op, and the symptom is a kernel that runs fast and returns zeros. */
-    this.onError = report;
-    /* A device can be lost at any point - a driver reset, the OS switching
-     * GPUs, the tab being discarded. Every call after that fails, so record it
-     * and let callers fall back rather than reporting nonsense. */
-    device.lost.then((info) => {
-      this.lost = info.reason || "unknown";
-      const m = `GPU device lost (${this.lost}); falling back to wasm`;
-      console.error(m);
-      if (this.onError) this.onError(m);
-    });
-    device.addEventListener("uncapturederror", (e) => {
-      console.error("gpu:", e.error.message);
-      if (this.onError) this.onError("gpu error: " + e.error.message);
-    });
-
-    /* ---- upload ---- */
-    report(`allocating ${(quantBytes / 1e9).toFixed(2)} GB on the GPU in ` +
-           `${shards.length} shard${shards.length === 1 ? "" : "s"} of up to ` +
-           `${(biggestShard / 1e6).toFixed(0)} MB...`);
-    this.bufQuants = shards.map((sh) =>
-      device.createBuffer({ size: sh.bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }));
-    this.bufScale = device.createBuffer({ size: scaleFloats * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    this.shardCount = shards.length;
-
-    const CH = 64 << 20;
-    const src = this.weightSource;
-    let done = 0, lastReport = 0;
-    const putQuant = async (shard, wordBase, w, nq) => {
-      for (let off = 0; off < nq; off += CH) {
-        const n = Math.min(CH, nq - off);
-        if (src) {
-          const chunk = await src.read(w.qoff + off, n);
-          device.queue.writeBuffer(this.bufQuants[shard], wordBase * 4 + off,
-                                   new Uint8Array(chunk), 0, n);
-        } else {
-          device.queue.writeBuffer(this.bufQuants[shard], wordBase * 4 + off,
-                                   freshHeap(M).HEAPU8, w.qptr + off, n);
-        }
-        done += n;
-      }
-    };
-    for (const w of wmap.values()) {
-      if (w.pieces) {
-        for (const p of w.pieces) await putQuant(p.shard, p.wordBase, p, p.nq);
-      } else {
-        await putQuant(w.shard, w.wordBase, w, w.nq);
-      }
-      const sBytes = (w.nq / 64) * 4;
-      if (src) {
-        device.queue.writeBuffer(this.bufScale, w.scaleBase * 4,
-                                 new Uint8Array(await src.read(w.soff, sBytes)), 0, sBytes);
-      } else {
-        device.queue.writeBuffer(this.bufScale, w.scaleBase * 4, freshHeap(M).HEAPU8, w.sptr, sBytes);
-      }
-      if (done - lastReport > (256 << 20)) {
-        lastReport = done;
-        report(`uploading weights ${(done / 1e9).toFixed(2)} / ${(quantBytes / 1e9).toFixed(2)} GB`);
-        await device.queue.onSubmittedWorkDone();
-      }
-    }
-    await device.queue.onSubmittedWorkDone();
-
-    let normFloats = 0;
-    const nmap = new Map();
-    for (let i = 0; i < nF; i++) {
-      const [kind, layer, count, ptr] = fd.subarray(i * 4, i * 4 + 4);
-      nmap.set(`${kind}:${layer}`, { base: normFloats, count, ptr });
-      normFloats += count;
-    }
-    /* The RoPE cos/sin table lives at the end of this buffer so the shaders do
-     * not need a ninth binding (WebGPU guarantees only 8 storage buffers). */
-    this.ropeBase = normFloats;
-    this.ropeMaxSeq = 8192;
-    const normBytes = (normFloats + this.ropeMaxSeq * cfg.headDim) * 4;
-    this.bufNorm = device.createBuffer({ size: normBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    for (const n of nmap.values())
-      device.queue.writeBuffer(this.bufNorm, n.base * 4, freshHeap(M).HEAPU8, n.ptr, n.count * 4);
-    this.uploadRopeTable();
-
-    this.wmap = wmap;
-    this.nmap = nmap;
-    this.weightBytes = quantBytes + scaleFloats * 4;
-
-    /* ---- activations ---- */
+  allocateActivations() {
+    const { cfg, device } = this;
     const A = {};
     let ao = 0;
     const slot = (k, n) => { A[k] = ao; ao += n; };
@@ -1831,7 +1616,8 @@ export class WebGPUDecoder {
      * length and grows it to hold the prefill arena as well. */
     this.bufAct = device.createBuffer({
       size: ao * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
     this.actFloats = ao;
     this.actCapFloats = ao;
 
@@ -1839,122 +1625,526 @@ export class WebGPUDecoder {
       size: this.tokWords * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
-    this.bufTokRead = device.createBuffer({ size: STEP_REGIONS * 4,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    this.bufTokRead = device.createBuffer({
+      size: STEP_REGIONS * 4,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+  }
 
-    /* ---- pipelines ---- */
+  allocateStorageBuffers(opts = {}) {
+    this.destroyed = false;
+    try {
+      const M = this.M;
+      if (opts.device && !this.device) {
+        this.setupDevice(opts.device, opts.adapter);
+      }
+      const device = this.device;
+      if (!device) throw new Error("WebGPUDecoder: device must be initialized before allocateStorageBuffers");
+
+      // 1. Resolve model shape / config
+      let cfg = opts.cfg || this.cfg;
+      if (!cfg) {
+        if (opts.header) {
+          const is17b = opts.header["thinker.model.layers.0.input_layernorm.weight"]?.shape?.[0] === 2048;
+          let decLayers = 0;
+          while (opts.header[`thinker.model.layers.${decLayers}.self_attn.q_proj.weight.q8`]) decLayers++;
+          cfg = {
+            layers: decLayers || 28,
+            hidden: is17b ? 2048 : 1024,
+            heads: 16,
+            kvHeads: 8,
+            headDim: 128,
+            inter: is17b ? 6144 : 3072,
+            vocab: 151936,
+            imEnd: 151645,
+            endOfText: 151643,
+            asrText: 151704,
+          };
+        } else {
+          cfg = {
+            layers: 28,
+            hidden: 2048,
+            heads: 16,
+            kvHeads: 8,
+            headDim: 128,
+            inter: 6144,
+            vocab: 151936,
+            imEnd: 151645,
+            endOfText: 151643,
+            asrText: 151704,
+          };
+        }
+      }
+      if (!cfg.qDim) cfg.qDim = cfg.heads * cfg.headDim;
+      if (!cfg.kvDim) cfg.kvDim = cfg.kvHeads * cfg.headDim;
+      if (!cfg.headsPerKv) cfg.headsPerKv = cfg.heads / cfg.kvHeads;
+      if (!cfg.endOfText) cfg.endOfText = 151643;
+      if (!cfg.asrText) cfg.asrText = 151704;
+      this.cfg = cfg;
+      if (this.eps === undefined) {
+        this.eps = (M && M._qwen_wasm_rms_eps) ? M._qwen_wasm_rms_eps() : 1e-6;
+      }
+      if (this.theta === undefined) {
+        this.theta = (M && M._qwen_wasm_rope_theta) ? M._qwen_wasm_rope_theta() : 1e6;
+      }
+
+      // 2. Dynamic SHARD_BUDGET
+      const maxBinding = this.adapter?.limits?.maxStorageBufferBindingSize ||
+                         this.device?.limits?.maxStorageBufferBindingSize ||
+                         (128 << 20);
+      const SHARD_BUDGET = Math.min(opts.shardBudget || (256 << 20), maxBinding);
+
+      // 3. Obtain descriptor entries
+      let qEntries = opts.entries || this.weightSource?.entries;
+      if (!qEntries) {
+        const MAXD = 8 * cfg.layers + 8;
+        const dPtr = M._qwen_wasm_alloc(MAXD * 8 * 4) >>> 0;
+        const nQ = M._qwen_wasm_q8_desc(dPtr, MAXD);
+        if (nQ < 0) {
+          M._qwen_wasm_release(dPtr);
+          throw new Error("decoder is not Q8 quantized (use the packed model)");
+        }
+        const qd = new Uint32Array(freshHeap(M).HEAPU8.buffer, dPtr, nQ * 6).slice();
+        M._qwen_wasm_release(dPtr);
+        qEntries = [];
+        for (let i = 0; i < nQ; i++) {
+          const [kind, layer, rows, cols, qptr, sptr] = qd.subarray(i * 6, i * 6 + 6);
+          qEntries.push({ kind, layer, rows, cols, qptr, sptr });
+        }
+      }
+
+      // 4. Compute shards and offsets
+      let scaleFloats = 0, quantBytes = 0;
+      const wmap = new Map();
+      const shards = [{ bytes: 0 }];
+      const openShard = (need) => {
+        let sh = shards[shards.length - 1];
+        if (sh.bytes > 0 && sh.bytes + need > SHARD_BUDGET) {
+          shards.push({ bytes: 0 });
+          sh = shards[shards.length - 1];
+        }
+        return sh;
+      };
+
+      for (const ent of qEntries) {
+        const { kind, layer, rows, cols } = ent;
+        const nq = rows * cols;
+        const scaleBase = scaleFloats;
+
+        if (nq > SHARD_BUDGET) {
+          if (SHARD_BUDGET < cols) {
+            throw new Error(`SHARD_BUDGET (${SHARD_BUDGET}) cannot be smaller than matrix column width (${cols})`);
+          }
+          const rowsPer = Math.floor(SHARD_BUDGET / cols);
+          const pieces = [];
+          for (let r0 = 0; r0 < rows; r0 += rowsPer) {
+            const n = Math.min(rowsPer, rows - r0);
+            const sh = openShard(n * cols);
+            pieces.push({
+              shard: shards.length - 1,
+              wordBase: sh.bytes / 4,
+              rowBase: r0, rowCount: n,
+              scaleBase: scaleBase + (r0 * cols) / 64,
+              qptr: ent.qptr != null ? ent.qptr + r0 * cols : undefined,
+              qoff: ent.qoff != null ? ent.qoff + r0 * cols : undefined,
+              nq: n * cols,
+            });
+            sh.bytes += n * cols;
+          }
+          wmap.set(`${kind}:${layer}`, {
+            rows, cols, scaleBase,
+            sptr: ent.sptr, soff: ent.soff, nq, pieces,
+          });
+        } else {
+          const sh = openShard(nq);
+          wmap.set(`${kind}:${layer}`, {
+            rows, cols, qptr: ent.qptr, qoff: ent.qoff,
+            sptr: ent.sptr, soff: ent.soff, nq, scaleBase,
+            shard: shards.length - 1, wordBase: sh.bytes / 4,
+          });
+          sh.bytes += nq;
+        }
+        quantBytes += nq;
+        scaleFloats += nq / 64;
+      }
+
+      // 5. Create storage buffers
+      const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+      this.bufQuants = [];
+      for (const sh of shards) {
+        this.bufQuants.push(device.createBuffer({ size: Math.max(4, sh.bytes), usage }));
+      }
+      this.bufScale = device.createBuffer({ size: Math.max(4, scaleFloats * 4), usage });
+      this.shardCount = shards.length;
+      this.shards = shards;
+
+      // 6. Compute norm table and allocate bufNorm
+      let normFloats = 0;
+      const nmap = new Map();
+      if (opts.nmap) {
+        for (const [k, v] of opts.nmap.entries()) {
+          nmap.set(k, v);
+          normFloats += v.count;
+        }
+      } else if (opts.header || !M._qwen_wasm_f32_desc) {
+        for (let l = 0; l < cfg.layers; l++) {
+          nmap.set(`0:${l}`, { base: normFloats, count: cfg.hidden, ptr: 0 });
+          normFloats += cfg.hidden;
+          nmap.set(`1:${l}`, { base: normFloats, count: cfg.hidden, ptr: 0 });
+          normFloats += cfg.hidden;
+          nmap.set(`2:${l}`, { base: normFloats, count: cfg.headDim, ptr: 0 });
+          normFloats += cfg.headDim;
+          nmap.set(`3:${l}`, { base: normFloats, count: cfg.headDim, ptr: 0 });
+          normFloats += cfg.headDim;
+        }
+        nmap.set(`4:0`, { base: normFloats, count: cfg.hidden, ptr: 0 });
+        normFloats += cfg.hidden;
+      } else {
+        const MAXD = 8 * cfg.layers + 8;
+        const dPtr = M._qwen_wasm_alloc(MAXD * 8 * 4) >>> 0;
+        const nF = M._qwen_wasm_f32_desc(dPtr, MAXD * 2);
+        if (nF >= 0) {
+          const fd = new Uint32Array(freshHeap(M).HEAPU8.buffer, dPtr, nF * 4).slice();
+          M._qwen_wasm_release(dPtr);
+          for (let i = 0; i < nF; i++) {
+            const [kind, layer, count, ptr] = fd.subarray(i * 4, i * 4 + 4);
+            nmap.set(`${kind}:${layer}`, { base: normFloats, count, ptr });
+            normFloats += count;
+          }
+        } else {
+          M._qwen_wasm_release(dPtr);
+        }
+      }
+
+      this.ropeBase = normFloats;
+      this.ropeMaxSeq = 8192;
+      const normBytes = (normFloats + this.ropeMaxSeq * cfg.headDim) * 4;
+      this.bufNorm = device.createBuffer({ size: normBytes, usage });
+      this.uploadRopeTable();
+
+      this.wmap = wmap;
+      this.nmap = nmap;
+      this.weightBytes = quantBytes + scaleFloats * 4;
+      this.quantBytes = quantBytes;
+
+      // 7. Activations
+      this.allocateActivations();
+
+      return {
+        bufQuants: this.bufQuants,
+        bufScale: this.bufScale,
+        bufNorm: this.bufNorm,
+        wmap: this.wmap,
+        nmap: this.nmap,
+        shards,
+        weightBytes: this.weightBytes,
+      };
+    } catch (err) {
+      this.destroy();
+      throw err;
+    }
+  }
+
+  ensureMatvecPipes(mode, wg) {
+    if (this.destroyed) return;
+    if (this.matvecPipesTree?.[mode]?.[wg]) return;
+    const device = this.device;
+    if (!device) return;
     const layout = this.pipelineLayout();
-    /* Keep the modules so their compilation diagnostics can be surfaced: an
-     * invalid pipeline silently turns every dispatch into a no-op, which shows
-     * up as "impossibly fast and wrong" rather than as an error. */
-    const modules = [];
-    const mk = (code, name) => {
-      /* Every module sees the KV cache through the KVT alias; enable
-       * directives must precede everything else, so hoist them. */
+    const mkSync = (code, name) => {
       code = (this.kvF16 ? "enable f16;\nalias KVT = f16;\n"
                          : "alias KVT = f32;\n") + code;
       const enables = [...new Set([...code.matchAll(/^enable [^;]+;$/gm)].map((m) => m[0]))];
       code = enables.join("\n") + "\n" + code.replace(/^enable [^;]+;$/gm, "");
       const module = device.createShaderModule({ code, label: name });
-      modules.push([name, module]);
       return device.createComputePipeline({
         label: name, layout, compute: { module, entryPoint: "main" },
       });
     };
-    /* The best reduction width for a GEMV is hardware dependent, so build a few
-     * and let the caller pick (see setMatvecWidth). */
-    const ROW_Q8 = "q8row(P.wordBase + row * nwords, P.scaleBase + row * (P.cols / 64u), " +
-                   "nwords, P.a, P.b, lid.x, WG)";
-    const ROW_F32 = "q8rowF(P.wordBase + row * nwords, P.scaleBase + row * (P.cols / 64u), " +
-                    "nwords, P.xOff, lid.x, WG)";
-    /* Two reduction families: the portable shared-memory tree, and the
-     * subgroup one where the feature exists. Both are kept so they can be
-     * compared on the same audio (setSubgroups). */
-    this.matvecPipes = { q8: {}, f32: {} };
-    this.logitsPipes = { q8: {}, f32: {} };
-    this.gateUpPipes = { q8: {}, f32: {} };
-    this.matvecPipesTree = { q8: {}, f32: {} };
-    this.logitsPipesTree = { q8: {}, f32: {} };
-    this.gateUpPipesTree = { q8: {}, f32: {} };
-    for (const [mode, rowfn] of [["q8", ROW_Q8], ["f32", ROW_F32]]) {
-      for (const wg of [32, 64, 128, 256]) {
-        const sub = (code) => code.replace("$WG$", String(wg)).replace("$ROWFN$", rowfn);
-        const gatefn = rowfn.replace(/\brow\b/g, "grow");
-        const upfn = rowfn.replace(/\brow\b/g, "(grow + 1u)");
-        const subGateUp = (code) => code.replace("$WG$", String(wg))
-          .replace("$GATEFN$", gatefn).replace("$UPFN$", upfn);
-        this.matvecPipesTree[mode][wg] = mk(sub(MATVEC_WGSL), `matvec_${mode}_${wg}`);
-        this.logitsPipesTree[mode][wg] = mk(sub(LOGITS_WGSL), `logits_${mode}_${wg}`);
-        this.gateUpPipesTree[mode][wg] = mk(subGateUp(GATE_UP_WGSL), `gate_up_${mode}_${wg}`);
+    const rowfn = mode === "q8" ? ROW_Q8 : ROW_F32;
+    const sub = (code) => code.replace("$WG$", String(wg)).replace("$ROWFN$", rowfn);
+    const gatefn = rowfn.replace(/\brow\b/g, "grow");
+    const upfn = rowfn.replace(/\brow\b/g, "(grow + 1u)");
+    const subGateUp = (code) => code.replace("$WG$", String(wg))
+      .replace("$GATEFN$", gatefn).replace("$UPFN$", upfn);
+
+    if (!this.matvecPipesTree) this.matvecPipesTree = { q8: {}, f32: {} };
+    if (!this.logitsPipesTree) this.logitsPipesTree = { q8: {}, f32: {} };
+    if (!this.gateUpPipesTree) this.gateUpPipesTree = { q8: {}, f32: {} };
+    if (!this.matvecPipes) this.matvecPipes = { q8: {}, f32: {} };
+    if (!this.logitsPipes) this.logitsPipes = { q8: {}, f32: {} };
+    if (!this.gateUpPipes) this.gateUpPipes = { q8: {}, f32: {} };
+
+    if (!this.matvecPipesTree[mode]) this.matvecPipesTree[mode] = {};
+    if (!this.logitsPipesTree[mode]) this.logitsPipesTree[mode] = {};
+    if (!this.gateUpPipesTree[mode]) this.gateUpPipesTree[mode] = {};
+    if (!this.matvecPipes[mode]) this.matvecPipes[mode] = {};
+    if (!this.logitsPipes[mode]) this.logitsPipes[mode] = {};
+    if (!this.gateUpPipes[mode]) this.gateUpPipes[mode] = {};
+
+    this.matvecPipesTree[mode][wg] = mkSync(sub(MATVEC_WGSL), `matvec_${mode}_${wg}`);
+    this.logitsPipesTree[mode][wg] = mkSync(sub(LOGITS_WGSL), `logits_${mode}_${wg}`);
+    this.gateUpPipesTree[mode][wg] = mkSync(subGateUp(GATE_UP_WGSL), `gate_up_${mode}_${wg}`);
+    if (this.hasSubgroups) {
+      this.matvecPipes[mode][wg] = mkSync(sub(MATVEC_SG_WGSL), `matvec_sg_${mode}_${wg}`);
+      this.logitsPipes[mode][wg] = mkSync(sub(LOGITS_SG_WGSL), `logits_sg_${mode}_${wg}`);
+      this.gateUpPipes[mode][wg] = mkSync(subGateUp(GATE_UP_SG_WGSL), `gate_up_sg_${mode}_${wg}`);
+    } else {
+      this.matvecPipes[mode][wg] = this.matvecPipesTree[mode][wg];
+      this.logitsPipes[mode][wg] = this.logitsPipesTree[mode][wg];
+      this.gateUpPipes[mode][wg] = this.gateUpPipesTree[mode][wg];
+    }
+  }
+
+  async finishInit(report = () => {}) {
+    if (this.destroyed) return;
+    if (this.ready) return;
+    if (this._initPromise) return this._initPromise;
+
+    this._initPromise = (async () => {
+      try {
+        const device = this.device;
+        if (!device) throw new Error("WebGPUDecoder: device missing in finishInit");
+        if (this.destroyed) return;
+        const layout = this.pipelineLayout();
+        const modules = [];
+        const tick = () => new Promise((r) => setTimeout(r, 0));
+        let compiledCount = 0;
+        const totalPipelines = 3 + (this.hasSubgroups ? 3 : 0) + 24;
+
+        const mk = async (code, name) => {
+          if (this.destroyed) return null;
+          await tick();
+          if (this.destroyed) return null;
+          compiledCount++;
+          report(`Compiling shaders (${compiledCount}/${totalPipelines}): ${name}...`);
+          code = (this.kvF16 ? "enable f16;\nalias KVT = f16;\n"
+                             : "alias KVT = f32;\n") + code;
+          const enables = [...new Set([...code.matchAll(/^enable [^;]+;$/gm)].map((m) => m[0]))];
+          code = enables.join("\n") + "\n" + code.replace(/^enable [^;]+;$/gm, "");
+          const module = device.createShaderModule({ code, label: name });
+          modules.push([name, module]);
+          if (device.createComputePipelineAsync) {
+            return await device.createComputePipelineAsync({
+              label: name, layout, compute: { module, entryPoint: "main" },
+            });
+          }
+          return device.createComputePipeline({
+            label: name, layout, compute: { module, entryPoint: "main" },
+          });
+        };
+
+        // Compile ONLY active default configuration: WG 64, f32 activation mode
+        const sub64 = (code) => code.replace("$WG$", "64").replace("$ROWFN$", ROW_F32);
+        const gatefn64 = ROW_F32.replace(/\brow\b/g, "grow");
+        const upfn64 = ROW_F32.replace(/\brow\b/g, "(grow + 1u)");
+        const subGateUp64 = (code) => code.replace("$WG$", "64")
+          .replace("$GATEFN$", gatefn64).replace("$UPFN$", upfn64);
+
+        const pMatvec = await mk(sub64(MATVEC_WGSL), "matvec_f32_64");
+        if (this.destroyed) return;
+        const pLogits = await mk(sub64(LOGITS_WGSL), "logits_f32_64");
+        if (this.destroyed) return;
+        const pGateUp = await mk(subGateUp64(GATE_UP_WGSL), "gate_up_f32_64");
+        if (this.destroyed) return;
+
+        let pMatvecSg = null;
+        let pLogitsSg = null;
+        let pGateUpSg = null;
         if (this.hasSubgroups) {
-          this.matvecPipes[mode][wg] = mk(sub(MATVEC_SG_WGSL), `matvec_sg_${mode}_${wg}`);
-          this.logitsPipes[mode][wg] = mk(sub(LOGITS_SG_WGSL), `logits_sg_${mode}_${wg}`);
-          this.gateUpPipes[mode][wg] = mk(subGateUp(GATE_UP_SG_WGSL), `gate_up_sg_${mode}_${wg}`);
+          pMatvecSg = await mk(sub64(MATVEC_SG_WGSL), "matvec_sg_f32_64");
+          if (this.destroyed) return;
+          pLogitsSg = await mk(sub64(LOGITS_SG_WGSL), "logits_sg_f32_64");
+          if (this.destroyed) return;
+          pGateUpSg = await mk(subGateUp64(GATE_UP_SG_WGSL), "gate_up_sg_f32_64");
+          if (this.destroyed) return;
+        }
+
+        if (this.destroyed) return;
+
+        this.matvecPipes = { q8: {}, f32: {} };
+        this.logitsPipes = { q8: {}, f32: {} };
+        this.gateUpPipes = { q8: {}, f32: {} };
+        this.matvecPipesTree = { q8: {}, f32: {} };
+        this.logitsPipesTree = { q8: {}, f32: {} };
+        this.gateUpPipesTree = { q8: {}, f32: {} };
+
+        this.matvecPipesTree.f32[64] = pMatvec;
+        this.logitsPipesTree.f32[64] = pLogits;
+        this.gateUpPipesTree.f32[64] = pGateUp;
+
+        if (this.hasSubgroups) {
+          this.matvecPipes.f32[64] = pMatvecSg;
+          this.logitsPipes.f32[64] = pLogitsSg;
+          this.gateUpPipes.f32[64] = pGateUpSg;
         } else {
-          this.matvecPipes[mode][wg] = this.matvecPipesTree[mode][wg];
-          this.logitsPipes[mode][wg] = this.logitsPipesTree[mode][wg];
-          this.gateUpPipes[mode][wg] = this.gateUpPipesTree[mode][wg];
+          this.matvecPipes.f32[64] = pMatvec;
+          this.logitsPipes.f32[64] = pLogits;
+          this.gateUpPipes.f32[64] = pGateUp;
+        }
+
+        this.useSubgroups = this.hasSubgroups;
+        this.matvecWidth = 64;
+        this.quantizeActivations = false;
+
+        const pipe = {
+          matvec: this.matvecPipes.f32[64],
+          logits: this.logitsPipes.f32[64],
+          gateUp: this.gateUpPipes.f32[64],
+          rmsnorm: await mk(RMSNORM_WGSL, "rmsnorm"),
+          qkrope: await mk(QKROPE_WGSL, "qkrope"),
+          scores: this.hasSubgroups ? await mk(ATTN_SCORES_SG_WGSL, "scores_sg")
+                                    : await mk(ATTN_SCORES_WGSL, "scores"),
+          softmax: await mk(ATTN_SOFTMAX_WGSL, "softmax"),
+          apply: await mk(ATTN_APPLY_WGSL, "apply"),
+          merge: await mk(ATTN_MERGE_WGSL, "merge"),
+          quantAct: await mk(QUANTACT_WGSL, "quantAct"),
+          preMatmul: await mk(PRE_MATMUL_WGSL, "preMatmul"),
+          preGateUp: await mk(PRE_GATE_UP_WGSL, "preGateUp"),
+          preRms: await mk(PRE_RMSNORM_WGSL, "preRms"),
+          preQkRope: await mk(PRE_QKROPE_WGSL, "preQkRope"),
+          preKvStore: await mk(PRE_KVSTORE_WGSL, "preKvStore"),
+          preScores: await mk(PRE_SCORES_WGSL, "preScores"),
+          preScoresKv: this.hasSubgroups ? await mk(PRE_SCORES_KV_SG_WGSL, "preScoresKv_sg")
+                                         : await mk(PRE_SCORES_KV_WGSL, "preScoresKv"),
+          preSoftmax: await mk(PRE_SOFTMAX_WGSL, "preSoftmax"),
+          preSoftmaxKv: await mk(PRE_SOFTMAX_KV_WGSL, "preSoftmaxKv"),
+          preApplyKv: await mk(PRE_APPLY_KV_WGSL, "preApplyKv"),
+          preApply: await mk(PRE_APPLY_WGSL, "preApply"),
+          preExtract: await mk(PRE_EXTRACT_WGSL, "preExtract"),
+          embed: await mk(EMBED_WGSL, "embed"),
+          embedBatch: await mk(EMBED_BATCH_WGSL, "embedBatch"),
+          argmax: await mk(ARGMAX_WGSL, "argmax"),
+          argmax1: await mk(ARGMAX_STAGE1_WGSL, "argmax_stage1"),
+          argmax2: await mk(ARGMAX_STAGE2_WGSL, "argmax_stage2"),
+          transposeEmbeds: await mk(TRANSPOSE_EMBEDS_WGSL, "transpose_embeds"),
+        };
+
+        if (this.destroyed) return;
+        this.pipe = pipe;
+
+        let shaderErrors = 0;
+        for (const [name, module] of modules) {
+          if (this.destroyed) return;
+          if (module.getCompilationInfo) {
+            const info = await module.getCompilationInfo();
+            if (this.destroyed) return;
+            for (const m of info.messages) {
+              if (m.type !== "error") continue;
+              shaderErrors++;
+              report(`shader ${name}:${m.lineNum}: ${m.message}`);
+              console.error(`shader ${name}:${m.lineNum}:${m.linePos}: ${m.message}`);
+            }
+          }
+        }
+        if (this.destroyed) return;
+        if (shaderErrors) throw new Error(`${shaderErrors} shader compilation error(s)`);
+
+        if (this.destroyed) return;
+        this.ready = true;
+        report("GPU decoder ready");
+      } finally {
+        this._initPromise = null;
+        this._finishInitPromise = null;
+      }
+    })();
+    this._finishInitPromise = this._initPromise;
+    return this._initPromise;
+  }
+
+  async init(report = () => {}) {
+    const M = this.M;
+    this.onError = report;
+
+    if (!this.device) {
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+      if (!adapter) throw new Error("no WebGPU adapter");
+      const lim = adapter.limits;
+      const cap = (typeof window !== "undefined" && window.__gpuBindingCap) ||
+                  lim.maxStorageBufferBindingSize;
+      const wantBinding = Math.min(cap, lim.maxStorageBufferBindingSize);
+      const wantBufferSize = Math.min(cap, lim.maxBufferSize);
+      const wantFeatures = ["subgroups", "shader-f16", "timestamp-query"]
+        .filter((f) => adapter.features.has(f));
+      const device = await adapter.requestDevice({
+        requiredFeatures: wantFeatures,
+        requiredLimits: {
+          maxBufferSize: wantBufferSize,
+          maxStorageBufferBindingSize: wantBinding,
+          maxComputeWorkgroupStorageSize:
+            Math.min(adapter.limits.maxComputeWorkgroupStorageSize, 32768),
+        },
+      });
+      this.setupDevice(device, adapter, wantFeatures);
+    }
+
+    if (!this.bufQuants) {
+      this.allocateStorageBuffers({
+        shardBudget: this.opts?.shardBudget,
+        entries: this.weightSource?.entries,
+      });
+    }
+
+    const { device, wmap, quantBytes, shards } = this;
+    const biggestShard = Math.max(...shards.map((s) => s.bytes));
+    report(`allocating ${(quantBytes / 1e9).toFixed(2)} GB on the GPU in ` +
+           `${shards.length} shard${shards.length === 1 ? "" : "s"} of up to ` +
+           `${(biggestShard / 1e6).toFixed(0)} MB...`);
+
+    const CH = 64 << 20;
+    const src = this.weightSource;
+    let done = 0, lastReport = 0;
+    const putQuant = async (shard, wordBase, w, nq) => {
+      for (let off = 0; off < nq; off += CH) {
+        const n = Math.min(CH, nq - off);
+        if (src) {
+          const chunk = await src.read(w.qoff + off, n);
+          device.queue.writeBuffer(this.bufQuants[shard], wordBase * 4 + off,
+                                   new Uint8Array(chunk), 0, n);
+        } else if (w.qptr != null) {
+          device.queue.writeBuffer(this.bufQuants[shard], wordBase * 4 + off,
+                                   freshHeap(M).HEAPU8, w.qptr + off, n);
+        }
+        done += n;
+      }
+    };
+    for (const w of wmap.values()) {
+      if (w.pieces) {
+        for (const p of w.pieces) await putQuant(p.shard, p.wordBase, p, p.nq);
+      } else {
+        await putQuant(w.shard, w.wordBase, w, w.nq);
+      }
+      const sBytes = (w.nq / 64) * 4;
+      if (src && w.soff != null) {
+        device.queue.writeBuffer(this.bufScale, w.scaleBase * 4,
+                                 new Uint8Array(await src.read(w.soff, sBytes)), 0, sBytes);
+      } else if (w.sptr != null) {
+        device.queue.writeBuffer(this.bufScale, w.scaleBase * 4, freshHeap(M).HEAPU8, w.sptr, sBytes);
+      }
+      if (done - lastReport > (256 << 20)) {
+        lastReport = done;
+        report(`uploading weights ${(done / 1e9).toFixed(2)} / ${(quantBytes / 1e9).toFixed(2)} GB`);
+        await device.queue.onSubmittedWorkDone();
+      }
+    }
+    await device.queue.onSubmittedWorkDone();
+
+    if (!src && this.nmap) {
+      for (const n of this.nmap.values()) {
+        if (n.ptr) {
+          device.queue.writeBuffer(this.bufNorm, n.base * 4, freshHeap(M).HEAPU8, n.ptr, n.count * 4);
         }
       }
     }
-    this.useSubgroups = this.hasSubgroups;
-    this.matvecWidth = 64;
-    /* f32 activations by default: one dispatch fewer per matvec (measured 25.6
-     * against 30.5 ms/token) and closer to the bf16 reference. The int8 mode
-     * exists for bit-comparability with the CPU decoder. */
-    this.quantizeActivations = false;
 
-    this.pipe = {
-      matvec: this.matvecPipes.f32[64],
-      logits: this.logitsPipes.f32[64],
-      gateUp: this.gateUpPipes.f32[64],
-      rmsnorm: mk(RMSNORM_WGSL, "rmsnorm"),
-      qkrope: mk(QKROPE_WGSL, "qkrope"),
-      scores: this.hasSubgroups ? mk(ATTN_SCORES_SG_WGSL, "scores_sg")
-                                : mk(ATTN_SCORES_WGSL, "scores"),
-      softmax: mk(ATTN_SOFTMAX_WGSL, "softmax"),
-      apply: mk(ATTN_APPLY_WGSL, "apply"),
-      merge: mk(ATTN_MERGE_WGSL, "merge"),
-      quantAct: mk(QUANTACT_WGSL, "quantAct"),
-      preMatmul: mk(PRE_MATMUL_WGSL, "preMatmul"),
-      preGateUp: mk(PRE_GATE_UP_WGSL, "preGateUp"),
-      preRms: mk(PRE_RMSNORM_WGSL, "preRms"),
-      preQkRope: mk(PRE_QKROPE_WGSL, "preQkRope"),
-      preKvStore: mk(PRE_KVSTORE_WGSL, "preKvStore"),
-      preScores: mk(PRE_SCORES_WGSL, "preScores"),
-      preScoresKv: this.hasSubgroups ? mk(PRE_SCORES_KV_SG_WGSL, "preScoresKv_sg")
-                                     : mk(PRE_SCORES_KV_WGSL, "preScoresKv"),
-      preSoftmax: mk(PRE_SOFTMAX_WGSL, "preSoftmax"),
-      preSoftmaxKv: mk(PRE_SOFTMAX_KV_WGSL, "preSoftmaxKv"),
-      preApplyKv: mk(PRE_APPLY_KV_WGSL, "preApplyKv"),
-      preApply: mk(PRE_APPLY_WGSL, "preApply"),
-      preExtract: mk(PRE_EXTRACT_WGSL, "preExtract"),
-      embed: mk(EMBED_WGSL, "embed"),
-      embedBatch: mk(EMBED_BATCH_WGSL, "embedBatch"),
-      argmax: mk(ARGMAX_WGSL, "argmax"),
-      argmax1: mk(ARGMAX_STAGE1_WGSL, "argmax_stage1"),
-      argmax2: mk(ARGMAX_STAGE2_WGSL, "argmax_stage2"),
-      transposeEmbeds: mk(TRANSPOSE_EMBEDS_WGSL, "transpose_embeds"),
-    };
-
-    let shaderErrors = 0;
-    for (const [name, module] of modules) {
-      const info = await module.getCompilationInfo();
-      for (const m of info.messages) {
-        if (m.type !== "error") continue;
-        shaderErrors++;
-        report(`shader ${name}:${m.lineNum}: ${m.message}`);
-        console.error(`shader ${name}:${m.lineNum}:${m.linePos}: ${m.message}`);
-      }
-    }
-    if (shaderErrors) throw new Error(`${shaderErrors} shader compilation error(s)`);
-
-    this.ready = true;
-    report("GPU decoder ready");
+    await this.finishInit(report);
   }
 
   setMatvecWidth(wg) {
-    if (!this.matvecPipes.q8[wg]) return false;
+    if (this.destroyed) return false;
+    if (![32, 64, 128, 256].includes(wg)) return false;
+    const mode = this.quantizeActivations ? "q8" : "f32";
+    this.ensureMatvecPipes(mode, wg);
     this.matvecWidth = wg;
     this.applyMode();
     return true;
@@ -1963,22 +2153,30 @@ export class WebGPUDecoder {
   /* q8: quantize the activation like the CPU does (bit-comparable output).
    * f32: keep it in f32 (one dispatch fewer per matvec, slightly different). */
   setQuantizeActivations(on) {
+    if (this.destroyed) return;
+    const mode = on ? "q8" : "f32";
+    this.ensureMatvecPipes(mode, this.matvecWidth);
     this.quantizeActivations = !!on;
     this.applyMode();
   }
 
   applyMode() {
+    if (this.destroyed) return;
     const mode = this.quantizeActivations ? "q8" : "f32";
+    this.ensureMatvecPipes(mode, this.matvecWidth);
     const mv = this.useSubgroups ? this.matvecPipes : this.matvecPipesTree;
     const lg = this.useSubgroups ? this.logitsPipes : this.logitsPipesTree;
     const gu = this.useSubgroups ? this.gateUpPipes : this.gateUpPipesTree;
-    this.pipe.matvec = mv[mode][this.matvecWidth];
-    this.pipe.logits = lg[mode][this.matvecWidth];
-    this.pipe.gateUp = gu[mode][this.matvecWidth];
+    if (this.pipe) {
+      this.pipe.matvec = mv?.[mode]?.[this.matvecWidth] || this.pipe.matvec;
+      this.pipe.logits = lg?.[mode]?.[this.matvecWidth] || this.pipe.logits;
+      this.pipe.gateUp = gu?.[mode]?.[this.matvecWidth] || this.pipe.gateUp;
+    }
   }
 
   /* Flip between the subgroup and shared-memory-tree reductions (A/B). */
   setSubgroups(on) {
+    if (this.destroyed) return false;
     this.useSubgroups = !!on && this.hasSubgroups;
     this.applyMode();
     return this.useSubgroups;
@@ -2045,13 +2243,38 @@ export class WebGPUDecoder {
      * every layer's base offset - must not move underneath it. Keep the
      * current layout while it is big enough, and grow in coarse steps so a
      * stream is not re-laying the cache out every chunk. */
+    const maxBinding = this.adapter?.limits?.maxStorageBufferBindingSize ||
+                       this.device?.limits?.maxStorageBufferBindingSize ||
+                       (128 << 20);
+    const bytesPerToken = 2 * cfg.layers * cfg.kvDim * this.kvBytes;
+    const maxPhysicalTokens = Math.floor(maxBinding / bytesPerToken);
+
+    // Precision-aware context ceiling:
+    // Under kvF16, 768 tokens = 84 MiB <= 128 MiB (fits up to 1024 / 1170 tokens).
+    // Under f32 fallback, strictly clamp to 512 tokens = 112 MiB (117 MB) to fit in 128 MiB.
+    const maxContextLimit = this.kvF16
+      ? Math.min(this.opts?.maxSeq || 1600, maxPhysicalTokens)
+      : Math.min(512, maxPhysicalTokens);
+
+    const totalSeq = kvLen + (maxNew || 0);
+    if (totalSeq > maxContextLimit) {
+      throw new Error(
+        `Context length (${totalSeq}) exceeds maximum supported context length (${maxContextLimit}) ` +
+        `under ${this.kvF16 ? "Float16" : "Float32 fallback"} for ${Math.round(maxBinding / (1024 * 1024))} MiB WebGPU storage limit. ` +
+        `${!this.kvF16 ? "Float16 KV cache (shader-f16 on iOS 18.2+) is required for longer contexts." : ""}`
+      );
+    }
+
+    const step = this.kvF16 ? 768 : 512;
     let maxSeq = kvLen + maxNew + 8;
     if (suffix) {
-      /* Keep the current layout whenever it actually fits; the 768-step
-       * rounding is only for sizing a fresh one, and comparing against the
-       * rounded figure would re-lay out a cache that was already big enough. */
-      if (this.bufKV && this.maxSeq >= maxSeq) maxSeq = this.maxSeq;
-      else maxSeq = Math.ceil(maxSeq / 768) * 768;
+      if (this.bufKV && this.maxSeq >= maxSeq) {
+        maxSeq = this.maxSeq;
+      } else {
+        maxSeq = Math.min(Math.ceil(maxSeq / step) * step, maxContextLimit);
+      }
+    } else {
+      maxSeq = Math.min(maxSeq, maxContextLimit);
     }
     const seqPad = opts.prefillSeq ? Math.ceil(opts.prefillSeq / 64) * 64 : 0;
     this.seqPad = seqPad;
@@ -2140,23 +2363,68 @@ export class WebGPUDecoder {
       const srcF16 = !!(M._qwen_wasm_kv_is_f16 && M._qwen_wasm_kv_is_f16());
       const n = kvLen * cfg.kvDim;
       const srcBytes = srcF16 ? 2 : 4;
+
+      const widenF16 = (u16) => {
+        if (typeof Float16Array !== "undefined") {
+          return Float32Array.from(new Float16Array(u16.buffer, u16.byteOffset, u16.length));
+        }
+        const out = new Float32Array(u16.length);
+        const dv = new DataView(u16.buffer, u16.byteOffset, u16.byteLength);
+        if (typeof dv.getFloat16 === "function") {
+          for (let i = 0; i < u16.length; i++) out[i] = dv.getFloat16(i * 2, true);
+          return out;
+        }
+        const u32Buf = new Uint32Array(1);
+        const f32Buf = new Float32Array(u32Buf.buffer);
+        for (let i = 0; i < u16.length; i++) {
+          const h = u16[i];
+          const s = (h & 0x8000) << 16;
+          let e = (h & 0x7c00) >> 10;
+          let f = h & 0x03ff;
+          if (e === 0) {
+            if (f !== 0) {
+              while (!(f & 0x0400)) { f <<= 1; e--; }
+              e++; f &= ~0x0400;
+              u32Buf[0] = s | ((e + 112) << 23) | (f << 13);
+            } else { u32Buf[0] = s; }
+          } else if (e === 0x1f) {
+            u32Buf[0] = s | 0x7f800000 | (f << 13);
+          } else {
+            u32Buf[0] = s | ((e + 112) << 23) | (f << 13);
+          }
+          out[i] = f32Buf[0];
+        }
+        return out;
+      };
+
       for (let l = 0; l < cfg.layers; l++) {
         const src = l * wasmStride * cfg.kvDim;
         let kSrc, vSrc;
         if (srcF16) {
           kSrc = new Uint16Array(freshHeap(M).HEAPU8.buffer, kPtr + src * srcBytes, n);
           vSrc = new Uint16Array(freshHeap(M).HEAPU8.buffer, vPtr + src * srcBytes, n);
-          if (this.kvF16) { kSrc = kSrc.slice(); vSrc = vSrc.slice(); }
-          else {
-            /* Widen through Float16Array's element accessors (exact). */
-            kSrc = Float32Array.from(new Float16Array(kSrc.slice().buffer));
-            vSrc = Float32Array.from(new Float16Array(vSrc.slice().buffer));
+          if (this.kvF16) {
+            kSrc = kSrc.slice();
+            vSrc = vSrc.slice();
+          } else {
+            kSrc = widenF16(kSrc);
+            vSrc = widenF16(vSrc);
           }
         } else {
           kSrc = new Float32Array(freshHeap(M).HEAPF32.buffer, kPtr + src * srcBytes, n);
           vSrc = new Float32Array(freshHeap(M).HEAPF32.buffer, vPtr + src * srcBytes, n);
-          if (this.kvF16) { kSrc = new Float16Array(kSrc); vSrc = new Float16Array(vSrc); }
-          else { kSrc = kSrc.slice(); vSrc = vSrc.slice(); }
+          if (this.kvF16) {
+            if (typeof Float16Array !== "undefined") {
+              kSrc = new Float16Array(kSrc);
+              vSrc = new Float16Array(vSrc);
+            } else {
+              kSrc = kSrc.slice();
+              vSrc = vSrc.slice();
+            }
+          } else {
+            kSrc = kSrc.slice();
+            vSrc = vSrc.slice();
+          }
         }
         device.queue.writeBuffer(this.bufKV, l * perLayer * this.kvBytes, kSrc);
         device.queue.writeBuffer(this.bufKV, (this.vDelta + l * perLayer) * this.kvBytes, vSrc);
@@ -2935,5 +3203,192 @@ export class WebGPUDecoder {
       }
     }
     return { text, tokens: n, ids };
+  }
+
+  /**
+   * Returns the dynamic sum of bytes across all active, non-destroyed GPU storage buffers.
+   * Dynamically sums bufQuants, bufScale, bufNorm, bufAct, bufTok, bufTokRead, and bufKV.
+   */
+  getActiveGpuBytes() {
+    if (this.destroyed) return 0;
+    let bytes = 0;
+    if (this.bufQuants && Array.isArray(this.bufQuants)) {
+      for (const b of this.bufQuants) {
+        if (b && !b.destroyed && typeof b.size === "number") {
+          bytes += b.size;
+        }
+      }
+    }
+    const singleBuffers = [
+      this.bufScale,
+      this.bufNorm,
+      this.bufAct,
+      this.bufTok,
+      this.bufTokRead,
+      this.bufKV,
+    ];
+    for (const b of singleBuffers) {
+      if (b && !b.destroyed && typeof b.size === "number") {
+        bytes += b.size;
+      }
+    }
+    return bytes;
+  }
+
+  /**
+   * Explicitly and idempotently releases all WebGPU GPUBuffer instances, bind groups,
+   * pipelines, host staging arrays, and internal state.
+   */
+  destroy() {
+    this.ready = false;
+    this.destroyed = true;
+    this._initPromise = null;
+    this._finishInitPromise = null;
+
+    if (this.device && this._onUncapturedError) {
+      try {
+        if (typeof this.device.removeEventListener === "function") {
+          this.device.removeEventListener("uncapturederror", this._onUncapturedError);
+        }
+      } catch (_) {}
+      this._onUncapturedError = null;
+    }
+
+    // 1. Destroy quantized weight storage buffers (array of buffers, one per shard)
+    if (this.bufQuants && Array.isArray(this.bufQuants)) {
+      for (const b of this.bufQuants) {
+        try {
+          if (b) {
+            b.destroyed = true;
+            if (typeof b.destroy === "function") b.destroy();
+          }
+        } catch (_) {}
+      }
+      this.bufQuants = null;
+    }
+
+    // 2. Destroy scales and norm storage buffers
+    try {
+      if (this.bufScale) {
+        this.bufScale.destroyed = true;
+        if (typeof this.bufScale.destroy === "function") this.bufScale.destroy();
+      }
+    } catch (_) {}
+    this.bufScale = null;
+
+    try {
+      if (this.bufNorm) {
+        this.bufNorm.destroyed = true;
+        if (typeof this.bufNorm.destroy === "function") this.bufNorm.destroy();
+      }
+    } catch (_) {}
+    this.bufNorm = null;
+
+    // 3. Destroy activations and KV cache buffers
+    try {
+      if (this.bufAct) {
+        this.bufAct.destroyed = true;
+        if (typeof this.bufAct.destroy === "function") this.bufAct.destroy();
+      }
+    } catch (_) {}
+    this.bufAct = null;
+
+    try {
+      if (this.bufKV) {
+        this.bufKV.destroyed = true;
+        if (typeof this.bufKV.destroy === "function") this.bufKV.destroy();
+      }
+    } catch (_) {}
+    this.bufKV = null;
+
+    // 4. Destroy scratch and uniform parameters buffers
+    try {
+      if (this.bufScratch) {
+        this.bufScratch.destroyed = true;
+        if (typeof this.bufScratch.destroy === "function") this.bufScratch.destroy();
+      }
+    } catch (_) {}
+    this.bufScratch = null;
+
+    try {
+      if (this.bufParams) {
+        this.bufParams.destroyed = true;
+        if (typeof this.bufParams.destroy === "function") this.bufParams.destroy();
+      }
+    } catch (_) {}
+    this.bufParams = null;
+
+    // 5. Destroy token generation and readback staging buffers
+    try {
+      if (this.bufTok) {
+        this.bufTok.destroyed = true;
+        if (typeof this.bufTok.destroy === "function") this.bufTok.destroy();
+      }
+    } catch (_) {}
+    this.bufTok = null;
+
+    try {
+      if (this.bufTokRead) {
+        this.bufTokRead.destroyed = true;
+        try { this.bufTokRead.unmap(); } catch (_) {}
+        if (typeof this.bufTokRead.destroy === "function") this.bufTokRead.destroy();
+      }
+    } catch (_) {}
+    this.bufTokRead = null;
+
+    // 6. Destroy token embedding output and readback buffers
+    try {
+      if (this.bufEmbedOut) {
+        this.bufEmbedOut.destroyed = true;
+        if (typeof this.bufEmbedOut.destroy === "function") this.bufEmbedOut.destroy();
+      }
+    } catch (_) {}
+    this.bufEmbedOut = null;
+
+    try {
+      if (this.bufEmbedRead) {
+        this.bufEmbedRead.destroyed = true;
+        try { this.bufEmbedRead.unmap(); } catch (_) {}
+        if (typeof this.bufEmbedRead.destroy === "function") this.bufEmbedRead.destroy();
+      }
+    } catch (_) {}
+    this.bufEmbedRead = null;
+
+    // 7. Clear bind groups, layouts, and pipelines
+    this._bind = null;
+    this._bgl = null;
+    this.pipe = null;
+    this.matvecPipesTree = null;
+    this.logitsPipesTree = null;
+    this.gateUpPipesTree = null;
+    this.matvecPipes = null;
+    this.logitsPipes = null;
+    this.gateUpPipes = null;
+    this.preMatmulPipe = null;
+    this.preGateUpPipe = null;
+    this.preGateUpPipe32 = null;
+
+    // 8. Clear host parameter arrays, lookup maps, and metadata
+    this.host = null;
+    this.hu = null;
+    this.hf = null;
+    this.wmap = null;
+    this.nmap = null;
+    this.shards = null;
+    this.slotDefs = null;
+    this.slotShard = null;
+    this.off = null;
+
+    // 9. Reset capacity tracking
+    this.actCapFloats = 0;
+    this.actFloats = 0;
+    this.kvCap = 0;
+    this.scratchCap = 0;
+    this.paramBytes = 0;
+    this.embedRows = 0;
+
+    // 10. Mark lifecycle state
+    this.ready = false;
+    this.destroyed = true;
   }
 }

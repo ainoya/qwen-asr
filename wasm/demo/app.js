@@ -625,10 +625,12 @@ async function streamChunksToTargets({
   excessChunk,
   reportProgress = () => {},
 }) {
+  const isMobile = isMobileDevice;
   let fileOffset = initialFileOffset;
   let bytesSinceSync = 0;
-  let lastReport = fileOffset;
-  const SYNC_INTERVAL = 48 * 1024 * 1024; // 48 MB staging throttle
+  // On mobile (iOS Safari), use an 8 MB sync interval to prevent WebKit GPU process
+  // staging buffers and Mach IPC queues from accumulating dirty memory past the Jetsam ceiling.
+  const SYNC_INTERVAL = isMobile ? (8 * 1024 * 1024) : (32 * 1024 * 1024);
 
   let alignRemainder = null; // Cross-chunk remainder scratchpad (< 4 bytes)
 
@@ -658,14 +660,16 @@ async function streamChunksToTargets({
 
     if (bytesSinceSync >= SYNC_INTERVAL) {
       bytesSinceSync = 0;
-      await device.queue.onSubmittedWorkDone();
-      await tick(); // Allow GC sweep and UI render
-    }
-
-    if (fileOffset - lastReport >= 16 * 1024 * 1024) {
-      lastReport = fileOffset;
       reportProgress(fileOffset, totalBytes);
-      await tick();
+      await device.queue.onSubmittedWorkDone();
+      // On mobile / Safari, yielding via setTimeout(..., 0) allows the native
+      // Cocoa / WebKit CFRunLoop turn to complete, draining the @autoreleasepool,
+      // flushing IPC buffers, and allowing the JS garbage collector to sweep.
+      if (isMobile) {
+        await new Promise((r) => setTimeout(r, 0));
+      } else {
+        await tick();
+      }
     }
   }
 
@@ -691,6 +695,9 @@ async function streamChunksToTargets({
   }
 
   await device.queue.onSubmittedWorkDone();
+  if (isMobile) {
+    await new Promise((r) => setTimeout(r, 0));
+  }
   reportProgress(totalBytes, totalBytes);
 }
 
@@ -840,7 +847,14 @@ function cleanupGpuResources({ markLost = false, reason = "" } = {}) {
  * and diagnostic notification.
  */
 function attachDeviceLostHandler(device) {
-  if (!device || !device.lost) return;
+  if (!device) return;
+  if (device.addEventListener) {
+    device.addEventListener("uncapturederror", (e) => {
+      console.error("WebGPU uncaptured error:", e.error);
+      log(`WebGPU error: ${e.error?.message || e.error}`, "err");
+    });
+  }
+  if (!device.lost) return;
   device.lost.then((info) => {
     const reason = info.reason || "unknown";
     const msg = info.message || "";
@@ -993,15 +1007,17 @@ $("load").onclick = async () => {
     const isMobile = isMobileDevice;
     const mobileThreads = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
     const poolSize = isMobile ? Math.min(2, mobileThreads) : Math.min(4, defaultThreads);
-    const maxPages = isMobile ? 8192 : 32768; // 512 MB on iOS Safari avoids WebKit Jetsam OOM kill
+    const maxPages = isMobile ? 4096 : 32768; // 256 MB on iOS Safari (GPU-resident mode uses ~40 MB)
+    const initPages = isMobile ? 512 : 1024;  // 32 MB initial on mobile
 
     let wasmMem = null;
     try {
-      wasmMem = new WebAssembly.Memory({ initial: 1024, maximum: maxPages, shared: true });
+      wasmMem = new WebAssembly.Memory({ initial: initPages, maximum: maxPages, shared: true });
     } catch (e) {
-      for (const p of [16384, 8192, 4096, 2048, 1024]) {
+      const candidates = isMobile ? [4096, 2048, 1024] : [16384, 8192, 4096, 2048, 1024];
+      for (const p of candidates) {
         try {
-          wasmMem = new WebAssembly.Memory({ initial: 1024, maximum: p, shared: true });
+          wasmMem = new WebAssembly.Memory({ initial: Math.min(initPages, p), maximum: p, shared: true });
           break;
         } catch (_) {}
       }

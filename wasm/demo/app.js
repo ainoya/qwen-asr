@@ -84,7 +84,7 @@ const P = (ptr) => ptr >>> 0;
  * cores than it reports. Spinning pool threads are counter-productive in that
  * case, so start conservative and let the user raise it. */
 const defaultThreads = isMobileDevice
-  ? Math.min(2, Math.max(1, (navigator.hardwareConcurrency || 4) - 2))
+  ? 1
   : Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 4) - 2));
 const f32idx = (ptr) => P(ptr) / 4;
 
@@ -1043,13 +1043,13 @@ $("load").onclick = async () => {
     log("instantiating wasm module");
     const isMobile = isMobileDevice;
     const mobileThreads = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
-    const poolSize = isMobile ? Math.min(2, mobileThreads) : Math.min(4, defaultThreads);
-    const targetMaxPages = isMobile ? 8192 : 32768; // 512 MB on mobile (safely accommodates streaming KV cache & audio buffers), 2 GB on desktop
+    const poolSize = isMobile ? 1 : Math.min(4, defaultThreads);
+    const targetMaxPages = isMobile ? 2048 : 32768; // 128 MB on mobile (safely fits streaming audio/tokenizer without Jetsam), 2 GB on desktop
     const initPages = 1024;  // 64 MB (matches emcc -sINITIAL_MEMORY=64mb declaration)
 
     let wasmMem = null;
     let actualMaxPages = targetMaxPages;
-    const candidates = isMobile ? [8192, 4096, 2048] : [32768, 16384, 8192, 4096];
+    const candidates = isMobile ? [2048, 1536, 1024] : [32768, 16384, 8192, 4096];
     for (const p of candidates) {
       try {
         wasmMem = new WebAssembly.Memory({ initial: initPages, maximum: p, shared: true });
@@ -1095,7 +1095,7 @@ $("load").onclick = async () => {
       sessionStorage.removeItem("qwenFullImage");
     }
 
-    const threads = Number($("threads").value) || (isMobile ? 2 : 8);
+    const threads = isMobile ? 1 : (Number($("threads").value) || 8);
     /* GPU backend: probe first, and if the GPU is real, keep the transformer
      * weights out of wasm memory entirely. sessionStorage flag forces the
      * classic full image after a mid-session GPU failure. */

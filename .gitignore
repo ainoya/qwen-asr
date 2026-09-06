@@ -13,6 +13,7 @@ TODO.md
 # Browser build outputs and packed model images (local artifacts)
 qwen3-asr-1.7b-q8/
 qwen3-asr-1.7b-q4/
+qwen3-asr-0.6b-q8/
 wasm/demo/qwen_asr.js
 wasm/demo/qwen_asr.wasm
 wasm/demo/*.worker.js

@@ -215,12 +215,18 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Qwen3-ASR 1.7B — WebAssembly</h1>
+  <h1>Qwen3-ASR — WebAssembly</h1>
   <div class="sub">Pure C inference engine compiled to wasm. Runs entirely in this tab; no audio leaves the machine.</div>
 
   <div class="panel">
     <div class="row">
       <button id="load">Load model</button>
+      <label>model
+        <select id="model-select">
+          <option value="0.6b">0.6B (Mobile-safe, 0.84 GB)</option>
+          <option value="1.7b">1.7B (2.18 GB)</option>
+        </select>
+      </label>
       <label>threads <input id="threads" type="number" min="1" max="12" value="8" style="width:64px"></label>
       <label>decoder
         <select id="backend">

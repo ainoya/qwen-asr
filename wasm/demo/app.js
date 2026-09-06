@@ -16,7 +16,18 @@ const $ = (id) => document.getElementById(id);
 /* A hosted playground overrides these via playground-config.js; the local
  * dev server (wasm/serve.py) uses the repo-relative defaults. */
 const CFG = (typeof window !== "undefined" && window.QWEN_PLAYGROUND) || {};
-const MODEL_BASE = CFG.modelBase || "../../qwen3-asr-1.7b-q8";
+const isMobileDevice = (typeof navigator !== "undefined" &&
+  (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
+   (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)));
+
+const getModelBase = () => {
+  if (CFG.modelBase) return CFG.modelBase;
+  const sel = $("model-select")?.value;
+  if (sel === "0.6b") return "../../qwen3-asr-0.6b-q8";
+  if (sel === "1.7b") return "../../qwen3-asr-1.7b-q8";
+  return isMobileDevice ? "../../qwen3-asr-0.6b-q8" : "../../qwen3-asr-1.7b-q8";
+};
+const MODEL_BASE = "../../qwen3-asr-1.7b-q8";
 const SAMPLE_EN = CFG.sampleEn || "../../samples/jfk.wav";
 const SAMPLE_JA = CFG.sampleJa || "../../samples/extra/ja_bench.wav";
 
@@ -68,10 +79,6 @@ function cstr(s) {
  * reinterpret it as unsigned. Same reason `>> 2` must never be used to turn a
  * byte pointer into a Float32Array index. */
 const P = (ptr) => ptr >>> 0;
-
-const isMobileDevice = (typeof navigator !== "undefined" &&
-  (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
-   (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)));
 
 /* hardwareConcurrency counts efficiency cores, and a browser may hand out fewer
  * cores than it reports. Spinning pool threads are counter-productive in that
@@ -1052,6 +1059,11 @@ $("load").onclick = async () => {
       }
     }
 
+    const modelBase = getModelBase();
+    if (isMobile && $("model-select")?.value === "1.7b") {
+      log("Warning: 1.7B model (~2.2 GB) may exceed iOS Safari memory limits and trigger a reload. 0.6B is recommended for mobile.", "warn");
+    }
+
     Module = await createQwenASR({
       wasmMemory: wasmMem,
       pthreadPoolSize: poolSize,
@@ -1061,14 +1073,14 @@ $("load").onclick = async () => {
     setStatus("fetching tokenizer...");
     Module.FS.mkdirTree("/model");
     for (const name of ["vocab.json", "merges.txt"]) {
-      const r = await fetch(`${MODEL_BASE}/${name}`);
+      const r = await fetch(`${modelBase}/${name}`);
       if (!r.ok) throw new Error(`${name}: HTTP ${r.status}`);
       Module.FS.writeFile(`/model/${name}`, new Uint8Array(await r.arrayBuffer()));
     }
 
     let total = 0;
     try {
-      const head = await fetch(`${MODEL_BASE}/qwen-asr-q8.bin`, { method: "HEAD" });
+      const head = await fetch(`${modelBase}/qwen-asr-q8.bin`, { method: "HEAD" });
       if (head.ok) total = Number(head.headers.get("content-length")) || 0;
     } catch {}
     /* Some CDNs answer HEAD without an exposed Content-Length; the deploy
@@ -1094,7 +1106,7 @@ $("load").onclick = async () => {
       } else if (!sessionStorage.getItem("qwenFullImage")) {
         try {
           log(`fetching packed model, ${(total / 1e9).toFixed(2)} GB`);
-          await loadGpuResident(`${MODEL_BASE}/qwen-asr-q8.bin`, total, threads);
+          await loadGpuResident(`${modelBase}/qwen-asr-q8.bin`, total, threads);
           loaded = true;
         } catch (e) {
           log(`gpu-resident load failed: ${e.message}`, "err");
@@ -1113,7 +1125,7 @@ $("load").onclick = async () => {
         );
       }
       log(`fetching packed model, ${(total / 1e9).toFixed(2)} GB`);
-      const ptr = await fetchModelInto(`${MODEL_BASE}/qwen-asr-q8.bin`, total);
+      const ptr = await fetchModelInto(`${modelBase}/qwen-asr-q8.bin`, total);
       setStatus("attaching weights...");
       const dir = cstr("/model");
       const rc = Module._qwen_wasm_init(ptr, total, dir, threads, 0);
@@ -1754,6 +1766,10 @@ if ($("tab-live")) {
 }
 
 $("threads").value = String(defaultThreads);
+
+if ($("model-select")) {
+  $("model-select").value = isMobileDevice ? "0.6b" : "1.7b";
+}
 
 if ($("backend")) {
   if (typeof navigator !== "undefined" && navigator.gpu) {

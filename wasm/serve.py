@@ -102,6 +102,9 @@ def main():
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--root", default=os.path.join(os.path.dirname(__file__), ".."))
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--ssl", action="store_true", help="Enable HTTPS using SSL certificates")
+    ap.add_argument("--cert", default="wasm/certs/cert.pem", help="Path to SSL certificate")
+    ap.add_argument("--key", default="wasm/certs/key.pem", help="Path to SSL private key")
     args = ap.parse_args()
 
     root = os.path.abspath(args.root)
@@ -109,8 +112,18 @@ def main():
 
     handler = lambda *a, **kw: Handler(*a, directory=root, **kw)
     with Server((args.host, args.port), handler) as httpd:
-        print(f"serving {root} on http://{args.host}:{args.port}")
-        print(f"local:  http://localhost:{args.port}/wasm/demo/")
+        proto = "http"
+        cert_path = os.path.join(root, args.cert) if not os.path.isabs(args.cert) else args.cert
+        key_path = os.path.join(root, args.key) if not os.path.isabs(args.key) else args.key
+        if args.ssl or (os.path.exists(cert_path) and os.path.exists(key_path) and args.ssl):
+            import ssl
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+            proto = "https"
+
+        print(f"serving {root} on {proto}://{args.host}:{args.port}")
+        print(f"local:  {proto}://localhost:{args.port}/wasm/demo/")
         if args.host in ("0.0.0.0", ""):
             try:
                 import socket
@@ -119,7 +132,7 @@ def main():
                 s.connect(("8.8.8.8", 80))
                 local_ip = s.getsockname()[0]
                 s.close()
-                print(f"LAN:    http://{local_ip}:{args.port}/wasm/demo/")
+                print(f"LAN:    {proto}://{local_ip}:{args.port}/wasm/demo/")
             except Exception:
                 pass
         try:

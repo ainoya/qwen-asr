@@ -21,3 +21,4 @@ scratch/
 tools/verify_reduced_c
 .agents/
 ORIGINAL_REQUEST.md
+wasm/certs/

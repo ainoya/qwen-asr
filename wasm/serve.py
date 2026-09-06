@@ -55,6 +55,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.send_header("Accept-Ranges", "bytes")
                 self.end_headers()
                 remaining = size
+                last_logged = 0
                 with open(path, "rb") as f:
                     while remaining > 0:
                         buf = f.read(min(CHUNK, remaining))
@@ -62,9 +63,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                             break
                         try:
                             self.wfile.write(buf)
-                        except Exception:
+                        except Exception as e:
+                            sent = size - remaining
+                            print(f"[STREAM] Client disconnected after {sent / 1e6:.1f} MB / {size / 1e6:.1f} MB ({sent/size*100:.1f}%): {e}", flush=True)
                             return
                         remaining -= len(buf)
+                        sent = size - remaining
+                        if sent - last_logged >= 100 * 1024 * 1024 or remaining == 0:
+                            last_logged = sent
+                            print(f"[STREAM] Sent {sent / 1e6:.1f} / {size / 1e6:.1f} MB ({sent/size*100:.1f}%)", flush=True)
                 return
             return super().do_GET()
 
@@ -93,6 +100,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
         remaining = end - start + 1
+        total_range = remaining
+        last_logged = 0
         with open(path, "rb") as f:
             f.seek(start)
             while remaining > 0:
@@ -101,9 +110,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     break
                 try:
                     self.wfile.write(buf)
-                except (BrokenPipeError, ConnectionResetError):
+                except Exception as e:
+                    sent = total_range - remaining
+                    print(f"[RANGE] Client disconnected after {sent / 1e6:.1f} MB / {total_range / 1e6:.1f} MB ({sent/total_range*100:.1f}%): {e}", flush=True)
                     return
                 remaining -= len(buf)
+                sent = total_range - remaining
+                if sent - last_logged >= 100 * 1024 * 1024 or remaining == 0:
+                    last_logged = sent
+                    print(f"[RANGE] Sent {sent / 1e6:.1f} / {total_range / 1e6:.1f} MB ({sent/total_range*100:.1f}%)", flush=True)
 
     def log_message(self, fmt, *args):
         if "--verbose" in sys.argv:

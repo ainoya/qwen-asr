@@ -44,6 +44,16 @@ function log(msg, cls) {
   $("log").scrollTop = $("log").scrollHeight;
 }
 
+try {
+  const lastInterrupted = sessionStorage.getItem("qwenLastCheckpoint");
+  if (lastInterrupted) {
+    sessionStorage.removeItem("qwenLastCheckpoint");
+    setTimeout(() => {
+      log(`[Notice] Previous session crashed/interrupted at: ${lastInterrupted}`, "warn");
+    }, 100);
+  }
+} catch (_) {}
+
 const setStatus = (s) => { $("status").textContent = s; };
 
 function cstr(s) {
@@ -911,6 +921,7 @@ async function loadGpuResidentDirect(url, total, threads) {
   }
 
   // 1. Open stream
+  sessionStorage.setItem("qwenLastCheckpoint", "connecting to model stream");
   setStatus("connecting to model stream...");
   log("connecting to model stream...");
   const res = await fetch(url);
@@ -918,16 +929,19 @@ async function loadGpuResidentDirect(url, total, threads) {
   const reader = res.body.getReader();
 
   // 2. Phase 1: Parse Safetensors Header
+  sessionStorage.setItem("qwenLastCheckpoint", "parsing safetensors header");
   setStatus("parsing model header...");
   log("parsing model header...");
   const { header, dataBase, leftover } = await parseSafetensorsHeaderStream(reader);
 
   // 3. Prepare reduced WASM norm image
+  sessionStorage.setItem("qwenLastCheckpoint", "preparing reduced norm image in WASM");
   setStatus("preparing reduced norm image in WASM...");
   log("preparing reduced norm image in WASM...");
   const reduced = prepareWasmReducedImage(header, Module);
 
   // 4. Pre-allocate WebGPU storage buffers
+  sessionStorage.setItem("qwenLastCheckpoint", "pre-allocating WebGPU storage buffers");
   setStatus("pre-allocating WebGPU storage buffers...");
   log("pre-allocating WebGPU storage buffers...");
   const { decEntries, encEntries } = extractModelDescriptorsFromHeader(header, dataBase);
@@ -953,11 +967,13 @@ async function loadGpuResidentDirect(url, total, threads) {
   });
 
   // 5. Build interval dispatch table
+  sessionStorage.setItem("qwenLastCheckpoint", "building interval dispatch table");
   log("building interval dispatch table...");
   const intervals = buildIntervalDispatchTable(header, dataBase, gpu, encoder, reduced.wasmNormMap);
   const dispatcher = new IntervalDispatcher(intervals, device, Module);
 
   // 6. Phase 2: Direct streaming ingestion
+  sessionStorage.setItem("qwenLastCheckpoint", "starting direct streaming to WebGPU");
   setStatus("streaming model weights directly to WebGPU...");
   log(`streaming model weights to WebGPU (sync: ${isMobileDevice ? "8MB" : "32MB"})...`);
   await streamChunksToTargets({
@@ -971,8 +987,11 @@ async function loadGpuResidentDirect(url, total, threads) {
       const pct = (cur / tot * 100).toFixed(1);
       if ($("barfill")) $("barfill").style.width = `${pct}%`;
       setStatus(`downloading model ${(cur / 1e9).toFixed(2)} / ${(tot / 1e9).toFixed(2)} GB (${pct}%)`);
+      sessionStorage.setItem("qwenLastCheckpoint", `downloading ${(cur / 1e9).toFixed(2)} / ${(tot / 1e9).toFixed(2)} GB (${pct}%)`);
     },
   });
+
+  sessionStorage.removeItem("qwenLastCheckpoint");
 
   // 7. Attach reduced image in WASM
   setStatus("attaching the reduced image in WASM...");

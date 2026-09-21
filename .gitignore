@@ -1,4 +1,9 @@
 *.o
+qwen_asr_metal_source.h
+tools/test-metal
+tools/bench-metal
+tools/test-metal-full
+tools/bench-metal-full
 qwen_asr
 venv/
 venv312/

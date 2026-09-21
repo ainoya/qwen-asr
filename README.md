@@ -38,6 +38,16 @@ The short version:
   that sweeps the weights once for several streams (generation 2.0x), an
   f16 KV cache, and prefill/conv paths tuned until they sit at measured
   hardware ceilings (AMX load-issue bound, DRAM bandwidth).
+- **Optional native Metal/MPS prefill** on Apple Silicon: `make metal`
+  moves large Q8 matrix multiplications to the GPU with float32 arithmetic.
+  Short sequences and token generation retain the CPU kernels.
+  See [native Metal measurements](benchmarks/metal.md).
+- **Experimental full native Metal**: `QWEN_METAL=full` also runs the
+  convolutional encoder, attention, normalization, decoder layers and token
+  selection on the GPU. See [resident Metal results](benchmarks/metal-full.md).
+- **Apple GPU WebGPU tuning**: tiled attention scores accelerate decoder
+  prefill while retaining f32 arithmetic. Other adapters use the portable
+  path. See [measurements and compatibility checks](benchmarks/webgpu-metal.md).
 - **A WebAssembly port** — SIMD128 + pthreads, same engine, same
   transcripts; Node harnesses for benchmarking and a 22/22 regression
   suite.
@@ -75,9 +85,16 @@ See [benchmarks/README.md](benchmarks/README.md) for the commit-by-commit speedu
 
 ```bash
 make blas                      # Accelerate (macOS) / OpenBLAS (Linux)
+# Or: make metal               # Apple Silicon: Metal/MPS Q8 prefill + Accelerate
 ./download_model.sh            # interactive: small=0.6B, large=1.7B
 ./qwen_asr -d qwen3-asr-1.7b -i samples/jfk.wav
 ```
+
+The Metal build uses the same CLI and model files. Set `QWEN_METAL=0` to
+compare against CPU execution; unavailable GPUs fall back automatically.
+Build and validate its kernels with `make test-metal`.
+Try the resident path with `QWEN_METAL=full ./qwen_asr -d qwen3-asr-1.7b-q8 -i recording.wav`.
+It is opt-in; the default Metal mode remains hybrid.
 
 Streaming, stdin/ffmpeg piping, segmented long-form decoding, weight
 precision options and the C API are documented in the full manual:

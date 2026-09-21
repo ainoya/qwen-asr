@@ -30,6 +30,22 @@ the list of things that were tried and did not survive measurement.
 
 ## 1. Native engine
 
+### Optional Metal/MPS prefill (`make metal`)
+
+Large Q8 prefill matrices can run on Apple Silicon's GPU using Metal
+dequantization followed by MPS float32 matrix multiplication. Weight buffers
+reference the existing unified memory; one reusable float32 scratch matrix
+avoids a second full model copy. Short sequences and token generation keep
+the CPU kernels. See [the native Metal benchmark](../benchmarks/metal.md)
+for cold-start limits, measured speedups, regression checks, and reproduction.
+
+`QWEN_METAL=full` opts into a resident encoder and decoder. It includes GPU
+convolutions, normalization, attention, MLPs, f16 KV updates and token argmax,
+with one submission per generated token. The original CPU cache allocation
+and ownership are retained, allowing streaming rollback and CPU fallback.
+See [the full Metal experiment](../benchmarks/metal-full.md) for quality and
+performance comparisons. `QWEN_METAL=decode` isolates token generation.
+
 ### Packed Q8 model image (`--pack-q8`)
 
 Upstream loads bf16 safetensors and quantizes the decoder at load time. The

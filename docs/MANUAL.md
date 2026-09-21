@@ -3,7 +3,11 @@
 
 This is a C implementation of the inference pipeline for [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) speech-to-text models (both 0.6B and 1.7B). It has zero external dependencies beyond the C standard library and a BLAS implementation (Accelerate on macOS, OpenBLAS on Linux). Tokens stream to stdout as they are generated. The implementation runs at speed multiple of the file length even in very modest hardware, like low end Intel or AMD processor.
 
-**Important**: this implementation explicitly **avoids implementing support for MPS**. Transcription systems are very important pieces of infrastructure, and are often run on remote Linux servers. Adding the MPS target would focus the efforts too much on Apple hardware, so for now I'm skipping it. The code runs very well anyway on Apple hardware (NEON optimized). Please, **don't send pull requests** about this feature, fork the code instead, in order to add MPS support. I'll add it much later when the other optimizations are already mature.
+The upstream implementation focuses on CPU inference. This fork also provides
+an optional Apple Silicon Metal/MPS backend (`make metal`) for large Q8 prefill
+matrix multiplications. The portable and BLAS builds retain their existing
+dependencies; the Metal build additionally links Foundation, Metal, and Metal
+Performance Shaders.
 
 ## Supported modes and models
 
@@ -59,6 +63,51 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 - **Optional segment splitting**: use `-S 20` / `-S 30` for large files with segment-cutting silence search (`-W 3`).
 
 ## Usage
+
+### Apple Silicon Metal backend
+
+```bash
+make metal
+./qwen_asr -d qwen3-asr-1.7b -i recording.wav
+QWEN_METAL=0 ./qwen_asr -d qwen3-asr-1.7b -i recording.wav  # CPU comparison
+make test-metal
+```
+
+This is a hybrid backend. Large Q8 operations in the float32 prefill path
+(at least 256 activation rows and 1,048,576 weights) use Metal dequantization
+and MPS float32 matrix multiplication. The existing quantized-activation path
+for short sequences, single-token generation, BF16 matrices, and Q4 matrices
+continue on the CPU. It accepts both original model weights quantized at load
+and packed Q8 images. The first GPU use includes setup costs; short clips
+usually stay entirely on the CPU.
+
+The GPU references the existing Q8 weights in unified memory. Float32 weight
+scratch holds one matrix at a time, and activation/output buffers grow as
+needed. No second full model or persistent float32 weight copy is created.
+Unavailable GPUs or failed Metal commands fall back to the CPU. `--silent`
+also suppresses Metal status messages. See [measurements and reproduction
+commands](../benchmarks/metal.md).
+
+The experimental `QWEN_METAL=full` mode also moves the convolutional stem,
+encoder transformer, decoder prefill, token generation and argmax to the GPU.
+Activations remain float32 and KV remains float16, matching CPU cache storage.
+Use a packed Q8 model or `--weights q8-lm` for the resident decoder. Unlike the
+CPU's token kernels, resident matvecs use float32 activations, so transcripts
+can differ slightly; evaluate recognition quality on your own audio.
+
+```bash
+QWEN_METAL=full ./qwen_asr -d qwen3-asr-1.7b-q8 -i recording.wav
+./tools/test-metal-full qwen3-asr-1.7b-q8
+./tools/bench-metal-full qwen3-asr-1.7b-q8 recording.wav 3
+```
+
+`QWEN_METAL=decode` isolates resident token generation for comparison, keeping
+hybrid prefill/encoding. In full mode, audio loading, mel extraction, prompt
+assembly, token embedding lookup and the outer generation loop stay on the
+CPU. One GPU submission runs all decoder layers for a token; the CPU still
+waits once per token. Parallel segmented decoder batches and unsupported
+weight layouts keep the existing CPU/hybrid paths. Encoder debug taps also
+use the CPU. See [resident measurements and limitations](../benchmarks/metal-full.md).
 
 ### Normal Mode (Default)
 

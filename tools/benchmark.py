@@ -108,9 +108,13 @@ def generate_svg(history_file=DEFAULT_HISTORY_FILE, output_svg=DEFAULT_OUTPUT_SV
     color_mem = "#f778ba"
 
     latest = history[-1]
-    rtf_11s = latest.get("clip_11s_rtf", 11.0 / latest.get("clip_11s_sec", 1.0))
-    decode_ms = latest.get("decode_ms_per_tok", 0.0)
-    heap_mb = latest.get("wasm_heap_mb", 0)
+    # Kernel-only measurements must not invent end-to-end or memory values.
+    rtf_11s = latest.get("clip_11s_rtf")
+    decode_ms = latest.get("decode_ms_per_tok")
+    heap_mb = latest.get("wasm_heap_mb")
+    rtf_label = f"{rtf_11s:.2f}x (11s clip)" if rtf_11s is not None else "Not measured"
+    decode_label = f"{decode_ms:.1f} ms / tok" if decode_ms is not None else "Not measured"
+    heap_label = f"{heap_mb} MB" if heap_mb is not None else "Not measured"
 
     svg = []
     svg.append(f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}">
@@ -136,15 +140,15 @@ def generate_svg(history_file=DEFAULT_HISTORY_FILE, output_svg=DEFAULT_OUTPUT_SV
   <g transform="translate({W - pad - 420}, 18)">
     <rect width="130" height="42" rx="6" fill="{panel_bg}" stroke="{border}"/>
     <text x="65" y="18" text-anchor="middle" font-size="10" fill="{text_muted}">REALTIME FACTOR</text>
-    <text x="65" y="34" text-anchor="middle" class="badge-txt" fill="{color_11s}">{rtf_11s:.2f}x (11s clip)</text>
+    <text x="65" y="34" text-anchor="middle" class="badge-txt" fill="{color_11s}">{rtf_label}</text>
 
     <rect x="140" width="130" height="42" rx="6" fill="{panel_bg}" stroke="{border}"/>
     <text x="205" y="18" text-anchor="middle" font-size="10" fill="{text_muted}">DECODE LATENCY</text>
-    <text x="205" y="34" text-anchor="middle" class="badge-txt" fill="{color_decode}">{decode_ms:.1f} ms / tok</text>
+    <text x="205" y="34" text-anchor="middle" class="badge-txt" fill="{color_decode}">{decode_label}</text>
 
     <rect x="280" width="140" height="42" rx="6" fill="{panel_bg}" stroke="{border}"/>
     <text x="350" y="18" text-anchor="middle" font-size="10" fill="{text_muted}">WASM HEAP MEMORY</text>
-    <text x="350" y="34" text-anchor="middle" class="badge-txt" fill="{color_mem}">{heap_mb} MB (-85%)</text>
+    <text x="350" y="34" text-anchor="middle" class="badge-txt" fill="{color_mem}">{heap_label}</text>
   </g>
 """)
 
@@ -174,18 +178,20 @@ def generate_svg(history_file=DEFAULT_HISTORY_FILE, output_svg=DEFAULT_OUTPUT_SV
     pts_41s = []
     for i, e in enumerate(history):
         x = c_x0 + (i / (n - 1)) * c_w if n > 1 else c_x0 + c_w / 2
-        y11 = c_y0 + c_h - (e["clip_11s_sec"] / y_max) * c_h
-        y41 = c_y0 + c_h - (e["clip_41s_sec"] / y_max) * c_h
-        pts_11s.append((x, y11, e["clip_11s_sec"], e["clip_11s_rtf"]))
-        pts_41s.append((x, y41, e["clip_41s_sec"], e["clip_41s_rtf"]))
+        if "clip_11s_sec" in e:
+            y11 = c_y0 + c_h - (e["clip_11s_sec"] / y_max) * c_h
+            pts_11s.append((x, y11, e["clip_11s_sec"], e["clip_11s_rtf"]))
+        if "clip_41s_sec" in e:
+            y41 = c_y0 + c_h - (e["clip_41s_sec"] / y_max) * c_h
+            pts_41s.append((x, y41, e["clip_41s_sec"], e["clip_41s_rtf"]))
 
-    d41 = "M " + " L ".join([f"{x},{y}" for x, y, _, _ in pts_41s])
+    d41 = "M " + " L ".join([f"{x},{y}" for x, y, _, _ in pts_41s]) if pts_41s else ""
     svg.append(f"""  <path d="{d41}" fill="none" stroke="{color_41s}" stroke-width="2.5"/>""")
     for x, y, val, rtf in pts_41s:
         svg.append(f"""  <circle cx="{x}" cy="{y}" r="5" fill="{bg}" stroke="{color_41s}" stroke-width="2.5"/>
   <text x="{x}" y="{y - 9}" class="val-lbl" fill="{color_41s}">{val}s ({rtf}x)</text>""")
 
-    d11 = "M " + " L ".join([f"{x},{y}" for x, y, _, _ in pts_11s])
+    d11 = "M " + " L ".join([f"{x},{y}" for x, y, _, _ in pts_11s]) if pts_11s else ""
     svg.append(f"""  <path d="{d11}" fill="none" stroke="{color_11s}" stroke-width="2.5"/>""")
     for x, y, val, rtf in pts_11s:
         svg.append(f"""  <circle cx="{x}" cy="{y}" r="5" fill="{bg}" stroke="{color_11s}" stroke-width="2.5"/>
@@ -216,11 +222,13 @@ def generate_svg(history_file=DEFAULT_HISTORY_FILE, output_svg=DEFAULT_OUTPUT_SV
 
     pts_dec = []
     for i, e in enumerate(history):
+        if "decode_ms_per_tok" not in e:
+            continue
         x = c2_x0 + (i / (n - 1)) * c2_w if n > 1 else c2_x0 + c2_w / 2
         y = c2_y0 + c2_h - (e["decode_ms_per_tok"] / y2_max) * c2_h
         pts_dec.append((x, y, e["decode_ms_per_tok"]))
 
-    d_dec = "M " + " L ".join([f"{x},{y}" for x, y, _ in pts_dec])
+    d_dec = "M " + " L ".join([f"{x},{y}" for x, y, _ in pts_dec]) if pts_dec else ""
     svg.append(f"""  <path d="{d_dec}" fill="none" stroke="{color_decode}" stroke-width="2.5"/>""")
     for x, y, val in pts_dec:
         svg.append(f"""  <circle cx="{x}" cy="{y}" r="5" fill="{bg}" stroke="{color_decode}" stroke-width="2.5"/>
@@ -251,11 +259,13 @@ def generate_svg(history_file=DEFAULT_HISTORY_FILE, output_svg=DEFAULT_OUTPUT_SV
 
     pts_pre = []
     for i, e in enumerate(history):
+        if "prefill_41s_ms" not in e:
+            continue
         x = c3_x0 + (i / (n - 1)) * c3_w if n > 1 else c3_x0 + c3_w / 2
         y = c3_y0 + c3_h - (e["prefill_41s_ms"] / y3_max) * c3_h
         pts_pre.append((x, y, e["prefill_41s_ms"]))
 
-    d_pre = "M " + " L ".join([f"{x},{y}" for x, y, _ in pts_pre])
+    d_pre = "M " + " L ".join([f"{x},{y}" for x, y, _ in pts_pre]) if pts_pre else ""
     svg.append(f"""  <path d="{d_pre}" fill="none" stroke="{color_prefill}" stroke-width="2.5"/>""")
     for x, y, val in pts_pre:
         svg.append(f"""  <circle cx="{x}" cy="{y}" r="5" fill="{bg}" stroke="{color_prefill}" stroke-width="2.5"/>
@@ -286,11 +296,13 @@ def generate_svg(history_file=DEFAULT_HISTORY_FILE, output_svg=DEFAULT_OUTPUT_SV
 
     pts_mem = []
     for i, e in enumerate(history):
+        if "wasm_heap_mb" not in e:
+            continue
         x = c4_x0 + (i / (n - 1)) * c4_w if n > 1 else c4_x0 + c4_w / 2
         y = c4_y0 + c4_h - (e["wasm_heap_mb"] / y4_max) * c4_h
         pts_mem.append((x, y, e["wasm_heap_mb"]))
 
-    d_mem = "M " + " L ".join([f"{x},{y}" for x, y, _ in pts_mem])
+    d_mem = "M " + " L ".join([f"{x},{y}" for x, y, _ in pts_mem]) if pts_mem else ""
     svg.append(f"""  <path d="{d_mem}" fill="none" stroke="{color_mem}" stroke-width="2.5"/>""")
     for x, y, val in pts_mem:
         svg.append(f"""  <circle cx="{x}" cy="{y}" r="5" fill="{bg}" stroke="{color_mem}" stroke-width="2.5"/>
@@ -301,7 +313,7 @@ def generate_svg(history_file=DEFAULT_HISTORY_FILE, output_svg=DEFAULT_OUTPUT_SV
         svg.append(f"""  <text x="{x}" y="{c4_y0 + c4_h + 18}" class="axis-lbl">{e["commit"]}</text>""")
 
     svg.append(f"""
-  <text x="{pad}" y="{H - 12}" font-size="11" fill="{text_muted}">Generated by tools/benchmark.py • Values verified on Apple Silicon / WebGPU pipeline</text>
+  <text x="{pad}" y="{H - 12}" font-size="11" fill="{text_muted}">Generated by tools/benchmark.py • Missing metrics were not measured; see each entry's benchmark notes.</text>
 </svg>""")
 
     os.makedirs(os.path.dirname(output_svg), exist_ok=True)

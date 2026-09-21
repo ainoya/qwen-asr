@@ -1342,6 +1342,62 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 }
 `;
 
+/* Apple GPU prefill: reuse Q and K across a 32 x 32 score tile. Loads follow
+ * the contiguous sequence axis of the transposed activations. The arithmetic
+ * remains f32 and visits head dimensions in the same order as the scalar
+ * path. Entire tiles above the causal diagonal are skipped uniformly. */
+const PRE_SCORES_TILED_WGSL = HEADER + `
+var<workgroup> qt : array<f32, 512>;
+var<workgroup> kt : array<f32, 512>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  let j0 = wid.x * 32u;
+  let i0 = wid.y * 32u;
+  let h = wid.z;
+  if (j0 > i0 + 31u || i0 >= P.b) { return; }
+  let tid = lid.y * 16u + lid.x;
+  let qi = lid.y * 2u;
+  let kj = lid.x * 2u;
+  let qb = P.c + h * P.d;
+  let kb = P.wordBase + (h / P.rows) * P.d;
+  var a0 = vec2<f32>(0.0);
+  var a1 = vec2<f32>(0.0);
+  for (var d0 = 0u; d0 < P.d; d0 += 16u) {
+    for (var t = 0u; t < 2u; t++) {
+      let index = tid + t * 256u;
+      let d = d0 + index / 32u;
+      let s = index % 32u;
+      var q = 0.0;
+      var k = 0.0;
+      if (d < P.d && i0 + s < P.b) { q = act[(qb + d) * P.a + i0 + s]; }
+      if (d < P.d && j0 + s < P.b) { k = act[(kb + d) * P.a + j0 + s]; }
+      qt[index] = q;
+      kt[index] = k;
+    }
+    workgroupBarrier();
+    for (var d = 0u; d < 16u; d++) {
+      let k = vec2<f32>(kt[d * 32u + kj], kt[d * 32u + kj + 1u]);
+      a0 += qt[d * 32u + qi] * k;
+      a1 += qt[d * 32u + qi + 1u] * k;
+    }
+    workgroupBarrier();
+  }
+  let i = i0 + qi;
+  let j = j0 + kj;
+  let base = P.scaleBase + (h * P.n + i) * P.n + j;
+  if (i < P.b) {
+    if (j <= i) { scratch[base] = a0.x * P.fa; }
+    if (j + 1u <= i) { scratch[base + 1u] = a0.y * P.fa; }
+  }
+  if (i + 1u < P.b) {
+    if (j <= i + 1u) { scratch[base + P.n] = a1.x * P.fa; }
+    if (j + 1u <= i + 1u) { scratch[base + P.n + 1u] = a1.y * P.fa; }
+  }
+}
+`;
+
 /* Softmax over the causal prefix of each query row. */
 const PRE_SOFTMAX_WGSL = HEADER + `
 const WG : u32 = 128u;
@@ -1532,6 +1588,14 @@ export class WebGPUDecoder {
     this.kvBytes = this.kvF16 ? 2 : 4;
     this.maxDim = device.limits ? device.limits.maxComputeWorkgroupsPerDimension : 65535;
     this.adapterInfo = adapter?.info || {};
+    // The score kernels dispatch eight subgroups per 256-thread workgroup.
+    // Unknown/variable widths use the portable path, not an assumed warp size.
+    this.hasScoreSubgroups = this.hasSubgroups &&
+      this.adapterInfo.subgroupMinSize === 32 && this.adapterInfo.subgroupMaxSize === 32;
+    this.tiledPrefillSupported = (this.adapterInfo.vendor || "").toLowerCase() === "apple" &&
+      device.limits.maxComputeInvocationsPerWorkgroup >= 256 &&
+      device.limits.maxComputeWorkgroupStorageSize >= 4096;
+    this.useTiledPrefillScores = this.tiledPrefillSupported && this.opts.tiledPrefillScores !== false;
     if (device.lost) {
       device.lost.then((info) => {
         this.lost = info.reason || "unknown";
@@ -1914,7 +1978,7 @@ export class WebGPUDecoder {
         const modules = [];
         const tick = () => new Promise((r) => setTimeout(r, 0));
         let compiledCount = 0;
-        const totalPipelines = 3 + (this.hasSubgroups ? 3 : 0) + 24;
+        const totalPipelines = 3 + (this.hasSubgroups ? 3 : 0) + 24 + (this.tiledPrefillSupported ? 1 : 0);
 
         const mk = async (code, name) => {
           if (this.destroyed) return null;
@@ -1997,7 +2061,7 @@ export class WebGPUDecoder {
           gateUp: this.gateUpPipes.f32[64],
           rmsnorm: await mk(RMSNORM_WGSL, "rmsnorm"),
           qkrope: await mk(QKROPE_WGSL, "qkrope"),
-          scores: this.hasSubgroups ? await mk(ATTN_SCORES_SG_WGSL, "scores_sg")
+          scores: this.hasScoreSubgroups ? await mk(ATTN_SCORES_SG_WGSL, "scores_sg")
                                     : await mk(ATTN_SCORES_WGSL, "scores"),
           softmax: await mk(ATTN_SOFTMAX_WGSL, "softmax"),
           apply: await mk(ATTN_APPLY_WGSL, "apply"),
@@ -2009,7 +2073,9 @@ export class WebGPUDecoder {
           preQkRope: await mk(PRE_QKROPE_WGSL, "preQkRope"),
           preKvStore: await mk(PRE_KVSTORE_WGSL, "preKvStore"),
           preScores: await mk(PRE_SCORES_WGSL, "preScores"),
-          preScoresKv: this.hasSubgroups ? await mk(PRE_SCORES_KV_SG_WGSL, "preScoresKv_sg")
+          preScoresTiled: this.tiledPrefillSupported
+            ? await mk(PRE_SCORES_TILED_WGSL, "preScores_tiled") : null,
+          preScoresKv: this.hasScoreSubgroups ? await mk(PRE_SCORES_KV_SG_WGSL, "preScoresKv_sg")
                                          : await mk(PRE_SCORES_KV_WGSL, "preScoresKv"),
           preSoftmax: await mk(PRE_SOFTMAX_WGSL, "preSoftmax"),
           preSoftmaxKv: await mk(PRE_SOFTMAX_KV_WGSL, "preSoftmaxKv"),
@@ -2719,13 +2785,19 @@ export class WebGPUDecoder {
       if (this.preBase != null) {
         const kvTotal = this.preBase + seq;
         ph("pre.scores"); use(pipe.preScoresKv, L.scores);
-        if (this.hasSubgroups) { pass.dispatchWorkgroups(up(kvTotal, 8), cfg.heads, seq); }
+        if (this.hasScoreSubgroups) { pass.dispatchWorkgroups(up(kvTotal, 8), cfg.heads, seq); }
         else { pass.dispatchWorkgroups(up(kvTotal, 64), seq, cfg.heads); }
         ph("pre.softmax"); use(pipe.preSoftmaxKv, L.softmax); pass.dispatchWorkgroups(seq, cfg.heads);
         ph("pre.apply"); use(pipe.preApplyKv, L.apply);
         pass.dispatchWorkgroups(up(seq, 32), up(cfg.headDim, 32), cfg.heads);
       } else {
-        ph("pre.scores"); use(pipe.preScores, L.scores); pass.dispatchWorkgroups(sBlocks, seq, cfg.heads);
+        ph("pre.scores");
+        if (this.useTiledPrefillScores && pipe.preScoresTiled && seq >= 128) {
+          use(pipe.preScoresTiled, L.scores);
+          pass.dispatchWorkgroups(up(seq, 32), up(seq, 32), cfg.heads);
+        } else {
+          use(pipe.preScores, L.scores); pass.dispatchWorkgroups(sBlocks, seq, cfg.heads);
+        }
         ph("pre.softmax"); use(pipe.preSoftmax, L.softmax); pass.dispatchWorkgroups(seq, cfg.heads);
         ph("pre.apply"); use(pipe.preApply, L.apply);
         pass.dispatchWorkgroups(up(seq, 32), up(cfg.headDim, 32), cfg.heads);
@@ -2845,7 +2917,7 @@ export class WebGPUDecoder {
       dw(...rowGrid(cfg.qDim + 2 * cfg.kvDim));
       ph("qkrope"); use(pipe.qkrope, L.qkrope); dw(cfg.heads + cfg.kvHeads);
       ph("attn.scores"); use(pipe.scores, L.scores);
-      if (this.hasSubgroups) { dw(up(this.kvLen, 8), cfg.heads); }
+      if (this.hasScoreSubgroups) { dw(up(this.kvLen, 8), cfg.heads); }
       else { dw(up(this.kvLen, 64), cfg.heads); }
       ph("attn.softmax"); use(pipe.softmax, L.softmax); dw(cfg.heads);
       ph("attn.apply"); use(pipe.apply, L.apply);

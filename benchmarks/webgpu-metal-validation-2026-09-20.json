@@ -1,0 +1,263 @@
+{
+  "date": "2026-09-20",
+  "device": "Apple M1 Pro",
+  "checks": [
+    {
+      "kernelSeq": 1,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.0000011905010435242502
+    },
+    {
+      "kernelSeq": 31,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.000002550559208280845
+    },
+    {
+      "kernelSeq": 32,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.000002550559208280845
+    },
+    {
+      "kernelSeq": 33,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.000002550559208280845
+    },
+    {
+      "kernelSeq": 63,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.000002550559208280845
+    },
+    {
+      "kernelSeq": 64,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.000002550559208280845
+    },
+    {
+      "kernelSeq": 65,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.0000036897253181678025
+    },
+    {
+      "kernelSeq": 127,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.0000036897253181678025
+    },
+    {
+      "kernelSeq": 128,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.0000036897253181678025
+    },
+    {
+      "kernelSeq": 129,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.000003046890076241482
+    },
+    {
+      "kernelSeq": 257,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.0000025978836735163213
+    },
+    {
+      "kernelSeq": 549,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.000003088054031152865
+    },
+    {
+      "kernelSeq": 1024,
+      "maxDiff": 0,
+      "cpuMaxDiff": 0.0000027776833144699253
+    },
+    {
+      "kernelsDone": true
+    },
+    {
+      "name": "ja_bench",
+      "seq": 549,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "jfk",
+      "seq": 158,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "10s_back_down_the_road",
+      "seq": 145,
+      "cpuCer": 0.07352941176470588,
+      "cpuExact": false,
+      "baselineExactIds": true
+    },
+    {
+      "name": "10s_im_taking_the_girl_with_me",
+      "seq": 145,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "119s_theres_supposed_to_be_another_broadcast",
+      "seq": 1566,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "12s_if_anything_should_try_to_break_in",
+      "seq": 166,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "15s_donnie_asked_me_if_i_were_afraid",
+      "seq": 210,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "15s_there_are_two_of_them_out_there",
+      "seq": 210,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "20s_no_authentic_way_for_us_to_say",
+      "seq": 274,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "21s_hey_thats_us_were_doing_all_right",
+      "seq": 291,
+      "cpuCer": 0.10256410256410256,
+      "cpuExact": false,
+      "baselineExactIds": true
+    },
+    {
+      "name": "30s_i_wont_open_this_door_again",
+      "seq": 402,
+      "cpuCer": 0.024193548387096774,
+      "cpuExact": false,
+      "baselineExactIds": true
+    },
+    {
+      "name": "31s_hes_wrong_you_know",
+      "seq": 415,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "45s_dont_be_afraid_of_me",
+      "seq": 600,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "45s_right_through_the_billboard",
+      "seq": 600,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "5s_dont_worry_about_him",
+      "seq": 80,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "5s_were_better_off_up_here",
+      "seq": 80,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "60s_i_dont_want_anyones_life_on_my_hands",
+      "seq": 792,
+      "cpuCer": 0.0033112582781456954,
+      "cpuExact": false,
+      "baselineExactIds": true
+    },
+    {
+      "name": "7s_i_wonder_what_happened",
+      "seq": 107,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "7s_prayings_for_church",
+      "seq": 111,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "7s_theyre_afraid_of_fire",
+      "seq": 104,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "89s_ill_come_back_down_as_soon_as",
+      "seq": 1170,
+      "cpuCer": 0.0026972353337828725,
+      "cpuExact": false,
+      "baselineExactIds": true
+    },
+    {
+      "name": "8s_do_you_live_here",
+      "seq": 119,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "name": "test_speech",
+      "seq": 62,
+      "cpuCer": 0,
+      "cpuExact": true,
+      "baselineExactIds": true
+    },
+    {
+      "regressionDone": true,
+      "passed": 23,
+      "total": 23
+    }
+  ],
+  "portableFallback": {
+    "subgroups": false,
+    "kvF16": false,
+    "fixture": "jfk",
+    "normalizedCpuCer": 0,
+    "oneShotSuffixExactTokenIds": true
+  },
+  "wasm": {
+    "productionMemoryGiB": 2,
+    "nodeTestMemoryGiB": 4,
+    "model": "1.7B Q8",
+    "passed": 22,
+    "total": 22,
+    "aggregateNormalizedCer": 0.0062,
+    "preprocessedChangedCKernelIdenticalToHead": true
+  },
+  "additional06b": {
+    "passed": 21,
+    "total": 22,
+    "failedFixture": "15s_there_are_two_of_them_out_there",
+    "normalizedCer": 0.23129251700680273
+  },
+  "webgpuValidationErrors": 0
+}

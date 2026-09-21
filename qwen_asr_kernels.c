@@ -5,6 +5,9 @@
 
 #include "qwen_asr_kernels.h"
 #include "qwen_asr_kernels_impl.h"
+#ifdef USE_METAL
+#include "qwen_asr_metal.h"
+#endif
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -893,6 +896,9 @@ size_t qwen_q8_bytes(const qwen_q8_mat_t *m) {
 
 void qwen_q8_free(qwen_q8_mat_t *m) {
     if (!m) return;
+#ifdef USE_METAL
+    qwen_metal_forget(m);
+#endif
     qwen_act_stats_free(m);
     if (m->owns) {
         free(m->q);
@@ -1510,6 +1516,13 @@ static void q4_matvec_m_worker(int tid, int n_threads, void *arg) {
 
 static void q8_linear_prefill(float *y, const float *x, const qwen_q8_mat_t *W,
                               int seq_len) {
+#ifdef USE_METAL
+    /* GPU launch/readback costs dominate small matrices and short sequences.
+     * Only replace the f32 panel path; quantized-activation matvecs keep their
+     * existing arithmetic and crossover, including streaming/batched decode. */
+    if (seq_len >= 256 && (size_t)W->rows * W->cols >= 1024 * 1024 &&
+        qwen_metal_linear(y, x, W, seq_len) == 0) return;
+#endif
     int cols = W->cols;
     int rows = W->rows;
 

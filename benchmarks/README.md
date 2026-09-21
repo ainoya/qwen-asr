@@ -2,6 +2,16 @@
 
 This directory tracks the performance and memory optimizations of Qwen-ASR on WebGPU and WebAssembly.
 
+The 2026-09-20 Apple Silicon additions have separate controlled measurements:
+[native Metal/MPS](metal.md) and [WebGPU tiled attention](webgpu-metal.md).
+The 2026-09-21 [resident native Metal experiment](metal-full.md) compares
+CPU, hybrid, resident generation, and full encoder/decoder execution in a
+separate native plot.
+The new WebGPU history entry records only measured prefill time; missing
+end-to-end, generation, and heap metrics are deliberately left blank. Use its
+paired baseline for the speedup, since historical entries used different
+measurement conditions.
+
 ## Speed & Latency Progression
 
 ![Speed History](speed_history.svg)
@@ -15,7 +25,8 @@ This directory tracks the performance and memory optimizations of Qwen-ASR on We
 | **f49f21c** | 2026-08-25 | 2.35 s | 4.68x | 11.10 s | 3.69x | 23.5 ms | 2,400 ms | 680 MB | Sharded Q8 decoder weights on GPU storage buffers |
 | **caf8753** | 2026-08-26 | 2.18 s | 5.05x | 10.40 s | 3.94x | 22.0 ms | 2,350 ms | 330 MB | Audio encoder transformer tower offloaded to GPU |
 | **341f5fb** | 2026-08-27 | 2.05 s | 5.37x | 9.60 s | 4.27x | 17.2 ms | 1,550 ms | 330 MB | Fused SwiGLU into gate/up matmuls & subgroup row sums |
-| **HEAD (Latest)** | 2026-09-05 | **1.85 s** | **5.95x** | **8.80 s** | **4.66x** | **14.8 ms** | **1,420 ms** | **330 MB** | GPU shared-memory tiled transpose, 64-way 2-stage parallel argmax, sinusoidal PE table, zero-allocation persistent buffers, unified GPUDevice |
+| **ee9a1a6** | 2026-09-05 | 1.85 s | 5.95x | 8.80 s | 4.66x | 14.8 ms | 1,420 ms | 330 MB | GPU shared-memory tiled transpose, 64-way 2-stage parallel argmax, sinusoidal PE table, zero-allocation persistent buffers, unified GPUDevice |
+| **worktree** | 2026-09-20 | — | — | — | — | — | **1,192 ms** | — | Apple Q/K tiles; GPU timestamp median, 5.7% below paired scalar baseline |
 
 ---
 

@@ -15,6 +15,9 @@
 
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
+#ifdef USE_METAL
+#include "qwen_asr_metal.h"
+#endif
 #include "qwen_asr_safetensors.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -253,6 +256,12 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
         return NULL;
     }
 
+#ifdef USE_METAL
+    if (!qwen_enc_tap) {
+        float *out = qwen_metal_encoder(ctx, mel, mel_frames, out_seq_len);
+        if (out) return out;
+    }
+#endif
     const qwen_config_t *cfg = &ctx->config;
     qwen_encoder_t *enc = &ctx->encoder;
 

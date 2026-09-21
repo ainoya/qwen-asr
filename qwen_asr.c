@@ -10,6 +10,9 @@
 #include "qwen_asr_safetensors.h"
 #include "qwen_asr_audio.h"
 #include "qwen_asr_tokenizer.h"
+#ifdef USE_METAL
+#include "qwen_asr_metal.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -315,6 +318,9 @@ qwen_ctx_t *qwen_load_memory(void *model_data, size_t model_size,
 
 void qwen_free(qwen_ctx_t *ctx) {
     if (!ctx) return;
+#ifdef USE_METAL
+    qwen_metal_context_free(ctx);
+#endif
 
     #define FREE0(p) do { free(p); (p) = NULL; } while (0)
 

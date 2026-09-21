@@ -13,6 +13,9 @@
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
 #include "qwen_asr_safetensors.h"
+#ifdef USE_METAL
+#include "qwen_asr_metal.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -562,6 +565,9 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
 
     int start_pos = ctx->kv_cache_len;
     if (ensure_rope_cache(ctx, start_pos + seq_len, head_dim, theta) != 0) return;
+#ifdef USE_METAL
+    if (qwen_metal_decoder_prefill(ctx, input_embeds, seq_len) == 0) return;
+#endif
     const float *rope_cos = ctx->rope_cache_cos + (size_t)start_pos * head_dim;
     const float *rope_sin = ctx->rope_cache_sin + (size_t)start_pos * head_dim;
 
@@ -709,6 +715,10 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
     if (ensure_rope_cache(ctx, pos + 1, head_dim, theta) != 0) {
         return QWEN_TOKEN_IM_END;
     }
+#ifdef USE_METAL
+    int metal_token = qwen_metal_decoder_step(ctx, input_embed);
+    if (metal_token >= 0) return metal_token;
+#endif
     const float *rope_cos = ctx->rope_cache_cos + (size_t)pos * head_dim;
     const float *rope_sin = ctx->rope_cache_sin + (size_t)pos * head_dim;
 

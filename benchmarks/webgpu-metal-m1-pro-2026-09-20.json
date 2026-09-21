@@ -1,0 +1,729 @@
+{
+  "date": "2026-09-20",
+  "hardware": "Apple M1 Pro, 32 GiB",
+  "backend": "Chromium WebGPU, Metal",
+  "model": "Qwen3-ASR 1.7B Q8",
+  "workload": "549 prompt embeddings from a 41 s local Japanese fixture",
+  "method": "One loaded model; alternating scalar/tiled order; pair 0 warmup; medians of pairs 1-3. GPU totals sum timestamped kernel passes, not end-to-end transcription.",
+  "adapter": {
+    "ready": true,
+    "adapter": {
+      "vendor": "apple",
+      "architecture": "metal-3",
+      "device": "",
+      "description": "",
+      "subgroupMinSize": 32,
+      "subgroupMaxSize": 32
+    },
+    "tiled": true,
+    "features": [
+      "core-features-and-limits",
+      "shader-f16",
+      "subgroups",
+      "timestamp-query"
+    ],
+    "kvF16": true
+  },
+  "summary": {
+    "scalar": {
+      "gpuPrefillMs": 1264.9758720000002,
+      "scoresMs": 92.08,
+      "wallPrefillMs": 1266.8049998283386
+    },
+    "tiled": {
+      "gpuPrefillMs": 1192.4930559999996,
+      "scoresMs": 19.99,
+      "wallPrefillMs": 1196.4749999046326
+    }
+  },
+  "runs": [
+    {
+      "run": 0,
+      "tiled": false,
+      "prefillWallMs": 1363.5300002098083,
+      "profile": {
+        "seq": 549,
+        "totalMs": 1265.631232,
+        "rows": [
+          {
+            "label": "pre.mm.gu+swiglu",
+            "ms": 518,
+            "pct": 40.9
+          },
+          {
+            "label": "pre.mm.down",
+            "ms": 272.3,
+            "pct": 21.5
+          },
+          {
+            "label": "pre.mm.qkv",
+            "ms": 178.91,
+            "pct": 14.1
+          },
+          {
+            "label": "pre.scores",
+            "ms": 92.27,
+            "pct": 7.3
+          },
+          {
+            "label": "pre.mm.o",
+            "ms": 91.23,
+            "pct": 7.2
+          },
+          {
+            "label": "pre.rms",
+            "ms": 68.35,
+            "pct": 5.4
+          },
+          {
+            "label": "pre.apply",
+            "ms": 23.99,
+            "pct": 1.9
+          },
+          {
+            "label": "pre.softmax",
+            "ms": 6.55,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.qkrope",
+            "ms": 6.09,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.kvstore",
+            "ms": 5.9,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.logits",
+            "ms": 1.97,
+            "pct": 0.2
+          },
+          {
+            "label": "pre.argmax1",
+            "ms": 0.07,
+            "pct": 0
+          },
+          {
+            "label": "pre.head",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.extract",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.argmax2",
+            "ms": 0,
+            "pct": 0
+          }
+        ]
+      }
+    },
+    {
+      "run": 0,
+      "tiled": true,
+      "prefillWallMs": 1195.5650000572205,
+      "profile": {
+        "seq": 549,
+        "totalMs": 1193.41056,
+        "rows": [
+          {
+            "label": "pre.mm.gu+swiglu",
+            "ms": 517.47,
+            "pct": 43.4
+          },
+          {
+            "label": "pre.mm.down",
+            "ms": 271.06,
+            "pct": 22.7
+          },
+          {
+            "label": "pre.mm.qkv",
+            "ms": 179.11,
+            "pct": 15
+          },
+          {
+            "label": "pre.mm.o",
+            "ms": 91.1,
+            "pct": 7.6
+          },
+          {
+            "label": "pre.rms",
+            "ms": 68.55,
+            "pct": 5.7
+          },
+          {
+            "label": "pre.apply",
+            "ms": 24.25,
+            "pct": 2
+          },
+          {
+            "label": "pre.scores",
+            "ms": 20.05,
+            "pct": 1.7
+          },
+          {
+            "label": "pre.softmax",
+            "ms": 6.88,
+            "pct": 0.6
+          },
+          {
+            "label": "pre.kvstore",
+            "ms": 6.75,
+            "pct": 0.6
+          },
+          {
+            "label": "pre.qkrope",
+            "ms": 6.16,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.logits",
+            "ms": 1.97,
+            "pct": 0.2
+          },
+          {
+            "label": "pre.extract",
+            "ms": 0.07,
+            "pct": 0
+          },
+          {
+            "label": "pre.head",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.argmax1",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.argmax2",
+            "ms": 0,
+            "pct": 0
+          }
+        ]
+      }
+    },
+    {
+      "run": 1,
+      "tiled": true,
+      "prefillWallMs": 1205.3899998664856,
+      "profile": {
+        "seq": 549,
+        "totalMs": 1206.3211520000002,
+        "rows": [
+          {
+            "label": "pre.mm.gu+swiglu",
+            "ms": 522.19,
+            "pct": 43.3
+          },
+          {
+            "label": "pre.mm.down",
+            "ms": 277.02,
+            "pct": 23
+          },
+          {
+            "label": "pre.mm.qkv",
+            "ms": 181.4,
+            "pct": 15
+          },
+          {
+            "label": "pre.mm.o",
+            "ms": 91.36,
+            "pct": 7.6
+          },
+          {
+            "label": "pre.rms",
+            "ms": 68.94,
+            "pct": 5.7
+          },
+          {
+            "label": "pre.apply",
+            "ms": 23.92,
+            "pct": 2
+          },
+          {
+            "label": "pre.scores",
+            "ms": 19.86,
+            "pct": 1.6
+          },
+          {
+            "label": "pre.softmax",
+            "ms": 6.75,
+            "pct": 0.6
+          },
+          {
+            "label": "pre.kvstore",
+            "ms": 6.42,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.qkrope",
+            "ms": 6.36,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.logits",
+            "ms": 2.03,
+            "pct": 0.2
+          },
+          {
+            "label": "pre.argmax1",
+            "ms": 0.07,
+            "pct": 0
+          },
+          {
+            "label": "pre.head",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.extract",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.argmax2",
+            "ms": 0,
+            "pct": 0
+          }
+        ]
+      }
+    },
+    {
+      "run": 1,
+      "tiled": false,
+      "prefillWallMs": 1266.2300000190735,
+      "profile": {
+        "seq": 549,
+        "totalMs": 1266.7453439999997,
+        "rows": [
+          {
+            "label": "pre.mm.gu+swiglu",
+            "ms": 518.32,
+            "pct": 40.9
+          },
+          {
+            "label": "pre.mm.down",
+            "ms": 271.12,
+            "pct": 21.4
+          },
+          {
+            "label": "pre.mm.qkv",
+            "ms": 179.04,
+            "pct": 14.1
+          },
+          {
+            "label": "pre.scores",
+            "ms": 93,
+            "pct": 7.3
+          },
+          {
+            "label": "pre.mm.o",
+            "ms": 91.23,
+            "pct": 7.2
+          },
+          {
+            "label": "pre.rms",
+            "ms": 69.07,
+            "pct": 5.5
+          },
+          {
+            "label": "pre.apply",
+            "ms": 23.99,
+            "pct": 1.9
+          },
+          {
+            "label": "pre.softmax",
+            "ms": 6.75,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.qkrope",
+            "ms": 6.29,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.kvstore",
+            "ms": 5.9,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.logits",
+            "ms": 2.03,
+            "pct": 0.2
+          },
+          {
+            "label": "pre.head",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.extract",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.argmax1",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.argmax2",
+            "ms": 0,
+            "pct": 0
+          }
+        ]
+      }
+    },
+    {
+      "run": 2,
+      "tiled": false,
+      "prefillWallMs": 1267.3949999809265,
+      "profile": {
+        "seq": 549,
+        "totalMs": 1264.2549760000004,
+        "rows": [
+          {
+            "label": "pre.mm.gu+swiglu",
+            "ms": 517.73,
+            "pct": 41
+          },
+          {
+            "label": "pre.mm.down",
+            "ms": 270.79,
+            "pct": 21.4
+          },
+          {
+            "label": "pre.mm.qkv",
+            "ms": 179.18,
+            "pct": 14.2
+          },
+          {
+            "label": "pre.scores",
+            "ms": 92.08,
+            "pct": 7.3
+          },
+          {
+            "label": "pre.mm.o",
+            "ms": 91.23,
+            "pct": 7.2
+          },
+          {
+            "label": "pre.rms",
+            "ms": 68.29,
+            "pct": 5.4
+          },
+          {
+            "label": "pre.apply",
+            "ms": 23.92,
+            "pct": 1.9
+          },
+          {
+            "label": "pre.softmax",
+            "ms": 6.82,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.qkrope",
+            "ms": 6.23,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.kvstore",
+            "ms": 5.96,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.logits",
+            "ms": 2.03,
+            "pct": 0.2
+          },
+          {
+            "label": "pre.head",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.extract",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.argmax1",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.argmax2",
+            "ms": 0,
+            "pct": 0
+          }
+        ]
+      }
+    },
+    {
+      "run": 2,
+      "tiled": true,
+      "prefillWallMs": 1196.0300002098083,
+      "profile": {
+        "seq": 549,
+        "totalMs": 1191.9032320000001,
+        "rows": [
+          {
+            "label": "pre.mm.gu+swiglu",
+            "ms": 517.6,
+            "pct": 43.4
+          },
+          {
+            "label": "pre.mm.down",
+            "ms": 270.79,
+            "pct": 22.7
+          },
+          {
+            "label": "pre.mm.qkv",
+            "ms": 179.04,
+            "pct": 15
+          },
+          {
+            "label": "pre.mm.o",
+            "ms": 91.36,
+            "pct": 7.7
+          },
+          {
+            "label": "pre.rms",
+            "ms": 67.83,
+            "pct": 5.7
+          },
+          {
+            "label": "pre.apply",
+            "ms": 23.92,
+            "pct": 2
+          },
+          {
+            "label": "pre.scores",
+            "ms": 20.12,
+            "pct": 1.7
+          },
+          {
+            "label": "pre.kvstore",
+            "ms": 6.55,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.softmax",
+            "ms": 6.55,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.qkrope",
+            "ms": 6.09,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.logits",
+            "ms": 2.03,
+            "pct": 0.2
+          },
+          {
+            "label": "pre.head",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.extract",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.argmax1",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.argmax2",
+            "ms": 0,
+            "pct": 0
+          }
+        ]
+      }
+    },
+    {
+      "run": 3,
+      "tiled": true,
+      "prefillWallMs": 1196.4749999046326,
+      "profile": {
+        "seq": 549,
+        "totalMs": 1192.4930559999996,
+        "rows": [
+          {
+            "label": "pre.mm.gu+swiglu",
+            "ms": 517.41,
+            "pct": 43.4
+          },
+          {
+            "label": "pre.mm.down",
+            "ms": 271.78,
+            "pct": 22.8
+          },
+          {
+            "label": "pre.mm.qkv",
+            "ms": 178.78,
+            "pct": 15
+          },
+          {
+            "label": "pre.mm.o",
+            "ms": 91.1,
+            "pct": 7.6
+          },
+          {
+            "label": "pre.rms",
+            "ms": 68.16,
+            "pct": 5.7
+          },
+          {
+            "label": "pre.apply",
+            "ms": 23.86,
+            "pct": 2
+          },
+          {
+            "label": "pre.scores",
+            "ms": 19.99,
+            "pct": 1.7
+          },
+          {
+            "label": "pre.softmax",
+            "ms": 6.75,
+            "pct": 0.6
+          },
+          {
+            "label": "pre.kvstore",
+            "ms": 6.55,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.qkrope",
+            "ms": 6.03,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.logits",
+            "ms": 2.03,
+            "pct": 0.2
+          },
+          {
+            "label": "pre.argmax1",
+            "ms": 0.07,
+            "pct": 0
+          },
+          {
+            "label": "pre.head",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.extract",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.argmax2",
+            "ms": 0,
+            "pct": 0
+          }
+        ]
+      }
+    },
+    {
+      "run": 3,
+      "tiled": false,
+      "prefillWallMs": 1266.8049998283386,
+      "profile": {
+        "seq": 549,
+        "totalMs": 1264.9758720000002,
+        "rows": [
+          {
+            "label": "pre.mm.gu+swiglu",
+            "ms": 517.54,
+            "pct": 40.9
+          },
+          {
+            "label": "pre.mm.down",
+            "ms": 271.32,
+            "pct": 21.4
+          },
+          {
+            "label": "pre.mm.qkv",
+            "ms": 179.24,
+            "pct": 14.2
+          },
+          {
+            "label": "pre.scores",
+            "ms": 91.82,
+            "pct": 7.3
+          },
+          {
+            "label": "pre.mm.o",
+            "ms": 91.1,
+            "pct": 7.2
+          },
+          {
+            "label": "pre.rms",
+            "ms": 68.55,
+            "pct": 5.4
+          },
+          {
+            "label": "pre.apply",
+            "ms": 24.12,
+            "pct": 1.9
+          },
+          {
+            "label": "pre.softmax",
+            "ms": 6.82,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.qkrope",
+            "ms": 6.42,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.kvstore",
+            "ms": 5.96,
+            "pct": 0.5
+          },
+          {
+            "label": "pre.logits",
+            "ms": 2.03,
+            "pct": 0.2
+          },
+          {
+            "label": "pre.argmax1",
+            "ms": 0.07,
+            "pct": 0
+          },
+          {
+            "label": "pre.head",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.extract",
+            "ms": 0,
+            "pct": 0
+          },
+          {
+            "label": "pre.argmax2",
+            "ms": 0,
+            "pct": 0
+          }
+        ]
+      }
+    }
+  ]
+}

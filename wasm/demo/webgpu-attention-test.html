@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>WebGPU attention checks</title>
+<style>body{font:15px system-ui;max-width:1100px;margin:30px auto}button{padding:8px;margin:4px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style>
+<h1>WebGPU attention checks</h1>
+<p>Uses the production GPU-resident loader and local golden embeddings. Results contain timing and error metrics, without transcripts.</p>
+<button id="prepare">Load model</button><button id="profile" disabled>Profile prefill</button><button id="regression" disabled>Compare all goldens</button>
+<button id="kernels" disabled>Check kernels</button><button id="fallback" disabled>Check portable fallback</button>
+<pre id="results">Idle</pre>
+<div id="status"></div><pre id="log"></pre>
+<!-- Hidden container providing elements required by app.js -->
+<div style="display:none" aria-hidden="true">
+  <div id="out"></div>
+  <div id="perf"></div>
+  <input id="lang" value="" />
+  <input id="seg" value="0" />
+  <input id="batch" value="1" />
+  <input id="chunk" value="0" />
+  <input id="encwin" value="0" />
+  <div id="barfill"></div>
+  <div id="lvlfill"></div>
+  <button id="load"></button>
+  <input id="threads" value="4" />
+  <select id="backend"><option value="gpu" selected>gpu</option></select>
+  <input id="file" type="file" />
+  <button id="sample-ja"></button>
+  <button id="sample-en"></button>
+  <button id="mic"></button>
+  <button id="micstop"></button>
+  <button id="simstream"></button>
+  <button id="stop"></button>
+  <button id="clear"></button>
+  <button id="tab-batch"></button>
+  <button id="tab-live"></button>
+  <div id="pane-batch"></div>
+  <div id="pane-live"></div>
+</div>
+
+<script src="qwen_asr.js"></script>
+<script type="module" src="webgpu-attention-test.js"></script></html>

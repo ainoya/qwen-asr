@@ -1,0 +1,303 @@
+{
+  "date": "2026-09-20",
+  "hardware": "Apple M1 Pro, 32 GiB unified memory",
+  "macOS": "26.6.2",
+  "threads": 8,
+  "model": "Qwen3-ASR-1.7B packed Q8",
+  "base_commit": "5aa42d1",
+  "implementation": "working tree native Metal/MPS Q8 prefill",
+  "method": "One loaded model per clip. One warmup pair then three measured pairs; order reverses each pair. No concurrent inference jobs. Inference timers exclude model loading.",
+  "samples": [
+    {
+      "audio": "samples/night_of_the_living_dead_1968/45s_right_through_the_billboard.wav",
+      "runs": [
+        {
+          "pair": 0,
+          "warmup": true,
+          "backend": "CPU",
+          "total_ms": 4218.12,
+          "encode_ms": 687.578,
+          "decode_ms": 3530.266,
+          "prefill_ms": 1515,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 0,
+          "warmup": true,
+          "backend": "Metal",
+          "total_ms": 3968.347,
+          "encode_ms": 837.37,
+          "decode_ms": 3130.288,
+          "prefill_ms": 1233,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 1,
+          "warmup": false,
+          "backend": "Metal",
+          "total_ms": 3601.483,
+          "encode_ms": 623.64,
+          "decode_ms": 2977.579,
+          "prefill_ms": 1019,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 1,
+          "warmup": false,
+          "backend": "CPU",
+          "total_ms": 4006.362,
+          "encode_ms": 703.059,
+          "decode_ms": 3302.616,
+          "prefill_ms": 1428,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 2,
+          "warmup": false,
+          "backend": "CPU",
+          "total_ms": 4060.882,
+          "encode_ms": 703.508,
+          "decode_ms": 3357.086,
+          "prefill_ms": 1417,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 2,
+          "warmup": false,
+          "backend": "Metal",
+          "total_ms": 3802.226,
+          "encode_ms": 727.005,
+          "decode_ms": 3074.968,
+          "prefill_ms": 1013,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 3,
+          "warmup": false,
+          "backend": "Metal",
+          "total_ms": 3653.996,
+          "encode_ms": 674.239,
+          "decode_ms": 2979.5,
+          "prefill_ms": 994,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 3,
+          "warmup": false,
+          "backend": "CPU",
+          "total_ms": 4141.21,
+          "encode_ms": 675.23,
+          "decode_ms": 3465.735,
+          "prefill_ms": 1403,
+          "exact_cpu_transcript": true
+        }
+      ],
+      "medians": {
+        "CPU": {
+          "total_ms": 4060.882,
+          "prefill_ms": 1417
+        },
+        "Metal": {
+          "total_ms": 3653.996,
+          "prefill_ms": 1013
+        }
+      },
+      "total_reduction_percent": 10.02,
+      "prefill_reduction_percent": 28.51
+    },
+    {
+      "audio": "samples/night_of_the_living_dead_1968/119s_theres_supposed_to_be_another_broadcast.wav",
+      "runs": [
+        {
+          "pair": 0,
+          "warmup": true,
+          "backend": "CPU",
+          "total_ms": 11863.342,
+          "encode_ms": 1575.613,
+          "decode_ms": 10287.246,
+          "prefill_ms": 3809,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 0,
+          "warmup": true,
+          "backend": "Metal",
+          "total_ms": 12569.059,
+          "encode_ms": 1396.15,
+          "decode_ms": 11171.939,
+          "prefill_ms": 3076,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 1,
+          "warmup": false,
+          "backend": "Metal",
+          "total_ms": 11167.826,
+          "encode_ms": 1541.959,
+          "decode_ms": 9625.408,
+          "prefill_ms": 2803,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 1,
+          "warmup": false,
+          "backend": "CPU",
+          "total_ms": 12312.231,
+          "encode_ms": 1613.78,
+          "decode_ms": 10696.941,
+          "prefill_ms": 3857,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 2,
+          "warmup": false,
+          "backend": "CPU",
+          "total_ms": 13479.232,
+          "encode_ms": 1557.255,
+          "decode_ms": 11920.665,
+          "prefill_ms": 3767,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 2,
+          "warmup": false,
+          "backend": "Metal",
+          "total_ms": 10939.83,
+          "encode_ms": 1350.098,
+          "decode_ms": 9589.104,
+          "prefill_ms": 2727,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 3,
+          "warmup": false,
+          "backend": "Metal",
+          "total_ms": 10892.67,
+          "encode_ms": 1293.505,
+          "decode_ms": 9598.75,
+          "prefill_ms": 2712,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 3,
+          "warmup": false,
+          "backend": "CPU",
+          "total_ms": 13193.091,
+          "encode_ms": 1584.036,
+          "decode_ms": 11607.69,
+          "prefill_ms": 3784,
+          "exact_cpu_transcript": true
+        }
+      ],
+      "medians": {
+        "CPU": {
+          "total_ms": 13193.091,
+          "prefill_ms": 3784
+        },
+        "Metal": {
+          "total_ms": 10939.83,
+          "prefill_ms": 2727
+        }
+      },
+      "total_reduction_percent": 17.08,
+      "prefill_reduction_percent": 27.93
+    },
+    {
+      "audio": "local 41-second Japanese clip (not distributed)",
+      "runs": [
+        {
+          "pair": 0,
+          "warmup": true,
+          "backend": "CPU",
+          "total_ms": 6273.195,
+          "encode_ms": 772.609,
+          "decode_ms": 5500.334,
+          "prefill_ms": 1434,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 0,
+          "warmup": true,
+          "backend": "Metal",
+          "total_ms": 5578.288,
+          "encode_ms": 652.982,
+          "decode_ms": 4925.044,
+          "prefill_ms": 1132,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 1,
+          "warmup": false,
+          "backend": "Metal",
+          "total_ms": 5643.944,
+          "encode_ms": 615.498,
+          "decode_ms": 5028.19,
+          "prefill_ms": 905,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 1,
+          "warmup": false,
+          "backend": "CPU",
+          "total_ms": 5859.659,
+          "encode_ms": 710.361,
+          "decode_ms": 5148.653,
+          "prefill_ms": 1419,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 2,
+          "warmup": false,
+          "backend": "CPU",
+          "total_ms": 5473.276,
+          "encode_ms": 616.458,
+          "decode_ms": 4856.573,
+          "prefill_ms": 1353,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 2,
+          "warmup": false,
+          "backend": "Metal",
+          "total_ms": 5003.687,
+          "encode_ms": 597.119,
+          "decode_ms": 4405.859,
+          "prefill_ms": 910,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 3,
+          "warmup": false,
+          "backend": "Metal",
+          "total_ms": 4996.112,
+          "encode_ms": 605.063,
+          "decode_ms": 4390.8,
+          "prefill_ms": 922,
+          "exact_cpu_transcript": true
+        },
+        {
+          "pair": 3,
+          "warmup": false,
+          "backend": "CPU",
+          "total_ms": 6165.208,
+          "encode_ms": 624.939,
+          "decode_ms": 5539.491,
+          "prefill_ms": 1369,
+          "exact_cpu_transcript": true
+        }
+      ],
+      "medians": {
+        "CPU": {
+          "total_ms": 5859.659,
+          "prefill_ms": 1369
+        },
+        "Metal": {
+          "total_ms": 5003.687,
+          "prefill_ms": 910
+        }
+      },
+      "total_reduction_percent": 14.61,
+      "prefill_reduction_percent": 33.53
+    }
+  ]
+}

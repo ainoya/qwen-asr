@@ -9,6 +9,10 @@ Pure C inference engine for Qwen3-ASR speech-to-text models:
 - `Qwen3-ASR-1.7B`
 
 Primary target is CPU inference (BLAS + architecture-specific SIMD paths).
+An opt-in Apple Silicon Metal/MPS backend accelerates large Q8 prefill GEMMs;
+it keeps the short-sequence and token-generation CPU paths.
+`QWEN_METAL=full` opts into resident encoder/decoder execution; `=decode`
+isolates resident token generation. See `benchmarks/metal-full.md`.
 
 ## Source Of Truth
 
@@ -29,6 +33,8 @@ Architecture/background references:
 ## Build Targets
 
 - `make blas` — Accelerate (macOS) / OpenBLAS (Linux). The fast native path.
+- `make metal` — Apple Silicon hybrid Metal/MPS Q8 prefill + Accelerate.
+- `make test-metal` — numerical/boundary/fallback tests on a real Metal device.
 - `make noblas` — portable kernels only; this is the configuration the wasm
   build compiles, so it is the one to check when touching generic kernels.
 - `./wasm/build.sh` — WebAssembly (SIMD128 + pthreads) for the browser demo.
@@ -403,6 +409,24 @@ Audio: <audio_s> s processed in <infer_s> s (<x>x realtime)
 
 ## Measured Hot Spots (Apple M1 Pro, 1.7B, 41s audio)
 
+For the optional native Metal backend and newer measurements, see
+`benchmarks/metal.md`. CPU hardware ceilings below do not rule out moving
+the large float32 prefill GEMMs to MPS. Keep short quantized-activation calls
+on the CPU: launching a GPU operation per small matvec was slower. Validate
+with `make test-metal`, real ASR regressions, and `tools/bench-metal` (one
+loaded model, warmup pair, alternating CPU/Metal order). GPU access denied by
+a sandbox must not be mistaken for successful GPU validation.
+
+The resident experiment (`QWEN_METAL=full`) batches all decoder layers into
+one command buffer per token. Per-matvec launch results do not predict that
+path's performance. Run `tools/test-metal-full MODEL_DIR` with Metal API and
+shader validation, then recognition and streaming regressions. Benchmark
+with `tools/bench-metal-full MODEL_DIR WAV 3`; counters must show real GPU
+prefills, steps and encoders. Its warmup round is excluded from medians.
+Native measurements have their own plot in `benchmarks/metal-full.md`, since
+the existing history plot is for WebGPU/WASM. Keep full mode opt-in while
+cross-device quality/performance coverage is limited.
+
 Useful when deciding where effort pays off:
 
 | Phase | Time | Status |
@@ -482,6 +506,15 @@ Known remaining opportunities, in rough value order:
    SwiGLU, attention is windowed and bidirectional, and there is a conv2d stem.
 
 ## WebGPU Notes
+
+- Apple adapters use the f32 tiled Q/K prefill score kernel for sequences of
+  at least 128 tokens. Keep the scalar path for other/unknown adapters and
+  for A/B tests (`gpu.useTiledPrefillScores = false`). Score subgroup dispatch
+  assumes eight keys per workgroup, so it requires both subgroup bounds to
+  equal 32; do not enable it from feature presence alone.
+- Use `wasm/demo/webgpu-attention-test.html` for GPU-resident loading, paired
+  timestamp profiles, numeric tile/mask checks, 23-golden token-ID comparisons,
+  and the feature-disabled f32 fallback. See `benchmarks/webgpu-metal.md`.
 
 `wasm/demo/webgpu-decoder.js` runs the whole decoder on the GPU — prefill and
 generation. wasm supplies the input embeddings (`qwen_wasm_embeds_*`, built by

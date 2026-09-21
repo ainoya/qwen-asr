@@ -76,5 +76,12 @@
     "prefill_41s_ms": 1420,
     "wasm_heap_mb": 330,
     "notes": "Shared-memory bank-conflict-free GPU tiled transpose, 64-way FTZ-immune argmax with pass barriers, precomputed sinusoidal PE, persistent zero-allocation streaming buffers, unified GPUDevice."
+  },
+  {
+    "commit": "worktree",
+    "date": "2026-09-20",
+    "title": "Apple QK tiles (GPU prefill only)",
+    "prefill_41s_ms": 1192.493,
+    "notes": "Uncommitted change based on 5aa42d1. M1 Pro, 1.7B Q8, seq 549. Median of three warm GPU timestamp profiles: scalar 1264.976 ms, tiled 1192.493 ms (5.7% reduction). End-to-end, generation, and heap not measured for this entry. Historical entries used different timing conditions; use the paired result in benchmarks/webgpu-metal.md for the speedup."
   }
 ]

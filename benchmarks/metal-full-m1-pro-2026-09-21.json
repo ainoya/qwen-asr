@@ -1,0 +1,1516 @@
+{
+  "date": "2026-09-21",
+  "hardware": "Apple M1 Pro, 32 GiB unified memory",
+  "macOS": "26.6.2",
+  "threads": 8,
+  "model": "Qwen3-ASR-1.7B packed Q8",
+  "base_commit": "5aa42d1",
+  "implementation": "working tree resident native Metal",
+  "method": "One model load per clip, warmup round 0 then three measured rounds with rotated mode order. Inference timers exclude model/audio loading. No concurrent inference jobs; GPU validation disabled for timings. GPU counters required by benchmark. Warm medians are not independent cold CLI timings.",
+  "modes": {
+    "0": "CPU",
+    "1": "Hybrid Metal",
+    "decode": "Resident generation, hybrid prefill/encoder",
+    "full": "Resident encoder, prefill and generation"
+  },
+  "clips": [
+    {
+      "label": "11 s English",
+      "audio": "samples/jfk.wav",
+      "runs": [
+        {
+          "round": 0,
+          "total_ms": 3642.124,
+          "encode_ms": 581.216,
+          "decode_ms": 3059.181,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 2534,
+          "generation_tokens": 30,
+          "generation_ms": 525,
+          "generation_ms_per_token": 17.5
+        },
+        {
+          "round": 0,
+          "total_ms": 1102.369,
+          "encode_ms": 171.673,
+          "decode_ms": 930.531,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 423,
+          "generation_tokens": 30,
+          "generation_ms": 508,
+          "generation_ms_per_token": 16.9
+        },
+        {
+          "round": 0,
+          "total_ms": 1773.112,
+          "encode_ms": 163.083,
+          "decode_ms": 1609.777,
+          "prefills": 0,
+          "steps": 30,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 1139,
+          "generation_tokens": 30,
+          "generation_ms": 470,
+          "generation_ms_per_token": 15.7
+        },
+        {
+          "round": 0,
+          "total_ms": 1162.066,
+          "encode_ms": 335.974,
+          "decode_ms": 825.906,
+          "prefills": 1,
+          "steps": 30,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 336,
+          "generation_tokens": 30,
+          "generation_ms": 490,
+          "generation_ms_per_token": 16.3
+        },
+        {
+          "round": 1,
+          "total_ms": 1551.134,
+          "encode_ms": 172.18,
+          "decode_ms": 1378.773,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 525,
+          "generation_tokens": 30,
+          "generation_ms": 854,
+          "generation_ms_per_token": 28.5
+        },
+        {
+          "round": 1,
+          "total_ms": 1319.533,
+          "encode_ms": 260.234,
+          "decode_ms": 1058.68,
+          "prefills": 0,
+          "steps": 30,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 591,
+          "generation_tokens": 30,
+          "generation_ms": 467,
+          "generation_ms_per_token": 15.6
+        },
+        {
+          "round": 1,
+          "total_ms": 888.184,
+          "encode_ms": 117.773,
+          "decode_ms": 770.229,
+          "prefills": 1,
+          "steps": 30,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 286,
+          "generation_tokens": 30,
+          "generation_ms": 484,
+          "generation_ms_per_token": 16.1
+        },
+        {
+          "round": 1,
+          "total_ms": 1590.7,
+          "encode_ms": 164.915,
+          "decode_ms": 1425.556,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 464,
+          "generation_tokens": 30,
+          "generation_ms": 962,
+          "generation_ms_per_token": 32.1
+        },
+        {
+          "round": 2,
+          "total_ms": 1193.335,
+          "encode_ms": 188.606,
+          "decode_ms": 1004.619,
+          "prefills": 0,
+          "steps": 30,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 534,
+          "generation_tokens": 30,
+          "generation_ms": 471,
+          "generation_ms_per_token": 15.7
+        },
+        {
+          "round": 2,
+          "total_ms": 882.273,
+          "encode_ms": 119.739,
+          "decode_ms": 762.372,
+          "prefills": 1,
+          "steps": 30,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 285,
+          "generation_tokens": 30,
+          "generation_ms": 477,
+          "generation_ms_per_token": 15.9
+        },
+        {
+          "round": 2,
+          "total_ms": 1120.763,
+          "encode_ms": 170.729,
+          "decode_ms": 949.836,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 433,
+          "generation_tokens": 30,
+          "generation_ms": 517,
+          "generation_ms_per_token": 17.2
+        },
+        {
+          "round": 2,
+          "total_ms": 1222.058,
+          "encode_ms": 163.468,
+          "decode_ms": 1058.405,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 431,
+          "generation_tokens": 30,
+          "generation_ms": 627,
+          "generation_ms_per_token": 20.9
+        },
+        {
+          "round": 3,
+          "total_ms": 964.369,
+          "encode_ms": 134.515,
+          "decode_ms": 829.65,
+          "prefills": 1,
+          "steps": 30,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 356,
+          "generation_tokens": 30,
+          "generation_ms": 473,
+          "generation_ms_per_token": 15.8
+        },
+        {
+          "round": 3,
+          "total_ms": 1339.775,
+          "encode_ms": 174.271,
+          "decode_ms": 1165.299,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 508,
+          "generation_tokens": 30,
+          "generation_ms": 658,
+          "generation_ms_per_token": 21.9
+        },
+        {
+          "round": 3,
+          "total_ms": 1244.32,
+          "encode_ms": 219.67,
+          "decode_ms": 1024.514,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 457,
+          "generation_tokens": 30,
+          "generation_ms": 568,
+          "generation_ms_per_token": 18.9
+        },
+        {
+          "round": 3,
+          "total_ms": 1196.187,
+          "encode_ms": 193.446,
+          "decode_ms": 1002.527,
+          "prefills": 0,
+          "steps": 30,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 158,
+          "prefill_ms": 534,
+          "generation_tokens": 30,
+          "generation_ms": 468,
+          "generation_ms_per_token": 15.6
+        }
+      ],
+      "medians": {
+        "0": {
+          "total_ms": 1339.775,
+          "encode_ms": 170.729,
+          "decode_ms": 1165.299,
+          "prefill_ms": 464,
+          "generation_ms": 658,
+          "generation_ms_per_token": 21.9
+        },
+        "1": {
+          "total_ms": 1244.32,
+          "encode_ms": 172.18,
+          "decode_ms": 1058.405,
+          "prefill_ms": 457,
+          "generation_ms": 627,
+          "generation_ms_per_token": 20.9
+        },
+        "decode": {
+          "total_ms": 1196.187,
+          "encode_ms": 193.446,
+          "decode_ms": 1004.619,
+          "prefill_ms": 534,
+          "generation_ms": 468,
+          "generation_ms_per_token": 15.6
+        },
+        "full": {
+          "total_ms": 888.184,
+          "encode_ms": 119.739,
+          "decode_ms": 770.229,
+          "prefill_ms": 286,
+          "generation_ms": 477,
+          "generation_ms_per_token": 15.9
+        }
+      },
+      "full_time_reduction_percent": {
+        "0": 33.71,
+        "1": 28.62
+      }
+    },
+    {
+      "label": "45 s English",
+      "audio": "samples/night_of_the_living_dead_1968/45s_right_through_the_billboard.wav",
+      "runs": [
+        {
+          "round": 0,
+          "total_ms": 4333.53,
+          "encode_ms": 697.538,
+          "decode_ms": 3635.742,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1500,
+          "generation_tokens": 98,
+          "generation_ms": 2136,
+          "generation_ms_per_token": 21.8
+        },
+        {
+          "round": 0,
+          "total_ms": 4572.682,
+          "encode_ms": 648.655,
+          "decode_ms": 3923.802,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1217,
+          "generation_tokens": 98,
+          "generation_ms": 2706,
+          "generation_ms_per_token": 27.6
+        },
+        {
+          "round": 0,
+          "total_ms": 3984.219,
+          "encode_ms": 797.523,
+          "decode_ms": 3186.479,
+          "prefills": 0,
+          "steps": 98,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1314,
+          "generation_tokens": 98,
+          "generation_ms": 1872,
+          "generation_ms_per_token": 19.1
+        },
+        {
+          "round": 0,
+          "total_ms": 3245.071,
+          "encode_ms": 379.823,
+          "decode_ms": 2864.966,
+          "prefills": 1,
+          "steps": 98,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1108,
+          "generation_tokens": 98,
+          "generation_ms": 1757,
+          "generation_ms_per_token": 17.9
+        },
+        {
+          "round": 1,
+          "total_ms": 4327.934,
+          "encode_ms": 677.93,
+          "decode_ms": 3649.708,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1180,
+          "generation_tokens": 98,
+          "generation_ms": 2470,
+          "generation_ms_per_token": 25.2
+        },
+        {
+          "round": 1,
+          "total_ms": 3520.831,
+          "encode_ms": 655.737,
+          "decode_ms": 2864.855,
+          "prefills": 0,
+          "steps": 98,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1140,
+          "generation_tokens": 98,
+          "generation_ms": 1725,
+          "generation_ms_per_token": 17.6
+        },
+        {
+          "round": 1,
+          "total_ms": 3332.829,
+          "encode_ms": 341.886,
+          "decode_ms": 2990.668,
+          "prefills": 1,
+          "steps": 98,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1101,
+          "generation_tokens": 98,
+          "generation_ms": 1889,
+          "generation_ms_per_token": 19.3
+        },
+        {
+          "round": 1,
+          "total_ms": 4239.731,
+          "encode_ms": 905.141,
+          "decode_ms": 3334.336,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1443,
+          "generation_tokens": 98,
+          "generation_ms": 1892,
+          "generation_ms_per_token": 19.3
+        },
+        {
+          "round": 2,
+          "total_ms": 3666.934,
+          "encode_ms": 763.966,
+          "decode_ms": 2902.731,
+          "prefills": 0,
+          "steps": 98,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1156,
+          "generation_tokens": 98,
+          "generation_ms": 1747,
+          "generation_ms_per_token": 17.8
+        },
+        {
+          "round": 2,
+          "total_ms": 3297.504,
+          "encode_ms": 362.272,
+          "decode_ms": 2933.68,
+          "prefills": 1,
+          "steps": 98,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1109,
+          "generation_tokens": 98,
+          "generation_ms": 1825,
+          "generation_ms_per_token": 18.6
+        },
+        {
+          "round": 2,
+          "total_ms": 4006.372,
+          "encode_ms": 681.576,
+          "decode_ms": 3324.557,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1450,
+          "generation_tokens": 98,
+          "generation_ms": 1875,
+          "generation_ms_per_token": 19.1
+        },
+        {
+          "round": 2,
+          "total_ms": 4487.324,
+          "encode_ms": 632.448,
+          "decode_ms": 3854.602,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1387,
+          "generation_tokens": 98,
+          "generation_ms": 2467,
+          "generation_ms_per_token": 25.2
+        },
+        {
+          "round": 3,
+          "total_ms": 3237.273,
+          "encode_ms": 359.215,
+          "decode_ms": 2877.748,
+          "prefills": 1,
+          "steps": 98,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1146,
+          "generation_tokens": 98,
+          "generation_ms": 1732,
+          "generation_ms_per_token": 17.7
+        },
+        {
+          "round": 3,
+          "total_ms": 3942.165,
+          "encode_ms": 666.044,
+          "decode_ms": 3275.881,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1420,
+          "generation_tokens": 98,
+          "generation_ms": 1856,
+          "generation_ms_per_token": 18.9
+        },
+        {
+          "round": 3,
+          "total_ms": 3944.471,
+          "encode_ms": 650.394,
+          "decode_ms": 3293.832,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1167,
+          "generation_tokens": 98,
+          "generation_ms": 2127,
+          "generation_ms_per_token": 21.7
+        },
+        {
+          "round": 3,
+          "total_ms": 3549.51,
+          "encode_ms": 630.576,
+          "decode_ms": 2918.738,
+          "prefills": 0,
+          "steps": 98,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 600,
+          "prefill_ms": 1126,
+          "generation_tokens": 98,
+          "generation_ms": 1793,
+          "generation_ms_per_token": 18.3
+        }
+      ],
+      "medians": {
+        "0": {
+          "total_ms": 4006.372,
+          "encode_ms": 681.576,
+          "decode_ms": 3324.557,
+          "prefill_ms": 1443,
+          "generation_ms": 1875,
+          "generation_ms_per_token": 19.1
+        },
+        "1": {
+          "total_ms": 4327.934,
+          "encode_ms": 650.394,
+          "decode_ms": 3649.708,
+          "prefill_ms": 1180,
+          "generation_ms": 2467,
+          "generation_ms_per_token": 25.2
+        },
+        "decode": {
+          "total_ms": 3549.51,
+          "encode_ms": 655.737,
+          "decode_ms": 2902.731,
+          "prefill_ms": 1140,
+          "generation_ms": 1747,
+          "generation_ms_per_token": 17.8
+        },
+        "full": {
+          "total_ms": 3297.504,
+          "encode_ms": 359.215,
+          "decode_ms": 2933.68,
+          "prefill_ms": 1109,
+          "generation_ms": 1825,
+          "generation_ms_per_token": 18.6
+        }
+      },
+      "full_time_reduction_percent": {
+        "0": 17.69,
+        "1": 23.81
+      }
+    },
+    {
+      "label": "119 s English",
+      "audio": "samples/night_of_the_living_dead_1968/119s_theres_supposed_to_be_another_broadcast.wav",
+      "runs": [
+        {
+          "round": 0,
+          "total_ms": 12282.974,
+          "encode_ms": 1593.866,
+          "decode_ms": 10688.667,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 3953,
+          "generation_tokens": 281,
+          "generation_ms": 6735,
+          "generation_ms_per_token": 24.0
+        },
+        {
+          "round": 0,
+          "total_ms": 11307.135,
+          "encode_ms": 1398.494,
+          "decode_ms": 9908.05,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 3211,
+          "generation_tokens": 281,
+          "generation_ms": 6697,
+          "generation_ms_per_token": 23.8
+        },
+        {
+          "round": 0,
+          "total_ms": 10532.141,
+          "encode_ms": 1321.594,
+          "decode_ms": 9209.164,
+          "prefills": 0,
+          "steps": 281,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 2895,
+          "generation_tokens": 281,
+          "generation_ms": 6315,
+          "generation_ms_per_token": 22.5
+        },
+        {
+          "round": 0,
+          "total_ms": 10486.653,
+          "encode_ms": 883.855,
+          "decode_ms": 9600.741,
+          "prefills": 1,
+          "steps": 281,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 3093,
+          "generation_tokens": 281,
+          "generation_ms": 6507,
+          "generation_ms_per_token": 23.2
+        },
+        {
+          "round": 1,
+          "total_ms": 11122.479,
+          "encode_ms": 1386.871,
+          "decode_ms": 9734.259,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 3043,
+          "generation_tokens": 281,
+          "generation_ms": 6691,
+          "generation_ms_per_token": 23.8
+        },
+        {
+          "round": 1,
+          "total_ms": 10345.402,
+          "encode_ms": 1311.256,
+          "decode_ms": 9033.6,
+          "prefills": 0,
+          "steps": 281,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 2856,
+          "generation_tokens": 281,
+          "generation_ms": 6178,
+          "generation_ms_per_token": 22.0
+        },
+        {
+          "round": 1,
+          "total_ms": 10261.507,
+          "encode_ms": 890.808,
+          "decode_ms": 9369.55,
+          "prefills": 1,
+          "steps": 281,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 3107,
+          "generation_tokens": 281,
+          "generation_ms": 6262,
+          "generation_ms_per_token": 22.3
+        },
+        {
+          "round": 1,
+          "total_ms": 12013.62,
+          "encode_ms": 1567.562,
+          "decode_ms": 10445.485,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 3907,
+          "generation_tokens": 281,
+          "generation_ms": 6538,
+          "generation_ms_per_token": 23.3
+        },
+        {
+          "round": 2,
+          "total_ms": 10465.536,
+          "encode_ms": 1336.591,
+          "decode_ms": 9127.637,
+          "prefills": 0,
+          "steps": 281,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 2869,
+          "generation_tokens": 281,
+          "generation_ms": 6259,
+          "generation_ms_per_token": 22.3
+        },
+        {
+          "round": 2,
+          "total_ms": 10292.921,
+          "encode_ms": 936.4,
+          "decode_ms": 9355.606,
+          "prefills": 1,
+          "steps": 281,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 3068,
+          "generation_tokens": 281,
+          "generation_ms": 6288,
+          "generation_ms_per_token": 22.4
+        },
+        {
+          "round": 2,
+          "total_ms": 12614.631,
+          "encode_ms": 1710.065,
+          "decode_ms": 10904.12,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 3844,
+          "generation_tokens": 281,
+          "generation_ms": 7060,
+          "generation_ms_per_token": 25.1
+        },
+        {
+          "round": 2,
+          "total_ms": 11531.534,
+          "encode_ms": 1317.388,
+          "decode_ms": 10212.785,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 2816,
+          "generation_tokens": 281,
+          "generation_ms": 7396,
+          "generation_ms_per_token": 26.3
+        },
+        {
+          "round": 3,
+          "total_ms": 10102.734,
+          "encode_ms": 863.435,
+          "decode_ms": 9238.204,
+          "prefills": 1,
+          "steps": 281,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 3111,
+          "generation_tokens": 281,
+          "generation_ms": 6127,
+          "generation_ms_per_token": 21.8
+        },
+        {
+          "round": 3,
+          "total_ms": 12558.49,
+          "encode_ms": 1604.937,
+          "decode_ms": 10952.859,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 3937,
+          "generation_tokens": 281,
+          "generation_ms": 7015,
+          "generation_ms_per_token": 25.0
+        },
+        {
+          "round": 3,
+          "total_ms": 10999.346,
+          "encode_ms": 1285.628,
+          "decode_ms": 9712.775,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 2820,
+          "generation_tokens": 281,
+          "generation_ms": 6893,
+          "generation_ms_per_token": 24.5
+        },
+        {
+          "round": 3,
+          "total_ms": 10459.967,
+          "encode_ms": 1345.407,
+          "decode_ms": 9114.132,
+          "prefills": 0,
+          "steps": 281,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 1566,
+          "prefill_ms": 3005,
+          "generation_tokens": 281,
+          "generation_ms": 6109,
+          "generation_ms_per_token": 21.7
+        }
+      ],
+      "medians": {
+        "0": {
+          "total_ms": 12558.49,
+          "encode_ms": 1604.937,
+          "decode_ms": 10904.12,
+          "prefill_ms": 3907,
+          "generation_ms": 7015,
+          "generation_ms_per_token": 25.0
+        },
+        "1": {
+          "total_ms": 11122.479,
+          "encode_ms": 1317.388,
+          "decode_ms": 9734.259,
+          "prefill_ms": 2820,
+          "generation_ms": 6893,
+          "generation_ms_per_token": 24.5
+        },
+        "decode": {
+          "total_ms": 10459.967,
+          "encode_ms": 1336.591,
+          "decode_ms": 9114.132,
+          "prefill_ms": 2869,
+          "generation_ms": 6178,
+          "generation_ms_per_token": 22.0
+        },
+        "full": {
+          "total_ms": 10261.507,
+          "encode_ms": 890.808,
+          "decode_ms": 9355.606,
+          "prefill_ms": 3107,
+          "generation_ms": 6262,
+          "generation_ms_per_token": 22.3
+        }
+      },
+      "full_time_reduction_percent": {
+        "0": 18.29,
+        "1": 7.74
+      }
+    },
+    {
+      "label": "41 s Japanese",
+      "audio": "local Japanese clip (not distributed)",
+      "runs": [
+        {
+          "round": 0,
+          "total_ms": 5792.791,
+          "encode_ms": 741.844,
+          "decode_ms": 5050.682,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1453,
+          "generation_tokens": 169,
+          "generation_ms": 3598,
+          "generation_ms_per_token": 21.3
+        },
+        {
+          "round": 0,
+          "total_ms": 5572.296,
+          "encode_ms": 813.134,
+          "decode_ms": 4758.943,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1388,
+          "generation_tokens": 169,
+          "generation_ms": 3371,
+          "generation_ms_per_token": 19.9
+        },
+        {
+          "round": 0,
+          "total_ms": 4527.036,
+          "encode_ms": 598.809,
+          "decode_ms": 3928.015,
+          "prefills": 0,
+          "steps": 169,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 959,
+          "generation_tokens": 169,
+          "generation_ms": 2969,
+          "generation_ms_per_token": 17.6
+        },
+        {
+          "round": 0,
+          "total_ms": 4289.674,
+          "encode_ms": 335.68,
+          "decode_ms": 3953.728,
+          "prefills": 1,
+          "steps": 169,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": true,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1013,
+          "generation_tokens": 169,
+          "generation_ms": 2941,
+          "generation_ms_per_token": 17.4
+        },
+        {
+          "round": 1,
+          "total_ms": 5393.636,
+          "encode_ms": 590.18,
+          "decode_ms": 4803.206,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1374,
+          "generation_tokens": 169,
+          "generation_ms": 3429,
+          "generation_ms_per_token": 20.3
+        },
+        {
+          "round": 1,
+          "total_ms": 4670.066,
+          "encode_ms": 666.58,
+          "decode_ms": 4003.289,
+          "prefills": 0,
+          "steps": 169,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1071,
+          "generation_tokens": 169,
+          "generation_ms": 2932,
+          "generation_ms_per_token": 17.4
+        },
+        {
+          "round": 1,
+          "total_ms": 4281.767,
+          "encode_ms": 324.856,
+          "decode_ms": 3956.631,
+          "prefills": 1,
+          "steps": 169,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1011,
+          "generation_tokens": 169,
+          "generation_ms": 2945,
+          "generation_ms_per_token": 17.4
+        },
+        {
+          "round": 1,
+          "total_ms": 5826.457,
+          "encode_ms": 775.83,
+          "decode_ms": 5037.392,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1518,
+          "generation_tokens": 169,
+          "generation_ms": 3519,
+          "generation_ms_per_token": 20.8
+        },
+        {
+          "round": 2,
+          "total_ms": 4892.325,
+          "encode_ms": 639.675,
+          "decode_ms": 4252.431,
+          "prefills": 0,
+          "steps": 169,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1173,
+          "generation_tokens": 169,
+          "generation_ms": 3079,
+          "generation_ms_per_token": 18.2
+        },
+        {
+          "round": 2,
+          "total_ms": 4324.37,
+          "encode_ms": 344.608,
+          "decode_ms": 3979.467,
+          "prefills": 1,
+          "steps": 169,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1029,
+          "generation_tokens": 169,
+          "generation_ms": 2951,
+          "generation_ms_per_token": 17.5
+        },
+        {
+          "round": 2,
+          "total_ms": 5298.647,
+          "encode_ms": 620.84,
+          "decode_ms": 4677.438,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1389,
+          "generation_tokens": 169,
+          "generation_ms": 3289,
+          "generation_ms_per_token": 19.5
+        },
+        {
+          "round": 2,
+          "total_ms": 5228.63,
+          "encode_ms": 572.611,
+          "decode_ms": 4655.778,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1154,
+          "generation_tokens": 169,
+          "generation_ms": 3502,
+          "generation_ms_per_token": 20.7
+        },
+        {
+          "round": 3,
+          "total_ms": 4333.338,
+          "encode_ms": 343.223,
+          "decode_ms": 3989.86,
+          "prefills": 1,
+          "steps": 169,
+          "encoders": 1,
+          "mode": "full",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1040,
+          "generation_tokens": 169,
+          "generation_ms": 2950,
+          "generation_ms_per_token": 17.5
+        },
+        {
+          "round": 3,
+          "total_ms": 5585.801,
+          "encode_ms": 649.285,
+          "decode_ms": 4936.217,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "0",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1391,
+          "generation_tokens": 169,
+          "generation_ms": 3545,
+          "generation_ms_per_token": 21.0
+        },
+        {
+          "round": 3,
+          "total_ms": 5457.166,
+          "encode_ms": 627.144,
+          "decode_ms": 4829.663,
+          "prefills": 0,
+          "steps": 0,
+          "encoders": 0,
+          "mode": "1",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1219,
+          "generation_tokens": 169,
+          "generation_ms": 3611,
+          "generation_ms_per_token": 21.4
+        },
+        {
+          "round": 3,
+          "total_ms": 4623.915,
+          "encode_ms": 623.364,
+          "decode_ms": 4000.336,
+          "prefills": 0,
+          "steps": 169,
+          "encoders": 0,
+          "mode": "decode",
+          "warmup": false,
+          "exact_cpu_transcript": true,
+          "prefill_tokens": 549,
+          "prefill_ms": 1062,
+          "generation_tokens": 169,
+          "generation_ms": 2939,
+          "generation_ms_per_token": 17.4
+        }
+      ],
+      "medians": {
+        "0": {
+          "total_ms": 5585.801,
+          "encode_ms": 649.285,
+          "decode_ms": 4936.217,
+          "prefill_ms": 1391,
+          "generation_ms": 3519,
+          "generation_ms_per_token": 20.8
+        },
+        "1": {
+          "total_ms": 5393.636,
+          "encode_ms": 590.18,
+          "decode_ms": 4803.206,
+          "prefill_ms": 1219,
+          "generation_ms": 3502,
+          "generation_ms_per_token": 20.7
+        },
+        "decode": {
+          "total_ms": 4670.066,
+          "encode_ms": 639.675,
+          "decode_ms": 4003.289,
+          "prefill_ms": 1071,
+          "generation_ms": 2939,
+          "generation_ms_per_token": 17.4
+        },
+        "full": {
+          "total_ms": 4324.37,
+          "encode_ms": 343.223,
+          "decode_ms": 3979.467,
+          "prefill_ms": 1029,
+          "generation_ms": 2950,
+          "generation_ms_per_token": 17.5
+        }
+      },
+      "full_time_reduction_percent": {
+        "0": 22.58,
+        "1": 19.82
+      }
+    }
+  ],
+  "validation": {
+    "english": {
+      "passed": 22,
+      "total": 22,
+      "threshold": 0.15,
+      "micro_normalized_cer": 0.006100422336931018
+    },
+    "japanese": {
+      "samples": 18,
+      "cpu_micro_normalized_cer": 0.1638981173864895,
+      "full_micro_normalized_cer": 0.1583610188261351,
+      "exact_cpu_transcripts": 16
+    },
+    "focused": [
+      "segmented conditioning passed",
+      "stdin streaming passed",
+      "0.6B stream cache equivalence 2/2 passed"
+    ],
+    "numerical": {
+      "17": {
+        "metal_api_validation": true,
+        "metal_shader_validation": true,
+        "tolerance": 0.003,
+        "cases": [
+          {
+            "case": "encoder frames=9 tokens=2",
+            "relative_l2_error": 6.16872e-06
+          },
+          {
+            "case": "encoder frames=99 tokens=13",
+            "relative_l2_error": 1.49383e-06
+          },
+          {
+            "case": "encoder frames=100 tokens=13",
+            "relative_l2_error": 1.57823e-06
+          },
+          {
+            "case": "encoder frames=101 tokens=14",
+            "relative_l2_error": 0.000515608
+          },
+          {
+            "case": "encoder frames=799 tokens=104",
+            "relative_l2_error": 2.80167e-06
+          },
+          {
+            "case": "encoder frames=800 tokens=104",
+            "relative_l2_error": 9.05365e-06
+          },
+          {
+            "case": "encoder frames=801 tokens=105",
+            "relative_l2_error": 0.000173777
+          },
+          {
+            "case": "encoder frames=801 tokens=105",
+            "relative_l2_error": 0.000168114
+          },
+          {
+            "case": "prefill seq=2",
+            "relative_l2_error": 5.83235e-05
+          },
+          {
+            "case": "prefill seq=31",
+            "relative_l2_error": 5.56246e-05
+          },
+          {
+            "case": "prefill seq=32",
+            "relative_l2_error": 5.53366e-05
+          },
+          {
+            "case": "prefill seq=33",
+            "relative_l2_error": 5.48919e-05
+          },
+          {
+            "case": "prefill seq=127",
+            "relative_l2_error": 7.35774e-05
+          },
+          {
+            "case": "prefill seq=128",
+            "relative_l2_error": 7.34045e-05
+          },
+          {
+            "case": "prefill seq=129",
+            "relative_l2_error": 7.32723e-05
+          },
+          {
+            "case": "prefill seq=256",
+            "relative_l2_error": 7.22512e-05
+          },
+          {
+            "case": "cache append/rollback",
+            "relative_l2_error": 0.0
+          },
+          {
+            "case": "matvec vs dense",
+            "relative_l2_error": 3.74967e-05
+          },
+          {
+            "case": "KV/RoPE growth",
+            "relative_l2_error": 0.0
+          }
+        ],
+        "disabled_and_q4_fallback": "passed"
+      },
+      "06": {
+        "metal_api_validation": true,
+        "metal_shader_validation": true,
+        "tolerance": 0.003,
+        "cases": [
+          {
+            "case": "encoder frames=9 tokens=2",
+            "relative_l2_error": 3.43031e-06
+          },
+          {
+            "case": "encoder frames=99 tokens=13",
+            "relative_l2_error": 1.90101e-06
+          },
+          {
+            "case": "encoder frames=100 tokens=13",
+            "relative_l2_error": 2.24152e-06
+          },
+          {
+            "case": "encoder frames=101 tokens=14",
+            "relative_l2_error": 1.09514e-05
+          },
+          {
+            "case": "encoder frames=799 tokens=104",
+            "relative_l2_error": 2.60737e-06
+          },
+          {
+            "case": "encoder frames=800 tokens=104",
+            "relative_l2_error": 2.40713e-06
+          },
+          {
+            "case": "encoder frames=801 tokens=105",
+            "relative_l2_error": 2.41812e-06
+          },
+          {
+            "case": "encoder frames=801 tokens=105",
+            "relative_l2_error": 2.23129e-06
+          },
+          {
+            "case": "prefill seq=2",
+            "relative_l2_error": 3.41542e-05
+          },
+          {
+            "case": "prefill seq=31",
+            "relative_l2_error": 9.43935e-05
+          },
+          {
+            "case": "prefill seq=32",
+            "relative_l2_error": 9.26106e-05
+          },
+          {
+            "case": "prefill seq=33",
+            "relative_l2_error": 9.17968e-05
+          },
+          {
+            "case": "prefill seq=127",
+            "relative_l2_error": 8.08889e-05
+          },
+          {
+            "case": "prefill seq=128",
+            "relative_l2_error": 8.07566e-05
+          },
+          {
+            "case": "prefill seq=129",
+            "relative_l2_error": 8.06773e-05
+          },
+          {
+            "case": "prefill seq=256",
+            "relative_l2_error": 7.93925e-05
+          },
+          {
+            "case": "cache append/rollback",
+            "relative_l2_error": 0.0
+          },
+          {
+            "case": "matvec vs dense",
+            "relative_l2_error": 2.24457e-05
+          },
+          {
+            "case": "KV/RoPE growth",
+            "relative_l2_error": 0.0
+          }
+        ],
+        "disabled_and_q4_fallback": "passed"
+      }
+    },
+    "compatibility": {
+      "blas_build": "passed, JFK exact",
+      "noblas_build": "passed, JFK exact",
+      "metal_build": "passed, restored as final binary",
+      "no_device": "JFK exact CPU fallback; silent stderr empty",
+      "webgpu_dispatch_unit_tests": "3/3 passed",
+      "wasm": {
+        "browser_build": "standard 2 GiB rebuilt",
+        "node_build": "temporary 4 GiB rebuilt for complete 1.7B packed model",
+        "passed": 22,
+        "total": 22,
+        "threshold": 0.15,
+        "micro_normalized_cer_rounded": 0.0062
+      }
+    }
+  },
+  "source_sha256": {
+    "qwen_asr_metal.m": "a431be74f4a2c0c2ed859f55f8c7655e36305ca05b6d8ef6caefa5b1a2843ad5",
+    "qwen_asr_metal_full.metal": "7f4708e1d5521f80feecda65c364fc1f161a56ea527fc79ed57070e01c79648e",
+    "qwen_asr_metal.metal": "57c3505d97ab5593aec1a0d68cc29220a466435c7ce3e234b19cd1efebc62dfb",
+    "qwen_asr_metal.h": "8d8d5e71d483bbbe7bbf5929ae39604759cc595d09360f44895e8a1084f4048d",
+    "qwen_asr.c": "197ba1b7801041be7556e28e93296390654fd7f4673e6924369a6334ea9c6808",
+    "qwen_asr_encoder.c": "37800eaee61717b64c5cf0ba48d5a374a0596df78e7add47064ae0bbf948c8ee",
+    "qwen_asr_decoder.c": "67af4278e3df000eb9dbd1c3b7c8fc6e1e1ef4f9c75ff0e08b70cf68a2495c9c",
+    "qwen_asr_kernels.c": "e37b9a5d55da2dedfeb9f26f7cf61702e6eaaae8569cfc40c8a8e5d0c353a92e",
+    "tools/bench-metal-full.c": "90c03f106f17b4306239c61efa1cb82d6fd5a5300e3a026663dd912a0380f493",
+    "tools/test-metal-full.c": "deab57f1b3d8135be71886021a1ab76222dd2fb96c60f516e6bdce7955c77fad"
+  },
+  "first_use_process_comparison": {
+    "audio": "45 s English",
+    "method": "One fresh process per mode after the warm benchmark; model file remains in OS cache. Process wall time includes loading and GPU initialization. Single comparison only, not a median.",
+    "runs": [
+      {
+        "mode": "0",
+        "process_wall_ms": 4798.75,
+        "exact_cpu_transcript": true,
+        "inference_ms": 4693
+      },
+      {
+        "mode": "full",
+        "process_wall_ms": 3695.139,
+        "exact_cpu_transcript": true,
+        "inference_ms": 3586
+      }
+    ]
+  }
+}

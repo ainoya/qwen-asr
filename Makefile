@@ -11,13 +11,18 @@ UNAME_S := $(shell uname -s)
 # Source files
 SRCS = qwen_asr.c qwen_asr_kernels.c qwen_asr_kernels_generic.c qwen_asr_kernels_neon.c qwen_asr_kernels_avx.c qwen_asr_kernels_wasm.c qwen_asr_audio.c qwen_asr_encoder.c qwen_asr_decoder.c qwen_asr_tokenizer.c qwen_asr_safetensors.c qwen_asr_pack.c qwen_asr_calib.c
 OBJS = $(SRCS:.c=.o)
+ifeq ($(METAL),1)
+OBJS += qwen_asr_metal.o
+endif
 MAIN = main.c
 TARGET = qwen_asr
+METAL_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -DUSE_METAL
+METAL_LDFLAGS = $(LDFLAGS) -framework Accelerate -framework Foundation -framework Metal -framework MetalPerformanceShaders
 
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug info help blas noblas test test-stream-cache bench bench-plot bench-record
+.PHONY: all clean debug info help blas metal noblas test test-metal test-stream-cache bench bench-plot bench-record
 
 # Default: show available targets
 all: help
@@ -27,12 +32,14 @@ help:
 	@echo ""
 	@echo "Choose a backend:"
 	@echo "  make blas     - With BLAS acceleration (Accelerate/OpenBLAS)"
+	@echo "  make metal    - Apple Silicon Q8 GPU kernels + Accelerate"
 	@echo "  make noblas   - Portable kernels only, no BLAS dependency"
 	@echo "                  (what a wasm/browser build compiles; ~1.6x slower here)"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make debug    - Debug build with AddressSanitizer"
 	@echo "  make test     - Run regression suite (requires ./qwen_asr and model files)"
+	@echo "  make test-metal - Build Metal and check GPU kernels against CPU"
 	@echo "  make test-stream-cache - Run stream cache on/off equivalence check"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make info     - Show build configuration"
@@ -69,6 +76,36 @@ noblas:
 	@echo ""
 	@echo "Built without BLAS (portable kernels)"
 
+# Metal is opt-in; the other targets do not link Apple GPU frameworks.
+metal:
+ifeq ($(UNAME_S),Darwin)
+	@$(MAKE) clean
+	@$(MAKE) $(TARGET) tools/test-metal tools/test-metal-full tools/bench-metal tools/bench-metal-full METAL=1 CFLAGS="$(METAL_CFLAGS)" LDFLAGS="$(METAL_LDFLAGS)"
+else
+	@echo "Metal requires macOS on Apple Silicon"; exit 1
+endif
+
+qwen_asr_metal_source.h: qwen_asr_metal.metal qwen_asr_metal_full.metal
+	python3 -c 'import json,sys; print(json.dumps("\n".join(open(p).read() for p in sys.argv[1:])))' $^ > $@
+
+qwen_asr_metal.o: qwen_asr_metal.m qwen_asr_metal_source.h qwen_asr_metal.h qwen_asr.h qwen_asr_kernels.h qwen_asr_kernels_impl.h
+	$(CC) $(CFLAGS) -fno-fast-math -fobjc-arc -c -o $@ $<
+
+tools/test-metal: tools/test-metal.c $(OBJS)
+	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $^ $(LDFLAGS)
+
+tools/bench-metal: tools/bench-metal.c $(OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ $^ $(LDFLAGS)
+
+tools/bench-metal-full: tools/bench-metal-full.c $(OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ $^ $(LDFLAGS)
+
+tools/test-metal-full: tools/test-metal-full.c $(OBJS)
+	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $^ $(LDFLAGS)
+
+test-metal: metal
+	./tools/test-metal
+
 # =============================================================================
 # Build rules
 # =============================================================================
@@ -89,14 +126,14 @@ debug:
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) main.o $(TARGET)
+	rm -f $(OBJS) qwen_asr_metal.o qwen_asr_metal_source.h main.o $(TARGET) tools/test-metal tools/test-metal-full tools/bench-metal tools/bench-metal-full
 
 info:
 	@echo "Platform: $(UNAME_S)"
 	@echo "Compiler: $(CC)"
 	@echo ""
 ifeq ($(UNAME_S),Darwin)
-	@echo "Backends: blas (Apple Accelerate), noblas (portable)"
+	@echo "Backends: blas (Apple Accelerate), metal (Q8 prefill + Accelerate), noblas (portable)"
 else
 	@echo "Backends: blas (OpenBLAS), noblas (portable)"
 endif
@@ -120,7 +157,7 @@ test-webgpu:
 # Dependencies
 # =============================================================================
 qwen_asr.o: qwen_asr.c qwen_asr.h qwen_asr_kernels.h qwen_asr_safetensors.h qwen_asr_audio.h qwen_asr_tokenizer.h
-qwen_asr_kernels.o: qwen_asr_kernels.c qwen_asr_kernels.h qwen_asr_kernels_impl.h
+qwen_asr_kernels.o: qwen_asr_kernels.c qwen_asr_kernels.h qwen_asr_kernels_impl.h qwen_asr_metal.h
 qwen_asr_kernels_generic.o: qwen_asr_kernels_generic.c qwen_asr_kernels_impl.h
 qwen_asr_kernels_neon.o: qwen_asr_kernels_neon.c qwen_asr_kernels_impl.h
 qwen_asr_kernels_avx.o: qwen_asr_kernels_avx.c qwen_asr_kernels_impl.h

@@ -98,6 +98,19 @@ node wasm/check-node.js qwen3-asr-1.7b-q8 samples 8
 
 ## WebGPU backend
 
+Apple GPU adapters now use a 32 x 32 tiled Q/K score pass for decoder prefills
+of at least 128 tokens. This reuses transposed f32 activations in workgroup
+memory and requires no new optional WebGPU features. Other vendors, redacted
+adapter information, and insufficient workgroup limits retain the scalar
+path. The subgroup score path is used only when the adapter guarantees a
+32-lane subgroup; other widths use the portable score shaders.
+
+The M1 Pro measurement reduced GPU prefill time from 1265 to 1192 ms at 549
+tokens, with identical generated token IDs on all 23 golden fixtures.
+See [benchmark scope and reproduction](../benchmarks/webgpu-metal.md), including
+the GPU-resident `webgpu-attention-test.html` harness. These are decoder
+prefill timings, not an end-to-end transcription speedup.
+
 `wasm/demo/webgpu-decoder.js` runs **the whole decoder** — prefill and token
 generation — on the GPU. Only mel and the audio encoder stay in wasm. Pick it
 with the *decoder* dropdown in the demo, or check it against the CPU path with

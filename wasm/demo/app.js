@@ -11,6 +11,7 @@ import { WebGPUDecoder } from "./webgpu-decoder.js";
 import { freshHeap } from "./heap.js";
 import { tick, until, sleep } from "./tick.js";
 import { WebGPUEncoder } from "./webgpu-encoder.js";
+import { resolveModelConfig } from "./model-config.mjs";
 
 const $ = (id) => document.getElementById(id);
 /* A hosted playground overrides these via playground-config.js; the local
@@ -20,14 +21,7 @@ const isMobileDevice = (typeof navigator !== "undefined" &&
   (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)));
 
-const getModelBase = () => {
-  if (CFG.modelBase) return CFG.modelBase;
-  const sel = $("model-select")?.value;
-  if (sel === "0.6b") return "../../qwen3-asr-0.6b-q8";
-  if (sel === "1.7b") return "../../qwen3-asr-1.7b-q8";
-  return isMobileDevice ? "../../qwen3-asr-0.6b-q8" : "../../qwen3-asr-1.7b-q8";
-};
-const MODEL_BASE = "../../qwen3-asr-1.7b-q8";
+const getModelConfig = () => resolveModelConfig(CFG, $("model-select")?.value || (isMobileDevice ? "0.6b" : "1.7b"));
 const SAMPLE_EN = CFG.sampleEn || "../../samples/jfk.wav";
 const SAMPLE_JA = CFG.sampleJa || "../../samples/extra/ja_bench.wav";
 
@@ -1062,7 +1056,8 @@ $("load").onclick = async () => {
       actualMaxPages = initPages;
     }
 
-    const modelBase = getModelBase();
+    const { id: modelId, modelBase, modelSize } = getModelConfig();
+    log(`selected model: ${modelId} (${modelBase})`);
     if (isMobile && $("model-select")?.value === "1.7b") {
       log("Warning: 1.7B model (~2.2 GB) may exceed iOS Safari memory limits and trigger a reload. 0.6B is recommended for mobile.", "warn");
     }
@@ -1088,7 +1083,7 @@ $("load").onclick = async () => {
     } catch {}
     /* Some CDNs answer HEAD without an exposed Content-Length; the deploy
      * config carries the size so progress and the OPFS cache still work. */
-    if (!total) total = Number(CFG.modelSize) || 0;
+    if (!total) total = modelSize;
     if (!total) throw new Error("could not determine the model size");
 
     if (isMobile) {

@@ -100,6 +100,11 @@ Streaming, stdin/ffmpeg piping, segmented long-form decoding, weight
 precision options and the C API are documented in the full manual:
 **[docs/MANUAL.md](docs/MANUAL.md)**.
 
+The browser model selector supports both variants locally. Prepare the 0.6B
+packed image using [the browser instructions](wasm/README.md#selecting-the-06b-model-locally).
+Hosted deployments must configure each variant separately; an unavailable model
+now fails explicitly rather than silently downloading 1.7B.
+
 ## Quick start (browser, local)
 
 ```bash

@@ -22,6 +22,29 @@ The demo has a **batch** tab (audio file or one of the bundled samples) and a
 **streaming** tab (microphone, or "Stream sample file" to watch the incremental
 path without a mic).
 
+## Selecting the 0.6B model locally
+
+The selector resolves model URL and size together. Hosted deployments can configure
+`models["0.6b"]` and `models["1.7b"]`, each with `modelBase` and optional
+`modelSize`. A missing hosted variant fails explicitly instead of downloading another model.
+
+```bash
+make blas
+bash download_model.sh --model small
+mkdir -p qwen3-asr-0.6b-q8
+cp qwen3-asr-0.6b/{config.json,generation_config.json,vocab.json,merges.txt} qwen3-asr-0.6b-q8/
+./qwen_asr -d qwen3-asr-0.6b --weights q8 --pack-q8 qwen3-asr-0.6b-q8/qwen-asr-q8.bin
+./wasm/build.sh
+/usr/bin/python3 wasm/serve.py
+```
+
+Open http://localhost:8765/wasm/demo/ and select 0.6B before loading.
+Run selection regressions with `node --test wasm/model-config.test.mjs`.
+For GitHub Pages, set `HF_SMALL_MODEL_REPO` to a published packed 0.6B model
+repository and optionally `HF_SMALL_MODEL_SIZE` to its exact byte length.
+Without that repository, selecting 0.6B produces an explicit configuration error;
+it does not fall back to the hosted 1.7B image.
+
 ## Hosted playground
 
 The demo deploys to GitHub Pages via `.github/workflows/pages.yml` (repo

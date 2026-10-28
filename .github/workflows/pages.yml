@@ -38,14 +38,24 @@ jobs:
       - name: Assemble site
         run: |
           mkdir -p _site/samples
-          cp wasm/demo/*.html wasm/demo/*.js wasm/demo/*.wasm _site/
+          cp wasm/demo/*.html wasm/demo/*.js wasm/demo/*.mjs wasm/demo/*.wasm _site/
           cp samples/jfk.wav _site/samples/
           cp samples/ja_say_eval/audio/daily__kyoko_normal.wav _site/samples/
           MODEL_SIZE=$(cat wasm/demo/model-size.txt 2>/dev/null || echo 2179070272)
           cat > _site/playground-config.js <<CFG
           window.QWEN_PLAYGROUND = {
-            modelBase: "https://huggingface.co/${{ vars.HF_MODEL_REPO || 'ainoya/qwen3-asr-1.7b-q8-packed' }}/resolve/main",
-            modelSize: $MODEL_SIZE,
+            models: {
+              "1.7b": {
+                modelBase: "https://huggingface.co/${{ vars.HF_MODEL_REPO || 'ainoya/qwen3-asr-1.7b-q8-packed' }}/resolve/main",
+                modelSize: $MODEL_SIZE,
+              },
+              ...("${{ vars.HF_SMALL_MODEL_REPO }}" ? {
+                "0.6b": {
+                  modelBase: "https://huggingface.co/${{ vars.HF_SMALL_MODEL_REPO }}/resolve/main",
+                  modelSize: Number("${{ vars.HF_SMALL_MODEL_SIZE }}") || 0,
+                },
+              } : {}),
+            },
             sampleEn: "samples/jfk.wav",
             sampleJa: "samples/daily__kyoko_normal.wav",
           };
